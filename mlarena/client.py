@@ -1,123 +1,395 @@
+"""ML Arena REST client.
+
+Authentication is via Bearer token of the form `mlk_<scope>_<lookup>_<secret>`,
+matching the backend's `auth_required` decorator (see backend/app/auth.py). The
+older `key_id:key_pass` format that earlier README versions documented has been
+retired — the canonical form is the full underscore-separated token.
+
+Routes hit the canonical API blueprints under `/api/...`. There is no longer a
+separate `/api/sdk/` namespace.
+"""
+
 import inspect
 import os
 import tempfile
 
 import requests
 
-from mlarena.exceptions import AuthenticationError, SubmissionError, CompetitionNotFoundError
+from mlarena.exceptions import (
+    AuthenticationError,
+    CompetitionNotFoundError,
+    MLArenaError,
+    SubmissionError,
+)
 
 
 class MLArenaClient:
-    """Client for interacting with the ML Arena API."""
+    """Client for the ML Arena REST API.
 
-    def __init__(self, key_id, key_pass, base_url):
-        self._key_id = key_id
-        self._key_pass = key_pass
-        self._base_url = base_url
+    Pass the full bearer token returned by your Profile page (`mlk_user_...`,
+    `mlk_creator_...`, or `mlk_teacher_...`). The token's scope segment dictates
+    which endpoints are reachable — a `user`-scope token cannot call a
+    `creator`-required route, and vice versa.
+    """
+
+    def __init__(self, token: str, base_url: str):
+        self._token = token
+        self._base_url = base_url.rstrip("/")
         self._last_agent_id = None
         self._last_competition = None
 
-    def _headers(self):
-        return {"Authorization": f"Bearer {self._key_id}:{self._key_pass}"}
+    def _headers(self, *, json_body: bool = False) -> dict:
+        h = {"Authorization": f"Bearer {self._token}"}
+        if json_body:
+            h["Content-Type"] = "application/json"
+        return h
 
-    def _url(self, path):
-        return f"{self._base_url}/api/sdk{path}"
+    def _url(self, path: str) -> str:
+        return f"{self._base_url}/api{path}"
 
-    def _handle_response(self, resp):
+    def _handle_response(self, resp: requests.Response) -> requests.Response:
         if resp.status_code == 401:
-            raise AuthenticationError("Invalid API credentials. Check your key_id and key_pass.")
+            raise AuthenticationError("Invalid or missing API credentials.")
         if resp.status_code == 403:
-            raise AuthenticationError(resp.json().get("error", "Access denied"))
+            raise AuthenticationError(_safe_error(resp, "Access denied"))
         if resp.status_code == 404:
-            raise CompetitionNotFoundError(resp.json().get("error", "Not found"))
+            raise CompetitionNotFoundError(_safe_error(resp, "Not found"))
         return resp
 
-    def submit(self, competition, agent=None, files=None, agent_name=None):
+    # ---- Competitions (public read; create/update via creator scope) ----
+
+    def competitions(self):
+        """List active competitions. Public; no auth required."""
+        resp = requests.get(self._url("/competitions/"), timeout=30)
+        resp.raise_for_status()
+        return _to_dataframe(resp.json())
+
+    def create_competition(self, name: str, kernel_version: str,
+                           description: str | None = None,
+                           copy_from_competition_id: int | None = None,
+                           tag_names: list[str] | None = None) -> dict:
+        """Create a new competition via the creator-scope authoring flow.
+
+        The backend resolves the engine + default evaluation + default env
+        runtime from `kernel_version`. To pin a specific engine, use the
+        creator UI or post-creation patch endpoints — the API does not let
+        you pick an engine directly at creation time.
+
+        If `tag_names` is given, each name is resolved against the public
+        tag catalog (`GET /api/competition_tags/tags`) before the create
+        call. Unknown names raise `MLArenaError` (fail fast — the catalog
+        is admin-curated; new tags are not auto-created).
+
+        Requires a `creator`-scope token.
         """
-        Submit an agent to a competition.
+        body = {"name": name, "kernel_version": kernel_version}
+        if description is not None:
+            body["description"] = description
+        if copy_from_competition_id is not None:
+            body["copy_from_competition_id"] = copy_from_competition_id
+        if tag_names:
+            body["tag_ids"] = self._resolve_tag_names(tag_names)
+        resp = requests.post(
+            self._url("/creator_competition/competition"),
+            headers=self._headers(json_body=True),
+            json=body,
+            timeout=60,
+        )
+        self._handle_response(resp)
+        if resp.status_code not in (200, 201):
+            raise MLArenaError(f"create_competition failed: {_safe_error(resp)}")
+        return resp.json()
 
-        Args:
-            competition: Competition name or ID
-            agent: A class whose source code will be extracted and submitted as agent.py
-            files: List of file paths to upload (must include agent.py)
-            agent_name: Optional name for the agent
+    def list_tags(self):
+        """Return the public tag catalog. No auth required."""
+        resp = requests.get(self._url("/competition_tags/tags"), timeout=30)
+        resp.raise_for_status()
+        return _to_dataframe(resp.json())
 
-        Returns:
-            dict with agent_id, status, and message
+    def set_competition_tags(self, competition_id: int,
+                             tag_names: list[str] | None = None,
+                             tag_ids: list[int] | None = None) -> dict:
+        """Replace the tag set on a competition.
 
-        Raises:
-            SubmissionError: If submission fails
-            AuthenticationError: If credentials are invalid
+        Pass exactly one of `tag_names` or `tag_ids`. Names are resolved
+        against the catalog; unknown names raise `MLArenaError`. Pass an
+        empty list to clear all tags.
+
+        Requires a `creator`-scope token and ownership (or admin) of the
+        target competition.
         """
-        if agent is None and files is None:
-            raise SubmissionError("Provide either agent= (a class) or files= (list of paths)")
-        if agent is not None and files is not None:
-            raise SubmissionError("Provide either agent= or files=, not both")
+        if (tag_names is None) == (tag_ids is None):
+            raise MLArenaError("Provide exactly one of tag_names= or tag_ids=")
+        ids = tag_ids if tag_ids is not None else self._resolve_tag_names(tag_names)
+        resp = requests.put(
+            self._url(f"/creator_competition/competition/{competition_id}/tags"),
+            headers=self._headers(json_body=True),
+            json={"tag_ids": ids},
+            timeout=30,
+        )
+        self._handle_response(resp)
+        if resp.status_code != 200:
+            raise MLArenaError(f"set_competition_tags failed: {_safe_error(resp)}")
+        return resp.json()
 
-        multipart_files = []
-        tmp_dir = None
+    def _resolve_tag_names(self, tag_names: list[str]) -> list[int]:
+        """Resolve a list of tag names to ids via the public catalog."""
+        catalog_resp = requests.get(self._url("/competition_tags/tags"), timeout=30)
+        catalog_resp.raise_for_status()
+        catalog = catalog_resp.json()
+        by_name = {t["name"]: t["id"] for t in catalog}
+        unknown = [n for n in tag_names if n not in by_name]
+        if unknown:
+            raise MLArenaError(
+                f"Unknown tag name(s): {unknown}. "
+                f"Known tags: {sorted(by_name.keys())}"
+            )
+        return [by_name[n] for n in tag_names]
 
-        try:
-            if agent is not None:
-                source = inspect.getsource(agent)
-                tmp_dir = tempfile.mkdtemp()
-                tmp_path = os.path.join(tmp_dir, "agent.py")
-                with open(tmp_path, "w") as f:
-                    f.write(source)
-                multipart_files.append(("files", ("agent.py", open(tmp_path, "rb"))))
-            else:
-                for path in files:
-                    if not os.path.isfile(path):
-                        raise SubmissionError(f"File not found: {path}")
-                    filename = os.path.basename(path)
-                    multipart_files.append(("files", (filename, open(path, "rb"))))
+    def update_competition(self, competition_id: int, *,
+                           name: str | None = None,
+                           description: str | None = None,
+                           is_public: bool | None = None) -> dict:
+        """Patch top-level competition fields (creator scope, pre-start only).
 
-            data = {}
-            if agent_name:
-                data["agent_name"] = agent_name
+        Mirrors `PUT /api/creator_competition/competition/{id}`. Only fields
+        explicitly passed are sent — everything else is left untouched. The
+        backend rejects updates after the competition has been started.
+        """
+        body: dict = {}
+        if name is not None:
+            body["name"] = name
+        if description is not None:
+            body["description"] = description
+        if is_public is not None:
+            body["is_public"] = is_public
+        if not body:
+            raise MLArenaError("update_competition requires at least one field")
+        resp = requests.put(
+            self._url(f"/creator_competition/competition/{competition_id}"),
+            headers=self._headers(json_body=True),
+            json=body,
+            timeout=30,
+        )
+        self._handle_response(resp)
+        if resp.status_code != 200:
+            raise MLArenaError(f"update_competition failed: {_safe_error(resp)}")
+        return resp.json()
 
-            resp = requests.post(
-                self._url(f"/submit/{competition}"),
+    def update_settings(self, competition_id: int, *,
+                        simulation_timeout_sec: int | None = None,
+                        max_upload_size_bytes: int | None = None,
+                        max_upload_files: int | None = None,
+                        max_active_agents_per_participant: int | None = None,
+                        evaluation_metric: str | None = None,
+                        evaluation_metric2: str | None = None,
+                        evaluation_is_elo_score: bool | None = None,
+                        evaluation_deployment_nb_constraint_run: int | None = None,
+                        evaluation_deployment_nb_initial_score_run: int | None = None,
+                        evaluation_episode_budget_brackets: list | None = None,
+                        ) -> dict:
+        """Update competition settings + evaluation parameters.
+
+        Mirrors `PUT /api/creator_competition/competition/{id}/settings` —
+        the same call the console's Settings tab makes via `saveSettings()`.
+        Only fields explicitly passed are sent; everything else is left
+        untouched. The backend rejects updates after the competition has
+        been started.
+
+        Notable parameters:
+            evaluation_metric: free-text label for the primary metric (e.g.
+                "reward", "accuracy", "bleu"). The DB column is String(20).
+            evaluation_is_elo_score: when True, the leaderboard ranks by
+                ELO rather than mean metric (multi-agent kernels).
+            evaluation_episode_budget_brackets: list of `[threshold,
+                n_episodes]` pairs implementing tiered early-stop.
+                Thresholds must be strictly ascending; n_episodes
+                non-decreasing; max 100 episodes per bracket.
+
+        Requires a `creator`-scope token and ownership (or admin) of the
+        target competition.
+        """
+        body: dict = {}
+        if simulation_timeout_sec is not None:
+            body["simulation_timeout_sec"] = simulation_timeout_sec
+        if max_upload_size_bytes is not None:
+            body["max_upload_size_bytes"] = max_upload_size_bytes
+        if max_upload_files is not None:
+            body["max_upload_files"] = max_upload_files
+        if max_active_agents_per_participant is not None:
+            body["max_active_agents_per_participant"] = max_active_agents_per_participant
+        if evaluation_metric is not None:
+            body["evaluation_metric"] = evaluation_metric
+        if evaluation_metric2 is not None:
+            body["evaluation_metric2"] = evaluation_metric2
+        if evaluation_is_elo_score is not None:
+            body["evaluation_is_elo_score"] = evaluation_is_elo_score
+        if evaluation_deployment_nb_constraint_run is not None:
+            body["evaluation_deployment_nb_constraint_run"] = evaluation_deployment_nb_constraint_run
+        if evaluation_deployment_nb_initial_score_run is not None:
+            body["evaluation_deployment_nb_initial_score_run"] = evaluation_deployment_nb_initial_score_run
+        if evaluation_episode_budget_brackets is not None:
+            body["evaluation_episode_budget_brackets"] = evaluation_episode_budget_brackets
+        if not body:
+            raise MLArenaError("update_settings requires at least one field")
+        resp = requests.put(
+            self._url(f"/creator_competition/competition/{competition_id}/settings"),
+            headers=self._headers(json_body=True),
+            json=body,
+            timeout=30,
+        )
+        self._handle_response(resp)
+        if resp.status_code != 200:
+            raise MLArenaError(f"update_settings failed: {_safe_error(resp)}")
+        return resp.json()
+
+    def upload_env_file(self, competition_id: int, file_path: str) -> dict:
+        """Upload a single environment file (env.py, requirements.txt, …).
+
+        Multipart PUT to `/api/creator_competition/competition/{id}/env/files`.
+        Use this for binary files; for text content driven by a template,
+        prefer `update_env_file_content`.
+        """
+        if not os.path.isfile(file_path):
+            raise MLArenaError(f"File not found: {file_path}")
+        with open(file_path, "rb") as fh:
+            resp = requests.put(
+                self._url(
+                    f"/creator_competition/competition/{competition_id}/env/files"
+                ),
                 headers=self._headers(),
-                files=multipart_files,
-                data=data,
+                files={"file": (os.path.basename(file_path), fh)},
                 timeout=120,
             )
+        self._handle_response(resp)
+        if resp.status_code not in (200, 201):
+            raise MLArenaError(f"upload_env_file failed: {_safe_error(resp)}")
+        return resp.json()
 
-            self._handle_response(resp)
+    def update_env_file_content(self, competition_id: int, filename: str,
+                                content: str) -> dict:
+        """Write a text env file by content (e.g. a rendered env.py template).
 
-            if resp.status_code not in (200, 201, 202):
-                error_msg = resp.json().get("error", resp.text)
-                raise SubmissionError(f"Submission failed: {error_msg}")
-
-            result = resp.json()
-            self._last_agent_id = result.get("agent_id")
-            self._last_competition = competition
-            return result
-
-        finally:
-            for _, file_tuple in multipart_files:
-                file_tuple[1].close()
-            if tmp_dir:
-                import shutil
-                shutil.rmtree(tmp_dir, ignore_errors=True)
-
-    def status(self, agent_id=None):
+        JSON PUT to the same endpoint as `upload_env_file`. The backend runs
+        the kernel-specific AST validator on env.py and returns a
+        `validation` block in the response.
         """
-        Get status of a submitted agent.
+        resp = requests.put(
+            self._url(
+                f"/creator_competition/competition/{competition_id}/env/files"
+            ),
+            headers=self._headers(json_body=True),
+            json={"filename": filename, "content": content},
+            timeout=60,
+        )
+        self._handle_response(resp)
+        if resp.status_code != 200:
+            raise MLArenaError(f"update_env_file_content failed: {_safe_error(resp)}")
+        return resp.json()
 
-        Args:
-            agent_id: Agent ID (defaults to last submitted agent)
+    def set_competition_image(self, competition_id: int, image_path: str) -> dict:
+        """Upload (or replace) the competition thumbnail (`miniature.png`).
 
-        Returns:
-            dict with agent status info
+        Multipart POST to `/api/creator_competition/competition/{id}/image`.
         """
-        agent_id = agent_id or self._last_agent_id
-        if agent_id is None:
-            raise SubmissionError("No agent_id provided and no previous submission found")
+        if not os.path.isfile(image_path):
+            raise MLArenaError(f"Image file not found: {image_path}")
+        with open(image_path, "rb") as fh:
+            resp = requests.post(
+                self._url(
+                    f"/creator_competition/competition/{competition_id}/image"
+                ),
+                headers=self._headers(),
+                files={"file": (os.path.basename(image_path), fh)},
+                timeout=120,
+            )
+        self._handle_response(resp)
+        if resp.status_code not in (200, 201):
+            raise MLArenaError(f"set_competition_image failed: {_safe_error(resp)}")
+        return resp.json()
 
+    def set_competition_markdown(self, competition_id: int, content: str) -> dict:
+        """Replace the competition overview markdown (`overview.md`)."""
+        resp = requests.put(
+            self._url(
+                f"/creator_competition/competition/{competition_id}/markdown"
+            ),
+            headers=self._headers(json_body=True),
+            json={"content": content},
+            timeout=30,
+        )
+        self._handle_response(resp)
+        if resp.status_code != 200:
+            raise MLArenaError(f"set_competition_markdown failed: {_safe_error(resp)}")
+        return resp.json()
+
+    def upload_benchmark_file(self, competition_id: int, file_path: str) -> dict:
+        """Upload a benchmark agent file (typically `agent.py`).
+
+        Backend reads the benchmark folder when `run_benchmark` fires; you
+        must upload the agent before kicking the run.
+        """
+        if not os.path.isfile(file_path):
+            raise MLArenaError(f"File not found: {file_path}")
+        with open(file_path, "rb") as fh:
+            resp = requests.put(
+                self._url(
+                    f"/creator_competition/competition/{competition_id}/benchmark/files"
+                ),
+                headers=self._headers(),
+                files={"file": (os.path.basename(file_path), fh)},
+                timeout=120,
+            )
+        self._handle_response(resp)
+        if resp.status_code not in (200, 201):
+            raise MLArenaError(f"upload_benchmark_file failed: {_safe_error(resp)}")
+        return resp.json()
+
+    def update_benchmark_file_content(self, competition_id: int, filename: str,
+                                      content: str) -> dict:
+        """Write a benchmark file by content (templated baseline agent)."""
+        resp = requests.put(
+            self._url(
+                f"/creator_competition/competition/{competition_id}/benchmark/files"
+            ),
+            headers=self._headers(json_body=True),
+            json={"filename": filename, "content": content},
+            timeout=60,
+        )
+        self._handle_response(resp)
+        if resp.status_code != 200:
+            raise MLArenaError(
+                f"update_benchmark_file_content failed: {_safe_error(resp)}"
+            )
+        return resp.json()
+
+    def run_benchmark(self, competition_id: int) -> dict:
+        """Kick off the benchmark simulation. Returns `{simulation_id, status}`.
+
+        Requires that env.py has been uploaded and a benchmark `agent.py`
+        (or `submission.csv` for csv_v1) is already present. The call itself
+        is fire-and-forget; poll `benchmark_status` for completion.
+        """
+        resp = requests.post(
+            self._url(
+                f"/creator_competition/competition/{competition_id}/benchmark/run"
+            ),
+            headers=self._headers(),
+            timeout=60,
+        )
+        self._handle_response(resp)
+        if resp.status_code != 200:
+            raise MLArenaError(f"run_benchmark failed: {_safe_error(resp)}")
+        return resp.json()
+
+    def benchmark_status(self, competition_id: int) -> dict:
+        """Read the latest benchmark run status. Status is one of
+        `none | running | completed | failed`.
+        """
         resp = requests.get(
-            self._url(f"/status/{agent_id}"),
+            self._url(
+                f"/creator_competition/competition/{competition_id}/benchmark/status"
+            ),
             headers=self._headers(),
             timeout=30,
         )
@@ -125,57 +397,249 @@ class MLArenaClient:
         resp.raise_for_status()
         return resp.json()
 
-    def leaderboard(self, competition=None):
+    def start_competition(self, competition_id: int) -> dict:
+        """Flip a creator competition into the started state.
+
+        Backend gates this behind: env.py uploaded, benchmark agent ACTIVE
+        with a non-null `mean_reward`. Failures bubble up as MLArenaError.
         """
-        Get the leaderboard for a competition.
+        resp = requests.put(
+            self._url(
+                f"/creator_competition/competition/{competition_id}/start"
+            ),
+            headers=self._headers(),
+            timeout=30,
+        )
+        self._handle_response(resp)
+        if resp.status_code != 200:
+            raise MLArenaError(f"start_competition failed: {_safe_error(resp)}")
+        return resp.json()
 
-        Args:
-            competition: Competition name or ID (defaults to last submitted competition)
+    # ---- Direct attached agents (user scope) ----
 
-        Returns:
-            pandas.DataFrame if pandas is installed, otherwise list of dicts
+    def create_attached_agent(self, competition_id: int, agent_name: str,
+                              copy_from_agent_id: int | None = None) -> dict:
+        """Create a new agent attachment for `competition_id`.
+
+        Requires a `user`-scope token.
         """
-        competition = competition or self._last_competition
-        if competition is None:
-            raise SubmissionError("No competition specified and no previous submission found")
+        body: dict = {"agent_name": agent_name}
+        if copy_from_agent_id is not None:
+            body["copy_from_agent_id"] = copy_from_agent_id
+        resp = requests.post(
+            self._url(f"/direct_attache_agents/competition/{competition_id}"),
+            headers=self._headers(json_body=True),
+            json=body,
+            timeout=60,
+        )
+        self._handle_response(resp)
+        if resp.status_code not in (200, 201):
+            raise SubmissionError(f"create_attached_agent failed: {_safe_error(resp)}")
+        return resp.json()
 
+    def upload_agent_file(self, competition_id: int, attache_agent_id: int,
+                          file_path: str) -> dict:
+        """Upload (or overwrite) a single file in an existing agent attachment."""
+        if not os.path.isfile(file_path):
+            raise SubmissionError(f"File not found: {file_path}")
+        with open(file_path, "rb") as fh:
+            resp = requests.put(
+                self._url(
+                    f"/direct_attache_agents/competition/{competition_id}/{attache_agent_id}/file"
+                ),
+                headers=self._headers(),
+                files={"file": (os.path.basename(file_path), fh)},
+                timeout=120,
+            )
+        self._handle_response(resp)
+        if resp.status_code not in (200, 201):
+            raise SubmissionError(f"upload_agent_file failed: {_safe_error(resp)}")
+        return resp.json()
+
+    def deploy_agent(self, competition_id: int, attache_agent_id: int) -> dict:
+        """Trigger deployment of an uploaded agent."""
+        resp = requests.put(
+            self._url(
+                f"/direct_attache_agents/competition/{competition_id}/{attache_agent_id}/deploy"
+            ),
+            headers=self._headers(),
+            timeout=60,
+        )
+        self._handle_response(resp)
+        if resp.status_code not in (200, 201, 202):
+            raise SubmissionError(f"deploy_agent failed: {_safe_error(resp)}")
+        return resp.json()
+
+    def agent_deploy_status(self, competition_id: int, attache_agent_id: int) -> dict:
+        """Read the deploy / run status of an attached agent."""
         resp = requests.get(
-            self._url(f"/leaderboard/{competition}"),
+            self._url(
+                f"/direct_attache_agents/competition/{competition_id}/{attache_agent_id}/deploy"
+            ),
+            headers=self._headers(),
             timeout=30,
         )
         self._handle_response(resp)
         resp.raise_for_status()
-        data = resp.json()
-        return _to_dataframe(data)
+        return resp.json()
 
-    def competitions(self):
-        """
-        List active competitions.
+    # ---- One-shot submit helper (still used by the notebook flow) ----
 
-        Returns:
-            pandas.DataFrame if pandas is installed, otherwise list of dicts
+    def submit(self, competition_id: int, agent=None, files=None,
+               agent_name: str | None = None) -> dict:
+        """Convenience: create attachment → upload files → deploy in one call.
+
+        Either pass `agent=<class>` (its source is uploaded as `agent.py`) or
+        `files=[...]` (each path is uploaded under its basename).
         """
+        if (agent is None) == (files is None):
+            raise SubmissionError("Provide exactly one of agent= or files=")
+
+        attach = self.create_attached_agent(
+            competition_id, agent_name or _default_agent_name(agent, files)
+        )
+        attache_agent_id = attach["attache_agent_id"]
+
+        tmp_dir = None
+        try:
+            if agent is not None:
+                tmp_dir = tempfile.mkdtemp()
+                agent_py = os.path.join(tmp_dir, "agent.py")
+                with open(agent_py, "w") as f:
+                    f.write(inspect.getsource(agent))
+                self.upload_agent_file(competition_id, attache_agent_id, agent_py)
+            else:
+                for path in files:
+                    self.upload_agent_file(competition_id, attache_agent_id, path)
+
+            deploy = self.deploy_agent(competition_id, attache_agent_id)
+            self._last_agent_id = attache_agent_id
+            self._last_competition = competition_id
+            return {
+                "attache_agent_id": attache_agent_id,
+                "agent_id": attache_agent_id,
+                "deploy": deploy,
+            }
+        finally:
+            if tmp_dir:
+                import shutil
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def status(self, agent_id: int | None = None,
+               competition_id: int | None = None) -> dict:
+        """Return the status of a previously-submitted agent.
+
+        Defaults to the last submission made through this client. Both
+        agent_id and competition_id are required by the backend route, so
+        callers using a non-default agent_id must also pass competition_id.
+        """
+        agent_id = agent_id or self._last_agent_id
+        competition_id = competition_id or self._last_competition
+        if agent_id is None or competition_id is None:
+            raise SubmissionError(
+                "agent_id and competition_id are required (no previous submission found)"
+            )
+        return self.agent_deploy_status(competition_id, agent_id)
+
+    # ---- Leaderboard (public read) ----
+
+    def leaderboard(self, competition_id: int | None = None):
+        """Get the leaderboard for a competition."""
+        competition_id = competition_id or self._last_competition
+        if competition_id is None:
+            raise SubmissionError("No competition specified and no previous submission found")
         resp = requests.get(
-            self._url("/competitions"),
+            self._url(f"/leaderboard/{competition_id}"),
             timeout=30,
         )
+        self._handle_response(resp)
         resp.raise_for_status()
-        data = resp.json()
-        return _to_dataframe(data)
+        return _to_dataframe(resp.json())
 
-    def __repr__(self):
-        return f"MLArenaClient(base_url='{self._base_url}', key_id='{self._key_id[:8]}...')"
+    # ---- Academic courses (teacher scope to create, user scope to enroll) ----
+
+    def create_course(self, name: str, code: str, start_date: str, end_date: str,
+                      instructor_name: str | None = None,
+                      competition_id: int | None = None) -> dict:
+        """Create an academic course. Requires a `teacher`-scope token.
+
+        `start_date` / `end_date` are ISO date strings (`YYYY-MM-DD`). The
+        backend mints the `enrollment_link` itself and returns it in the
+        response — read it from there to share with students.
+        """
+        body = {
+            "name": name,
+            "code": code,
+            "start_date": start_date,
+            "end_date": end_date,
+        }
+        if instructor_name is not None:
+            body["instructor_name"] = instructor_name
+        if competition_id is not None:
+            body["competition_id"] = competition_id
+        resp = requests.post(
+            self._url("/academic_courses/"),
+            headers=self._headers(json_body=True),
+            json=body,
+            timeout=30,
+        )
+        self._handle_response(resp)
+        if resp.status_code not in (200, 201):
+            raise MLArenaError(f"create_course failed: {_safe_error(resp)}")
+        return resp.json()
+
+    def enroll_in_course(self, enrollment_link: str,
+                         student_email: str | None = None,
+                         student_number: str | None = None,
+                         project_url: str | None = None) -> dict:
+        """Enroll the authenticated user in a course via its enrollment link."""
+        body: dict = {}
+        if student_email is not None:
+            body["student_email"] = student_email
+        if student_number is not None:
+            body["student_number"] = student_number
+        if project_url is not None:
+            body["project_url"] = project_url
+        resp = requests.post(
+            self._url(f"/academic_courses/enroll/{enrollment_link}"),
+            headers=self._headers(json_body=True),
+            json=body,
+            timeout=30,
+        )
+        self._handle_response(resp)
+        if resp.status_code not in (200, 201):
+            raise MLArenaError(f"enroll_in_course failed: {_safe_error(resp)}")
+        return resp.json()
+
+    def __repr__(self) -> str:
+        head = self._token.split("_", 3)
+        masked = "_".join(head[:3] + ["…"]) if len(head) == 4 else "…"
+        return f"MLArenaClient(base_url='{self._base_url}', token='{masked}')"
+
+
+def _default_agent_name(agent, files) -> str:
+    if agent is not None:
+        return getattr(agent, "__name__", "agent")
+    if files:
+        return os.path.splitext(os.path.basename(files[0]))[0]
+    return "agent"
+
+
+def _safe_error(resp: requests.Response, fallback: str = "request failed") -> str:
+    try:
+        return resp.json().get("error", fallback)
+    except Exception:
+        return resp.text or fallback
 
 
 def _to_dataframe(data):
-    """Convert tabular response to DataFrame if pandas available, else list of dicts."""
+    """Return a pandas DataFrame if pandas is installed, otherwise a list/dict."""
     if isinstance(data, dict) and "columns" in data and "data" in data:
         rows = [dict(zip(data["columns"], row)) for row in data["data"]]
     elif isinstance(data, list):
         rows = data
     else:
         return data
-
     try:
         import pandas as pd
         return pd.DataFrame(rows)

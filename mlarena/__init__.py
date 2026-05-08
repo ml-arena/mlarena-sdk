@@ -1,31 +1,40 @@
 from mlarena.client import MLArenaClient
-from mlarena.exceptions import MLArenaError, AuthenticationError, SubmissionError, CompetitionNotFoundError
+from mlarena.exceptions import (
+    AuthenticationError,
+    CompetitionNotFoundError,
+    MLArenaError,
+    SubmissionError,
+)
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 
-def connect(api_key, base_url="https://ml-arena.com"):
-    """
-    Connect to ML Arena.
+def connect(api_key: str, base_url: str = "https://ml-arena.com") -> MLArenaClient:
+    """Connect to ML Arena.
 
     Args:
-        api_key: API key in format "key_id:key_pass" (from your Profile page)
-        base_url: ML Arena server URL
+        api_key: Full bearer token in the canonical form
+            ``mlk_<scope>_<lookup>_<secret>`` (copy it from your Profile page).
+            Older `key_id:key_pass` colon-separated form is no longer supported.
+        base_url: ML Arena server URL.
 
     Returns:
-        MLArenaClient instance
+        MLArenaClient instance.
 
     Raises:
-        AuthenticationError: If api_key format is invalid
+        AuthenticationError: If the token doesn't look like a real `mlk_…`
+            token. The backend ultimately decides authenticity on the first
+            authenticated request.
     """
-    if not api_key or ":" not in api_key:
+    if not api_key or not api_key.startswith("mlk_"):
         raise AuthenticationError(
-            "Invalid api_key format. Expected 'key_id:key_pass'. "
-            "Get your keys from your Profile page on ML Arena."
+            "Invalid api_key format. Expected a token of the form "
+            "'mlk_<scope>_<lookup>_<secret>' (copy it from your Profile page)."
         )
-
-    key_id, key_pass = api_key.split(":", 1)
-    if not key_id or not key_pass:
-        raise AuthenticationError("Both key_id and key_pass must be non-empty.")
-
-    return MLArenaClient(key_id=key_id, key_pass=key_pass, base_url=base_url.rstrip("/"))
+    parts = api_key.split("_", 3)
+    if len(parts) != 4 or any(not part for part in parts):
+        raise AuthenticationError(
+            "Invalid api_key shape. Expected exactly 4 underscore-separated parts "
+            "(prefix, scope, lookup, secret)."
+        )
+    return MLArenaClient(token=api_key, base_url=base_url)
