@@ -10,8 +10,11 @@ separate `/api/sdk/` namespace.
 """
 
 import inspect
+import io
 import os
 import tempfile
+import time
+from typing import Iterator
 
 import requests
 
@@ -63,6 +66,18 @@ class MLArenaClient:
         resp = requests.get(self._url("/competitions/"), timeout=30)
         resp.raise_for_status()
         return _to_dataframe(resp.json())
+
+    def competition(self, competition_id: int) -> dict:
+        """Fetch a single competition's detail (settings, limits, status).
+
+        Useful for client-side preflight against `max_upload_size_bytes` and
+        `max_upload_files` before calling `upload_agent_file` / `submit`.
+        Mirrors `GET /api/competitions/{id}` (`competitions.py:164`).
+        """
+        resp = requests.get(self._url(f"/competitions/{competition_id}"), timeout=30)
+        self._handle_response(resp)
+        resp.raise_for_status()
+        return resp.json()
 
     def create_competition(self, name: str, kernel_version: str,
                            description: str | None = None,
@@ -483,22 +498,301 @@ class MLArenaClient:
         resp.raise_for_status()
         return resp.json()
 
+    def delete_agent(self, competition_id: int, attache_agent_id: int) -> dict:
+        """Soft-delete an attached agent (`DELETE /direct_attache_agents/competition/{cid}/{aid}`)."""
+        resp = requests.delete(
+            self._url(
+                f"/direct_attache_agents/competition/{competition_id}/{attache_agent_id}"
+            ),
+            headers=self._headers(),
+            timeout=30,
+        )
+        self._handle_response(resp)
+        if resp.status_code != 200:
+            raise SubmissionError(f"delete_agent failed: {_safe_error(resp)}")
+        return resp.json()
+
+    # ---- Runner / runtime selection (DockerImageAgentRuntime) ----
+
+    def runtime_options(self, competition_id: int):
+        """List runtimes (language × framework × version) compatible with this competition.
+
+        Mirrors `GET /api/direct_attache_agents/runtime_options/{cid}`
+        (`runtime.py:25`). Each entry: `{id, language, language_version,
+        framework, framework_version, requirement}`.
+        """
+        resp = requests.get(
+            self._url(f"/direct_attache_agents/runtime_options/{competition_id}"),
+            headers=self._headers(),
+            timeout=30,
+        )
+        self._handle_response(resp)
+        if resp.status_code != 200:
+            raise MLArenaError(f"runtime_options failed: {_safe_error(resp)}")
+        return _to_dataframe(resp.json())
+
+    def agent_runtime(self, attache_agent_id: int) -> dict:
+        """Currently selected runtime for an attached agent (`runtime.py:88`)."""
+        resp = requests.get(
+            self._url(f"/direct_attache_agents/agent_runtime/{attache_agent_id}"),
+            headers=self._headers(),
+            timeout=30,
+        )
+        self._handle_response(resp)
+        if resp.status_code != 200:
+            raise MLArenaError(f"agent_runtime failed: {_safe_error(resp)}")
+        return resp.json()
+
+    def set_agent_runtime(self, attache_agent_id: int, runtime_id: int) -> dict:
+        """Pin a `DockerImageAgentRuntime` onto an attached agent (`runtime.py:151`).
+
+        The backend rejects runtimes whose `docker_image_worker_envagent_id`
+        does not match the competition's engine.
+        """
+        resp = requests.put(
+            self._url(f"/direct_attache_agents/agent_runtime/{attache_agent_id}"),
+            headers=self._headers(json_body=True),
+            json={"docker_image_agent_runtime_id": runtime_id},
+            timeout=30,
+        )
+        self._handle_response(resp)
+        if resp.status_code != 200:
+            raise MLArenaError(f"set_agent_runtime failed: {_safe_error(resp)}")
+        return resp.json()
+
+    def resolve_runtime(self, competition_id: int, *,
+                        language: str | None = None,
+                        framework: str | None = None,
+                        framework_version: str | None = None) -> dict:
+        """Find one runtime matching the given language/framework on this competition.
+
+        Convenience wrapper over `runtime_options`. Returns the first match,
+        or raises `MLArenaError` if none. Used internally by `submit()` when
+        the caller passes `runtime={"language": ...}` instead of a numeric id.
+        """
+        opts = self.runtime_options(competition_id)
+        # Normalize back to list[dict] in case pandas converted it.
+        rows = opts.to_dict("records") if hasattr(opts, "to_dict") else list(opts)
+        for r in rows:
+            if language is not None and r.get("language") != language:
+                continue
+            if framework is not None and r.get("framework") != framework:
+                continue
+            if framework_version is not None and r.get("framework_version") != framework_version:
+                continue
+            return r
+        raise MLArenaError(
+            f"No runtime found for language={language!r} framework={framework!r} "
+            f"framework_version={framework_version!r}. Available: {rows}"
+        )
+
+    # ---- File listing / reading / editing / deleting ----
+
+    def list_agent_files(self, competition_id: int, attache_agent_id: int) -> dict:
+        """List files in an agent attachment with their content (or binary marker).
+
+        Mirrors `GET …/competition/{cid}/{aid}/file` (`file.py:244`). Returns
+        the raw `{"files": {<name>: {content, language, is_binary, size}}}`
+        payload — keep the wrapper shallow so callers can drill into either
+        the file map or the metadata.
+        """
+        resp = requests.get(
+            self._url(
+                f"/direct_attache_agents/competition/{competition_id}/{attache_agent_id}/file"
+            ),
+            headers=self._headers(),
+            timeout=30,
+        )
+        self._handle_response(resp)
+        if resp.status_code != 200:
+            raise SubmissionError(f"list_agent_files failed: {_safe_error(resp)}")
+        return resp.json()
+
+    def get_agent_file_content(self, competition_id: int, attache_agent_id: int,
+                               filename: str) -> str:
+        """Fetch the raw text content of one file in an agent attachment (`file.py:463`)."""
+        resp = requests.get(
+            self._url(
+                f"/direct_attache_agents/competition/{competition_id}/{attache_agent_id}/file/{filename}/content"
+            ),
+            headers=self._headers(),
+            timeout=30,
+        )
+        self._handle_response(resp)
+        if resp.status_code != 200:
+            raise SubmissionError(f"get_agent_file_content failed: {_safe_error(resp)}")
+        return resp.json()["content"]
+
+    def update_agent_file_content(self, competition_id: int, attache_agent_id: int,
+                                  filename: str, content: str) -> dict:
+        """Write a text file by content (template render → upload).
+
+        Multipart PUT to the same upload endpoint as `upload_agent_file`,
+        carrying the content as the `file` part. Sibling of
+        `update_env_file_content` on the creator side. The backend validates
+        the resulting attachment folder and returns `{status, validation_message}`.
+        """
+        resp = requests.put(
+            self._url(
+                f"/direct_attache_agents/competition/{competition_id}/{attache_agent_id}/file"
+            ),
+            headers=self._headers(),
+            files={"file": (filename, io.BytesIO(content.encode("utf-8")))},
+            timeout=120,
+        )
+        self._handle_response(resp)
+        if resp.status_code not in (200, 201):
+            raise SubmissionError(f"update_agent_file_content failed: {_safe_error(resp)}")
+        return resp.json()
+
+    def delete_agent_file(self, competition_id: int, attache_agent_id: int,
+                          filename: str) -> dict:
+        """Delete one file from an agent attachment.
+
+        The backend overloads the upload PUT with a `delete_file=<name>` form
+        field — same endpoint, different verb-encoding (`file.py:128`).
+        """
+        resp = requests.put(
+            self._url(
+                f"/direct_attache_agents/competition/{competition_id}/{attache_agent_id}/file"
+            ),
+            headers=self._headers(),
+            data={"delete_file": filename},
+            timeout=60,
+        )
+        self._handle_response(resp)
+        if resp.status_code != 200:
+            raise SubmissionError(f"delete_agent_file failed: {_safe_error(resp)}")
+        return resp.json()
+
+    # ---- Status / logs ----
+
+    def agent_status(self, competition_id: int, attache_agent_id: int) -> dict:
+        """Rich agent status: `queue_info`, `run_info`, `last_status_message`.
+
+        Mirrors `GET …/competition/{cid}/{aid}/status` (`status.py:210`).
+        Use this over `agent_deploy_status` when you want to see queue
+        position or per-run errors.
+        """
+        resp = requests.get(
+            self._url(
+                f"/direct_attache_agents/competition/{competition_id}/{attache_agent_id}/status"
+            ),
+            headers=self._headers(),
+            timeout=30,
+        )
+        self._handle_response(resp)
+        if resp.status_code != 200:
+            raise SubmissionError(f"agent_status failed: {_safe_error(resp)}")
+        return resp.json()
+
+    def agent_games(self, attache_agent_id: int) -> dict:
+        """Recent games for an attached agent with signed log URLs.
+
+        Mirrors `GET /api/direct_attache_agents/agent/{aid}/games`
+        (`monitor.py:25`). Each game carries a `signed_url` to the GCS render
+        log (60-day retention) plus reward/outcome and per-game metrics.
+        """
+        resp = requests.get(
+            self._url(f"/direct_attache_agents/agent/{attache_agent_id}/games"),
+            headers=self._headers(),
+            timeout=30,
+        )
+        self._handle_response(resp)
+        if resp.status_code != 200:
+            raise SubmissionError(f"agent_games failed: {_safe_error(resp)}")
+        return resp.json()
+
+    def tail_logs(self, competition_id: int, attache_agent_id: int, *,
+                  follow: bool = False, poll_sec: float = 5.0,
+                  timeout_sec: float | None = None) -> Iterator[str]:
+        """Yield human-readable status / log lines for an attached agent.
+
+        Polls `agent_status` and emits one line per status transition,
+        including queue position for `deploy_queue` and per-run rewards /
+        errors for `deploy_run`. With `follow=False` (default), returns once
+        the agent reaches a terminal state (`active`, `deploy_failed`,
+        `upload_failed`, `deleted`); with `follow=True`, keeps polling until
+        the caller breaks out. `timeout_sec` caps total wait time.
+
+        Note: this does NOT stream pod stdout — that's only available via
+        the per-game signed URLs from `agent_games()`. For raw logs of a
+        completed run, do:
+
+            for game in client.agent_games(aid)["games"]:
+                if game["signed_url"]:
+                    print(requests.get(game["signed_url"]).text)
+        """
+        terminal = {"active", "deploy_failed", "upload_failed", "deleted"}
+        last_signature = None
+        deadline = (time.monotonic() + timeout_sec) if timeout_sec else None
+
+        while True:
+            status = self.agent_status(competition_id, attache_agent_id)
+            sig = (status.get("status"), status.get("last_status_message"))
+            if sig != last_signature:
+                yield f"[{status.get('status')}] {status.get('last_status_message') or ''}".rstrip()
+                last_signature = sig
+
+            if status.get("status") == "deploy_queue":
+                qi = status.get("queue_info") or {}
+                if qi:
+                    yield (f"  queued: position={qi.get('position_in_queue')} "
+                           f"waiting={qi.get('in_queue_for_second')}s")
+
+            if status.get("status") == "deploy_run":
+                ri = status.get("run_info") or {}
+                for r in ri.get("results") or []:
+                    yield (f"  run: status={r.get('status')} "
+                           f"steps={r.get('steps_completed')} "
+                           f"reward={r.get('current_reward')} "
+                           f"outcome={r.get('game_outcome')}")
+                    if r.get("status") == "error":
+                        yield f"    error[{r.get('error_type')}]: {r.get('error_message')}"
+
+            if status.get("status") in terminal:
+                if not follow:
+                    return
+
+            if deadline and time.monotonic() > deadline:
+                return
+
+            time.sleep(poll_sec)
+
     # ---- One-shot submit helper (still used by the notebook flow) ----
 
     def submit(self, competition_id: int, agent=None, files=None,
-               agent_name: str | None = None) -> dict:
-        """Convenience: create attachment → upload files → deploy in one call.
+               agent_name: str | None = None,
+               runtime_id: int | None = None,
+               runtime: dict | None = None) -> dict:
+        """Convenience: create attachment → (pick runner) → upload files → deploy.
 
         Either pass `agent=<class>` (its source is uploaded as `agent.py`) or
         `files=[...]` (each path is uploaded under its basename).
+
+        Optional runner selection (between create and deploy):
+            runtime_id: numeric `DockerImageAgentRuntime.id`.
+            runtime:    dict spec resolved via `resolve_runtime()`, e.g.
+                        `{"language": "python", "framework": "torch"}`. The
+                        first runtime matching every supplied key is used.
+        Pass at most one of `runtime_id` / `runtime`. With neither, the
+        backend's competition-default runtime is kept.
         """
         if (agent is None) == (files is None):
             raise SubmissionError("Provide exactly one of agent= or files=")
+        if runtime_id is not None and runtime is not None:
+            raise SubmissionError("Provide at most one of runtime_id= or runtime=")
 
         attach = self.create_attached_agent(
             competition_id, agent_name or _default_agent_name(agent, files)
         )
         attache_agent_id = attach["attache_agent_id"]
+
+        # Pin runner before deploy so the JobPod uses the right image.
+        if runtime is not None:
+            runtime_id = self.resolve_runtime(competition_id, **runtime)["id"]
+        if runtime_id is not None:
+            self.set_agent_runtime(attache_agent_id, runtime_id)
 
         tmp_dir = None
         try:
@@ -527,11 +821,14 @@ class MLArenaClient:
 
     def status(self, agent_id: int | None = None,
                competition_id: int | None = None) -> dict:
-        """Return the status of a previously-submitted agent.
+        """Return the rich status of a previously-submitted agent.
 
         Defaults to the last submission made through this client. Both
         agent_id and competition_id are required by the backend route, so
         callers using a non-default agent_id must also pass competition_id.
+        Returns the same payload as `agent_status` (queue_info, run_info,
+        last_status_message), which is more informative than
+        `agent_deploy_status`.
         """
         agent_id = agent_id or self._last_agent_id
         competition_id = competition_id or self._last_competition
@@ -539,17 +836,20 @@ class MLArenaClient:
             raise SubmissionError(
                 "agent_id and competition_id are required (no previous submission found)"
             )
-        return self.agent_deploy_status(competition_id, agent_id)
+        return self.agent_status(competition_id, agent_id)
 
     # ---- Leaderboard (public read) ----
 
     def leaderboard(self, competition_id: int | None = None):
-        """Get the leaderboard for a competition."""
+        """Get the leaderboard for a competition.
+
+        Mirrors `GET /api/leaderboard/competition/{id}` (`leaderboard.py:28`).
+        """
         competition_id = competition_id or self._last_competition
         if competition_id is None:
             raise SubmissionError("No competition specified and no previous submission found")
         resp = requests.get(
-            self._url(f"/leaderboard/{competition_id}"),
+            self._url(f"/leaderboard/competition/{competition_id}"),
             timeout=30,
         )
         self._handle_response(resp)
