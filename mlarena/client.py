@@ -61,11 +61,48 @@ class MLArenaClient:
 
     # ---- Competitions (public read; create/update via creator scope) ----
 
-    def competitions(self):
-        """List active competitions. Public; no auth required."""
-        resp = requests.get(self._url("/competitions/"), timeout=30)
-        resp.raise_for_status()
-        return _to_dataframe(resp.json())
+    def competitions(
+        self,
+        *,
+        q: str | None = None,
+        tags: list[str] | str | None = None,
+        status: str | None = None,
+        page: int | None = None,
+        per_page: int | None = None,
+    ):
+        """List competitions. Public; no auth required.
+
+        With no args, returns all matching competitions as a DataFrame
+        (auto-paginates internally). Pass ``page``/``per_page`` to fetch a
+        single page; pass ``q``/``tags``/``status`` to filter server-side.
+        """
+        base_params: dict = {}
+        if q:
+            base_params["q"] = q
+        if status:
+            base_params["status"] = status
+        if tags:
+            base_params["tags"] = ",".join(tags) if isinstance(tags, list) else tags
+
+        if page is not None or per_page is not None:
+            params = {**base_params, "page": page or 1, "per_page": per_page or 24}
+            resp = requests.get(self._url("/competitions/"), params=params, timeout=30)
+            resp.raise_for_status()
+            return _to_dataframe(resp.json().get("items", []))
+
+        items: list = []
+        page_n = 1
+        per_page_n = 100
+        while True:
+            params = {**base_params, "page": page_n, "per_page": per_page_n}
+            resp = requests.get(self._url("/competitions/"), params=params, timeout=30)
+            resp.raise_for_status()
+            body = resp.json()
+            items.extend(body.get("items", []))
+            if not body.get("metadata", {}).get("has_next"):
+                break
+            page_n += 1
+        return _to_dataframe(items)
 
     def competition(self, competition_id: int) -> dict:
         """Fetch a single competition's detail (settings, limits, status).
@@ -73,6 +110,12 @@ class MLArenaClient:
         Useful for client-side preflight against `max_upload_size_bytes` and
         `max_upload_files` before calling `upload_agent_file` / `submit`.
         Mirrors `GET /api/competitions/{id}` (`competitions.py:164`).
+
+        Includes an `engine` sub-object with the engine's
+        `k8s_workload_value` plus `vm_health_ok` / `vm_health_checked_at`
+        (only populated for `local_vm` engines, polled every minute by
+        simulationmanager). `vm_health_ok=False` means the GPU VM is
+        currently unreachable and submissions will queue rather than run.
         """
         resp = requests.get(self._url(f"/competitions/{competition_id}"), timeout=30)
         self._handle_response(resp)
@@ -82,7 +125,8 @@ class MLArenaClient:
     def create_competition(self, name: str, kernel_version: str,
                            description: str | None = None,
                            copy_from_competition_id: int | None = None,
-                           tag_names: list[str] | None = None) -> dict:
+                           tag_names: list[str] | None = None,
+                           is_public: bool | None = None) -> dict:
         """Create a new competition via the creator-scope authoring flow.
 
         The backend resolves the engine + default evaluation + default env
@@ -95,6 +139,12 @@ class MLArenaClient:
         call. Unknown names raise `MLArenaError` (fail fast — the catalog
         is admin-curated; new tags are not auto-created).
 
+        Pass `is_public=False` to hide the competition from public listings,
+        search, and direct URLs at creation time. Only the owner, creator
+        assistants, and admins can view or interact with a hidden
+        competition; everyone else gets 404. Visibility can be toggled later
+        via `update_competition(is_public=...)`. Defaults to public.
+
         Requires a `creator`-scope token.
         """
         body = {"name": name, "kernel_version": kernel_version}
@@ -104,6 +154,8 @@ class MLArenaClient:
             body["copy_from_competition_id"] = copy_from_competition_id
         if tag_names:
             body["tag_ids"] = self._resolve_tag_names(tag_names)
+        if is_public is not None:
+            body["is_public"] = is_public
         resp = requests.post(
             self._url("/creator_competition/competition"),
             headers=self._headers(json_body=True),
@@ -148,28 +200,39 @@ class MLArenaClient:
         return resp.json()
 
     def _resolve_tag_names(self, tag_names: list[str]) -> list[int]:
-        """Resolve a list of tag names to ids via the public catalog."""
+        """Resolve a list of tag names to ids via the public catalog.
+
+        Matching is case-insensitive: prod seeds tags as "GYMNASIUM" while
+        local seeds them as "gymnasium", and callers shouldn't have to know
+        which environment they hit.
+        """
         catalog_resp = requests.get(self._url("/competition_tags/tags"), timeout=30)
         catalog_resp.raise_for_status()
         catalog = catalog_resp.json()
-        by_name = {t["name"]: t["id"] for t in catalog}
-        unknown = [n for n in tag_names if n not in by_name]
+        by_name_ci = {t["name"].casefold(): t["id"] for t in catalog}
+        unknown = [n for n in tag_names if n.casefold() not in by_name_ci]
         if unknown:
             raise MLArenaError(
                 f"Unknown tag name(s): {unknown}. "
-                f"Known tags: {sorted(by_name.keys())}"
+                f"Known tags: {sorted(t['name'] for t in catalog)}"
             )
-        return [by_name[n] for n in tag_names]
+        return [by_name_ci[n.casefold()] for n in tag_names]
 
     def update_competition(self, competition_id: int, *,
                            name: str | None = None,
                            description: str | None = None,
                            is_public: bool | None = None) -> dict:
-        """Patch top-level competition fields (creator scope, pre-start only).
+        """Patch top-level competition fields (creator scope).
 
         Mirrors `PUT /api/creator_competition/competition/{id}`. Only fields
-        explicitly passed are sent — everything else is left untouched. The
-        backend rejects updates after the competition has been started.
+        explicitly passed are sent — everything else is left untouched.
+
+        ``name`` and ``description`` are locked once the competition has
+        started; the backend rejects updates to those. ``is_public`` is
+        editable at any time, including while the competition is running, so
+        creators can hide an active competition without stopping it. When
+        ``is_public=False``, only the owner, creator assistants, and admins
+        can view or interact with the competition.
         """
         body: dict = {}
         if name is not None:
@@ -279,6 +342,37 @@ class MLArenaClient:
         self._handle_response(resp)
         if resp.status_code not in (200, 201):
             raise MLArenaError(f"upload_env_file failed: {_safe_error(resp)}")
+        return resp.json()
+
+    def sync_env_from_github(
+        self,
+        competition_id: int,
+        github_repo_url: str,
+        github_token: str | None = None,
+    ) -> dict:
+        """Mirror a GitHub repo's default branch into the competition env folder.
+
+        Wipes the current env folder and replaces its contents with the repo
+        (`.git` excluded). Only allowed before the competition is started, same
+        gate as `upload_env_file`. `github_token` is optional: when provided it
+        is persisted Fernet-encrypted on the competition configuration and
+        reused on future syncs; leave it `None` to fall back to the saved
+        token (if any).
+        """
+        body = {"github_repo_url": github_repo_url}
+        if github_token is not None:
+            body["github_token"] = github_token
+        resp = requests.post(
+            self._url(
+                f"/creator_competition/competition/{competition_id}/env/sync-github"
+            ),
+            headers=self._headers(json_body=True),
+            json=body,
+            timeout=180,
+        )
+        self._handle_response(resp)
+        if resp.status_code != 200:
+            raise MLArenaError(f"sync_env_from_github failed: {_safe_error(resp)}")
         return resp.json()
 
     def update_env_file_content(self, competition_id: int, filename: str,

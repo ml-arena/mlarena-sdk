@@ -55,12 +55,62 @@ Create a client. `api_key` must be the full `mlk_<scope>_<lookup>_<secret>` toke
 
 ### Agents (user scope)
 
-- `client.submit(competition_id, agent=None, files=None, agent_name=None)` — one-shot create + upload + deploy.
+- `client.submit(competition_id, agent=None, files=None, agent_name=None, runtime_id=None, runtime=None)` — one-shot create + (pick runner) + upload + deploy.
 - `client.create_attached_agent(competition_id, agent_name, copy_from_agent_id=None)`
-- `client.upload_agent_file(competition_id, attache_agent_id, file_path)`
+- `client.upload_agent_file(competition_id, attache_agent_id, file_path)` — multipart upload from disk.
+- `client.update_agent_file_content(competition_id, attache_agent_id, filename, content)` — upload from a string (template render → upload).
+- `client.list_agent_files(competition_id, attache_agent_id)` — list files with their content / binary marker.
+- `client.get_agent_file_content(competition_id, attache_agent_id, filename)` — fetch one file's text.
+- `client.delete_agent_file(competition_id, attache_agent_id, filename)`
 - `client.deploy_agent(competition_id, attache_agent_id)`
-- `client.agent_deploy_status(competition_id, attache_agent_id)`
+- `client.delete_agent(competition_id, attache_agent_id)`
+- `client.agent_status(competition_id, attache_agent_id)` — rich status (queue, runs, errors).
+- `client.agent_deploy_status(competition_id, attache_agent_id)` — deploy quotas + last deploy.
+- `client.agent_games(attache_agent_id)` — recent games with signed log URLs (60-day GCS retention).
+- `client.tail_logs(competition_id, attache_agent_id, follow=False, poll_sec=5.0)` — generator of status / run lines.
 - `client.status(agent_id=None, competition_id=None)` — defaults to the last submission.
+
+### Runners (DockerImageAgentRuntime, user scope)
+
+- `client.runtime_options(competition_id)` — list runtimes compatible with the competition.
+- `client.agent_runtime(attache_agent_id)` — read the runtime currently pinned to an agent.
+- `client.set_agent_runtime(attache_agent_id, runtime_id)` — pin a runtime by id.
+- `client.resolve_runtime(competition_id, language=None, framework=None, framework_version=None)` — resolve a (lang, framework, version) spec to one runtime row.
+
+## Full participant workflow
+
+```python
+import mlarena, requests
+
+c = mlarena.connect("mlk_user_…", base_url="http://localhost:5000")
+
+cid = 42  # competition id
+
+# 1. Pick a runner (language × framework)
+runtimes = c.runtime_options(cid)
+py_gym = c.resolve_runtime(cid, language="python", framework="gymnasium")
+
+# 2. Create the agent + pin runner + upload files + deploy in one call
+sub = c.submit(cid, files=["agent.py", "model.pkl"], runtime_id=py_gym["id"])
+aid = sub["attache_agent_id"]
+
+# 3. Inspect / edit a file in place after the initial upload
+src = c.get_agent_file_content(cid, aid, "agent.py")
+c.update_agent_file_content(cid, aid, "agent.py", src.replace("epsilon=0.1", "epsilon=0.05"))
+c.deploy_agent(cid, aid)  # redeploy after edit
+
+# 4. Watch status / run progress until terminal
+for line in c.tail_logs(cid, aid):
+    print(line)
+
+# 5. Pull stdout from completed games via signed URLs (60d retention)
+for game in c.agent_games(aid)["games"]:
+    if game["signed_url"]:
+        print(requests.get(game["signed_url"]).text)
+
+# 6. Read the leaderboard
+print(c.leaderboard(cid).head())
+```
 
 ### Competitions
 

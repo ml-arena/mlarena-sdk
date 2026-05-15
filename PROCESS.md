@@ -38,10 +38,10 @@ Methods on `MLArenaClient` map 1:1 to backend blueprints — same shape the fron
 
 | SDK method group | Backend blueprint | Frontend equivalent |
 |---|---|---|
-| `competitions()`, `list_tags()` | `/api/competitions`, `/api/competition_tags` | `services/competitionApi.js`, tag hooks |
+| `competitions()`, `competition()`, `list_tags()` | `/api/competitions`, `/api/competition_tags` | `services/competitionApi.js`, tag hooks |
 | `create_competition`, `update_competition`, `update_settings`, `set_competition_tags`, `upload_env_file`, `update_env_file_content`, `set_competition_image`, `set_competition_markdown`, `upload_benchmark_file`, `update_benchmark_file_content`, `run_benchmark`, `benchmark_status`, `start_competition` | `/api/creator_competition/*` | `services/creatorCompetitionApi.js` + `hooks/creatorCompetition/*` |
-| `create_attached_agent`, `upload_agent_file`, `deploy_agent`, `agent_deploy_status`, `submit`, `status` | `/api/direct_attache_agents/*` | `services/directAgentAttachApi.js` + `hooks/DirectAgentAttach/*` |
-| `leaderboard` | `/api/leaderboard/*` | `hooks/competition/useLeaderboard` |
+| `create_attached_agent`, `upload_agent_file`, `update_agent_file_content`, `list_agent_files`, `get_agent_file_content`, `delete_agent_file`, `deploy_agent`, `agent_deploy_status`, `agent_status`, `agent_games`, `tail_logs`, `runtime_options`, `agent_runtime`, `set_agent_runtime`, `resolve_runtime`, `delete_agent`, `submit`, `status` | `/api/direct_attache_agents/*` | `services/directAgentAttachApi.js` + `hooks/DirectAgentAttach/*` |
+| `leaderboard` | `/api/leaderboard/competition/{id}` | `hooks/competition/useLeaderboardData` |
 | `create_course`, `enroll_in_course` | `/api/academic_courses/*` | `services/teacherApi.js`, `pages/EnrollPage.js` |
 
 When the table above drifts from `client.py`, fix `client.py` — the table is a parity contract.
