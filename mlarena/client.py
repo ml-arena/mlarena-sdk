@@ -59,6 +59,16 @@ class MLArenaClient:
             raise CompetitionNotFoundError(_safe_error(resp, "Not found"))
         return resp
 
+    def _request(self, method: str, url: str, **kwargs) -> requests.Response:
+        """Single chokepoint for HTTP calls. Disables redirect-following by
+        default so the bearer token cannot be replayed to an unintended host
+        if the backend ever 3xx-s to one. Sets a default 30s timeout to match
+        the prior per-call default.
+        """
+        kwargs.setdefault("allow_redirects", False)
+        kwargs.setdefault("timeout", 30)
+        return requests.request(method, url, **kwargs)
+
     # ---- Competitions (public read; create/update via creator scope) ----
 
     def competitions(
@@ -86,7 +96,7 @@ class MLArenaClient:
 
         if page is not None or per_page is not None:
             params = {**base_params, "page": page or 1, "per_page": per_page or 24}
-            resp = requests.get(self._url("/competitions/"), params=params, timeout=30)
+            resp = self._request("GET",self._url("/competitions/"), params=params, timeout=30)
             resp.raise_for_status()
             return _to_dataframe(resp.json().get("items", []))
 
@@ -95,7 +105,7 @@ class MLArenaClient:
         per_page_n = 100
         while True:
             params = {**base_params, "page": page_n, "per_page": per_page_n}
-            resp = requests.get(self._url("/competitions/"), params=params, timeout=30)
+            resp = self._request("GET",self._url("/competitions/"), params=params, timeout=30)
             resp.raise_for_status()
             body = resp.json()
             items.extend(body.get("items", []))
@@ -117,7 +127,7 @@ class MLArenaClient:
         simulationmanager). `vm_health_ok=False` means the GPU VM is
         currently unreachable and submissions will queue rather than run.
         """
-        resp = requests.get(self._url(f"/competitions/{competition_id}"), timeout=30)
+        resp = self._request("GET",self._url(f"/competitions/{competition_id}"), timeout=30)
         self._handle_response(resp)
         resp.raise_for_status()
         return resp.json()
@@ -156,7 +166,7 @@ class MLArenaClient:
             body["tag_ids"] = self._resolve_tag_names(tag_names)
         if is_public is not None:
             body["is_public"] = is_public
-        resp = requests.post(
+        resp = self._request("POST",
             self._url("/creator_competition/competition"),
             headers=self._headers(json_body=True),
             json=body,
@@ -169,7 +179,7 @@ class MLArenaClient:
 
     def list_tags(self):
         """Return the public tag catalog. No auth required."""
-        resp = requests.get(self._url("/competition_tags/tags"), timeout=30)
+        resp = self._request("GET",self._url("/competition_tags/tags"), timeout=30)
         resp.raise_for_status()
         return _to_dataframe(resp.json())
 
@@ -188,7 +198,7 @@ class MLArenaClient:
         if (tag_names is None) == (tag_ids is None):
             raise MLArenaError("Provide exactly one of tag_names= or tag_ids=")
         ids = tag_ids if tag_ids is not None else self._resolve_tag_names(tag_names)
-        resp = requests.put(
+        resp = self._request("PUT",
             self._url(f"/creator_competition/competition/{competition_id}/tags"),
             headers=self._headers(json_body=True),
             json={"tag_ids": ids},
@@ -206,7 +216,7 @@ class MLArenaClient:
         local seeds them as "gymnasium", and callers shouldn't have to know
         which environment they hit.
         """
-        catalog_resp = requests.get(self._url("/competition_tags/tags"), timeout=30)
+        catalog_resp = self._request("GET",self._url("/competition_tags/tags"), timeout=30)
         catalog_resp.raise_for_status()
         catalog = catalog_resp.json()
         by_name_ci = {t["name"].casefold(): t["id"] for t in catalog}
@@ -243,7 +253,7 @@ class MLArenaClient:
             body["is_public"] = is_public
         if not body:
             raise MLArenaError("update_competition requires at least one field")
-        resp = requests.put(
+        resp = self._request("PUT",
             self._url(f"/creator_competition/competition/{competition_id}"),
             headers=self._headers(json_body=True),
             json=body,
@@ -310,7 +320,7 @@ class MLArenaClient:
             body["evaluation_episode_budget_brackets"] = evaluation_episode_budget_brackets
         if not body:
             raise MLArenaError("update_settings requires at least one field")
-        resp = requests.put(
+        resp = self._request("PUT",
             self._url(f"/creator_competition/competition/{competition_id}/settings"),
             headers=self._headers(json_body=True),
             json=body,
@@ -331,7 +341,7 @@ class MLArenaClient:
         if not os.path.isfile(file_path):
             raise MLArenaError(f"File not found: {file_path}")
         with open(file_path, "rb") as fh:
-            resp = requests.put(
+            resp = self._request("PUT",
                 self._url(
                     f"/creator_competition/competition/{competition_id}/env/files"
                 ),
@@ -362,7 +372,7 @@ class MLArenaClient:
         body = {"github_repo_url": github_repo_url}
         if github_token is not None:
             body["github_token"] = github_token
-        resp = requests.post(
+        resp = self._request("POST",
             self._url(
                 f"/creator_competition/competition/{competition_id}/env/sync-github"
             ),
@@ -383,7 +393,7 @@ class MLArenaClient:
         the kernel-specific AST validator on env.py and returns a
         `validation` block in the response.
         """
-        resp = requests.put(
+        resp = self._request("PUT",
             self._url(
                 f"/creator_competition/competition/{competition_id}/env/files"
             ),
@@ -404,7 +414,7 @@ class MLArenaClient:
         if not os.path.isfile(image_path):
             raise MLArenaError(f"Image file not found: {image_path}")
         with open(image_path, "rb") as fh:
-            resp = requests.post(
+            resp = self._request("POST",
                 self._url(
                     f"/creator_competition/competition/{competition_id}/image"
                 ),
@@ -419,7 +429,7 @@ class MLArenaClient:
 
     def set_competition_markdown(self, competition_id: int, content: str) -> dict:
         """Replace the competition overview markdown (`overview.md`)."""
-        resp = requests.put(
+        resp = self._request("PUT",
             self._url(
                 f"/creator_competition/competition/{competition_id}/markdown"
             ),
@@ -441,7 +451,7 @@ class MLArenaClient:
         if not os.path.isfile(file_path):
             raise MLArenaError(f"File not found: {file_path}")
         with open(file_path, "rb") as fh:
-            resp = requests.put(
+            resp = self._request("PUT",
                 self._url(
                     f"/creator_competition/competition/{competition_id}/benchmark/files"
                 ),
@@ -457,7 +467,7 @@ class MLArenaClient:
     def update_benchmark_file_content(self, competition_id: int, filename: str,
                                       content: str) -> dict:
         """Write a benchmark file by content (templated baseline agent)."""
-        resp = requests.put(
+        resp = self._request("PUT",
             self._url(
                 f"/creator_competition/competition/{competition_id}/benchmark/files"
             ),
@@ -479,7 +489,7 @@ class MLArenaClient:
         (or `submission.csv` for csv_v1) is already present. The call itself
         is fire-and-forget; poll `benchmark_status` for completion.
         """
-        resp = requests.post(
+        resp = self._request("POST",
             self._url(
                 f"/creator_competition/competition/{competition_id}/benchmark/run"
             ),
@@ -495,7 +505,7 @@ class MLArenaClient:
         """Read the latest benchmark run status. Status is one of
         `none | running | completed | failed`.
         """
-        resp = requests.get(
+        resp = self._request("GET",
             self._url(
                 f"/creator_competition/competition/{competition_id}/benchmark/status"
             ),
@@ -512,7 +522,7 @@ class MLArenaClient:
         Backend gates this behind: env.py uploaded, benchmark agent ACTIVE
         with a non-null `mean_reward`. Failures bubble up as MLArenaError.
         """
-        resp = requests.put(
+        resp = self._request("PUT",
             self._url(
                 f"/creator_competition/competition/{competition_id}/start"
             ),
@@ -535,7 +545,7 @@ class MLArenaClient:
         body: dict = {"agent_name": agent_name}
         if copy_from_agent_id is not None:
             body["copy_from_agent_id"] = copy_from_agent_id
-        resp = requests.post(
+        resp = self._request("POST",
             self._url(f"/direct_attache_agents/competition/{competition_id}"),
             headers=self._headers(json_body=True),
             json=body,
@@ -552,7 +562,7 @@ class MLArenaClient:
         if not os.path.isfile(file_path):
             raise SubmissionError(f"File not found: {file_path}")
         with open(file_path, "rb") as fh:
-            resp = requests.put(
+            resp = self._request("PUT",
                 self._url(
                     f"/direct_attache_agents/competition/{competition_id}/{attache_agent_id}/file"
                 ),
@@ -567,7 +577,7 @@ class MLArenaClient:
 
     def deploy_agent(self, competition_id: int, attache_agent_id: int) -> dict:
         """Trigger deployment of an uploaded agent."""
-        resp = requests.put(
+        resp = self._request("PUT",
             self._url(
                 f"/direct_attache_agents/competition/{competition_id}/{attache_agent_id}/deploy"
             ),
@@ -581,7 +591,7 @@ class MLArenaClient:
 
     def agent_deploy_status(self, competition_id: int, attache_agent_id: int) -> dict:
         """Read the deploy / run status of an attached agent."""
-        resp = requests.get(
+        resp = self._request("GET",
             self._url(
                 f"/direct_attache_agents/competition/{competition_id}/{attache_agent_id}/deploy"
             ),
@@ -594,7 +604,7 @@ class MLArenaClient:
 
     def delete_agent(self, competition_id: int, attache_agent_id: int) -> dict:
         """Soft-delete an attached agent (`DELETE /direct_attache_agents/competition/{cid}/{aid}`)."""
-        resp = requests.delete(
+        resp = self._request("DELETE",
             self._url(
                 f"/direct_attache_agents/competition/{competition_id}/{attache_agent_id}"
             ),
@@ -615,7 +625,7 @@ class MLArenaClient:
         (`runtime.py:25`). Each entry: `{id, language, language_version,
         framework, framework_version, requirement}`.
         """
-        resp = requests.get(
+        resp = self._request("GET",
             self._url(f"/direct_attache_agents/runtime_options/{competition_id}"),
             headers=self._headers(),
             timeout=30,
@@ -627,7 +637,7 @@ class MLArenaClient:
 
     def agent_runtime(self, attache_agent_id: int) -> dict:
         """Currently selected runtime for an attached agent (`runtime.py:88`)."""
-        resp = requests.get(
+        resp = self._request("GET",
             self._url(f"/direct_attache_agents/agent_runtime/{attache_agent_id}"),
             headers=self._headers(),
             timeout=30,
@@ -643,7 +653,7 @@ class MLArenaClient:
         The backend rejects runtimes whose `docker_image_worker_envagent_id`
         does not match the competition's engine.
         """
-        resp = requests.put(
+        resp = self._request("PUT",
             self._url(f"/direct_attache_agents/agent_runtime/{attache_agent_id}"),
             headers=self._headers(json_body=True),
             json={"docker_image_agent_runtime_id": runtime_id},
@@ -690,7 +700,7 @@ class MLArenaClient:
         payload — keep the wrapper shallow so callers can drill into either
         the file map or the metadata.
         """
-        resp = requests.get(
+        resp = self._request("GET",
             self._url(
                 f"/direct_attache_agents/competition/{competition_id}/{attache_agent_id}/file"
             ),
@@ -705,7 +715,7 @@ class MLArenaClient:
     def get_agent_file_content(self, competition_id: int, attache_agent_id: int,
                                filename: str) -> str:
         """Fetch the raw text content of one file in an agent attachment (`file.py:463`)."""
-        resp = requests.get(
+        resp = self._request("GET",
             self._url(
                 f"/direct_attache_agents/competition/{competition_id}/{attache_agent_id}/file/{filename}/content"
             ),
@@ -726,7 +736,7 @@ class MLArenaClient:
         `update_env_file_content` on the creator side. The backend validates
         the resulting attachment folder and returns `{status, validation_message}`.
         """
-        resp = requests.put(
+        resp = self._request("PUT",
             self._url(
                 f"/direct_attache_agents/competition/{competition_id}/{attache_agent_id}/file"
             ),
@@ -746,7 +756,7 @@ class MLArenaClient:
         The backend overloads the upload PUT with a `delete_file=<name>` form
         field — same endpoint, different verb-encoding (`file.py:128`).
         """
-        resp = requests.put(
+        resp = self._request("PUT",
             self._url(
                 f"/direct_attache_agents/competition/{competition_id}/{attache_agent_id}/file"
             ),
@@ -768,7 +778,7 @@ class MLArenaClient:
         Use this over `agent_deploy_status` when you want to see queue
         position or per-run errors.
         """
-        resp = requests.get(
+        resp = self._request("GET",
             self._url(
                 f"/direct_attache_agents/competition/{competition_id}/{attache_agent_id}/status"
             ),
@@ -787,7 +797,7 @@ class MLArenaClient:
         (`monitor.py:25`). Each game carries a `signed_url` to the GCS render
         log (60-day retention) plus reward/outcome and per-game metrics.
         """
-        resp = requests.get(
+        resp = self._request("GET",
             self._url(f"/direct_attache_agents/agent/{attache_agent_id}/games"),
             headers=self._headers(),
             timeout=30,
@@ -815,7 +825,7 @@ class MLArenaClient:
 
             for game in client.agent_games(aid)["games"]:
                 if game["signed_url"]:
-                    print(requests.get(game["signed_url"]).text)
+                    print(self._request("GET",game["signed_url"]).text)
         """
         terminal = {"active", "deploy_failed", "upload_failed", "deleted"}
         last_signature = None
@@ -942,7 +952,7 @@ class MLArenaClient:
         competition_id = competition_id or self._last_competition
         if competition_id is None:
             raise SubmissionError("No competition specified and no previous submission found")
-        resp = requests.get(
+        resp = self._request("GET",
             self._url(f"/leaderboard/competition/{competition_id}"),
             timeout=30,
         )
@@ -971,7 +981,7 @@ class MLArenaClient:
             body["instructor_name"] = instructor_name
         if competition_id is not None:
             body["competition_id"] = competition_id
-        resp = requests.post(
+        resp = self._request("POST",
             self._url("/academic_courses/"),
             headers=self._headers(json_body=True),
             json=body,
@@ -994,7 +1004,7 @@ class MLArenaClient:
             body["student_number"] = student_number
         if project_url is not None:
             body["project_url"] = project_url
-        resp = requests.post(
+        resp = self._request("POST",
             self._url(f"/academic_courses/enroll/{enrollment_link}"),
             headers=self._headers(json_body=True),
             json=body,
