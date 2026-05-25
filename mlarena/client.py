@@ -1,7 +1,7 @@
 """ML Arena REST client.
 
 Authentication is via Bearer token of the form `mlk_<scope>_<lookup>_<secret>`,
-matching the backend's `auth_required` decorator (see backend/app/auth.py). The
+matching the backend's `auth_required` decorator (see backend/app/auth/decorators.py). The
 older `key_id:key_pass` format that earlier README versions documented has been
 retired — the canonical form is the full underscore-separated token.
 
@@ -486,7 +486,7 @@ class MLArenaClient:
         """Kick off the benchmark simulation. Returns `{simulation_id, status}`.
 
         Requires that env.py has been uploaded and a benchmark `agent.py`
-        (or `submission.csv` for csv_v1) is already present. The call itself
+        (or `submission.csv` for csv_v2) is already present. The call itself
         is fire-and-forget; poll `benchmark_status` for completion.
         """
         resp = self._request("POST",
