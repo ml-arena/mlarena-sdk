@@ -5,7 +5,7 @@ Python SDK for [ML Arena](https://ml-arena.com) — submit agents, manage compet
 ## Install
 
 ```bash
-pip install mlarena
+pip install mlarena-sdk
 ```
 
 ## Quick Start
