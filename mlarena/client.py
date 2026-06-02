@@ -807,6 +807,24 @@ class MLArenaClient:
             raise SubmissionError(f"agent_games failed: {_safe_error(resp)}")
         return resp.json()
 
+    def recent_replays(self, competition_id: int, limit: int = 10) -> dict:
+        """List recent completed replays for a competition.
+
+        Mirrors `GET /api/competitions/{id}/recent-replays`. Each replay
+        carries `simulation_id`, `created_at`, `render_delay_second`,
+        `signed_url` (GCS render file) and `participants`.
+        """
+        resp = self._request("GET",
+            self._url(f"/competitions/{competition_id}/recent-replays"),
+            headers=self._headers(),
+            params={"limit": limit},
+            timeout=30,
+        )
+        self._handle_response(resp)
+        if resp.status_code != 200:
+            raise SubmissionError(f"recent_replays failed: {_safe_error(resp)}")
+        return resp.json()
+
     def tail_logs(self, competition_id: int, attache_agent_id: int, *,
                   follow: bool = False, poll_sec: float = 5.0,
                   timeout_sec: float | None = None) -> Iterator[str]:
