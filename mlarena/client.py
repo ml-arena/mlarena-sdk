@@ -1014,7 +1014,14 @@ class MLArenaClient:
                          student_email: str | None = None,
                          student_number: str | None = None,
                          project_url: str | None = None) -> dict:
-        """Enroll the authenticated user in a course via its enrollment link."""
+        """Enroll the authenticated user in a course via its enrollment link.
+
+        `student_email` / `student_number` fill the caller's global student
+        identity when it isn't set yet (they never overwrite values already on
+        the profile — set those via the Profile page / profile update). The
+        backend requires both to be present before enrolling. `project_url` is
+        stored on the enrollment. Returns `{message, competition_id}`.
+        """
         body: dict = {}
         if student_email is not None:
             body["student_email"] = student_email
