@@ -8,7 +8,7 @@ from mlarena.exceptions import (
     SubmissionError,
 )
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 _LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 

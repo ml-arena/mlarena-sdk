@@ -38,23 +38,30 @@ Methods on `MLArenaClient` map 1:1 to backend blueprints — same shape the fron
 
 | SDK method group | Backend blueprint | Frontend equivalent |
 |---|---|---|
-| `competitions()`, `competition()`, `list_tags()` | `/api/competitions`, `/api/competition_tags` | `services/competitionApi.js`, tag hooks |
-| `create_competition`, `update_competition`, `update_settings`, `set_competition_tags`, `upload_env_file`, `update_env_file_content`, `set_competition_image`, `set_competition_markdown`, `upload_benchmark_file`, `update_benchmark_file_content`, `run_benchmark`, `benchmark_status`, `start_competition` | `/api/creator_competition/*` | `services/creatorCompetitionApi.js` + `hooks/creatorCompetition/*` |
+| `competitions()`, `competition()`, `datasets()`, `download_dataset()`, `list_tags()` | `/api/competitions`, `/api/competition_tags` | `services/competitionApi.js`, tag hooks |
+| `create_competition`, `update_competition`, `update_settings`, `set_competition_tags`, `upload_env_file`, `update_env_file_content`, `set_competition_image`, `set_competition_markdown`, `upload_benchmark_file`, `update_benchmark_file_content`, `run_benchmark`, `benchmark_status`, `create_dataset`, `upload_dataset_file`, `start_competition` | `/api/creator_competition/*` | `services/creatorCompetitionApi.js` + `hooks/creatorCompetition/*` |
 | `create_attached_agent`, `upload_agent_file`, `update_agent_file_content`, `list_agent_files`, `get_agent_file_content`, `delete_agent_file`, `deploy_agent`, `agent_deploy_status`, `agent_status`, `agent_games`, `tail_logs`, `runtime_options`, `agent_runtime`, `set_agent_runtime`, `resolve_runtime`, `delete_agent`, `submit`, `status` | `/api/direct_attache_agents/*` | `services/directAgentAttachApi.js` + `hooks/DirectAgentAttach/*` |
 | `leaderboard` | `/api/leaderboard/competition/{id}` | `hooks/competition/useLeaderboardData` |
-| `create_course`, `enroll_in_course` | `/api/academic_courses/*` | `services/teacherApi.js`, `pages/EnrollPage.js` |
+| `create_course`, `enroll_in_course`, `enrollment_info`, `list_courses` | `/api/academic_courses/` (list/enroll/create) | `services/teacherApi.js`, `pages/EnrollPage.js` |
+| `course_catalog`, `course`, `module_overview`, `lesson`, `mark_lesson_viewed`, `mark_lesson_complete`, `my_progress` | `/api/academic_courses/*` (consumption — catalog/landing/module/lesson/progress) | `services/coursesApi.ts` (learner, `04`) |
+| `create_module`, `list_modules`, `get_module`, `update_module`, `delete_module`, `fork_module`, `attach_competition`, `detach_competition`, `reorder_module_competitions` | `/api/teacher/modules/*` | `services/coursesApi.ts` + `hooks/courseAuthoring/*` (`03`) |
+| `create_lesson`, `get_lesson`, `update_lesson`, `delete_lesson`, `reorder_lessons`, `upload_lesson_media`, `delete_lesson_media`, `preview_lesson` | `/api/teacher/lessons/*`, `/api/teacher/modules/{id}/lessons/*` | `services/coursesApi.ts` + `hooks/courseAuthoring/*` (`03`) |
+| `update_course`, `set_course_cover`, `list_course_modules`, `link_module`, `unlink_module`, `reorder_modules`, `course_progress` | `/api/teacher/course/{id}/*` | `services/coursesApi.ts` + `hooks/courseAuthoring/*` (`03`) |
+| `author_course_from_dir`, `export_course_to_dir` | *(client-side compositions — no endpoint)* | *(SDK-only ergonomic, like `submit()`)* |
 
 When the table above drifts from `client.py`, fix `client.py` — the table is a parity contract.
+
+The course-content methods mirror the routes in `02-BACKEND-API.md` (`backend/app/views/teacher/{modules,lessons,course_content}.py` and `backend/app/views/academic_courses/{consumption,legacy,course_assets}.py`). `author_course_from_dir` / `export_course_to_dir` are pure compositions of the public authoring/consumption methods — they add no endpoint (the `submit()` idiom).
 
 ## Auth scopes
 
 Token scope is encoded in the second segment (`mlk_<scope>_<lookup>_<secret>`). The backend's `auth_required` decorator enforces it:
 
-- `user` — submit agents, manage own attachments, enroll in courses.
+- `user` — submit agents, manage own attachments, enroll in courses, read course content + write own lesson progress (`mark_lesson_*`, `my_progress`).
 - `creator` — create / update / start competitions you own (also requires ownership or admin).
-- `teacher` — create academic courses.
+- `teacher` — author course content (`create_module`, `create_lesson`, `link_module`, …) and create academic courses. The `/api/teacher/*` routes require a `teacher`-scope token specifically.
 
-A scope mismatch returns 403; the SDK surfaces this as `AuthenticationError`.
+Course **consumption reads** (`course_catalog`, `course`, `module_overview`, `lesson`) are public for public/unlisted courses; gated lessons and progress writes require any authenticated token (they use `@login_required`, so a `user` token is enough — the bearer token authenticates via the backend's `request_loader`). A scope mismatch returns 403; the SDK surfaces this as `AuthenticationError`.
 
 ## Local dev
 
