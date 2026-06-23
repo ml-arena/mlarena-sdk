@@ -783,6 +783,37 @@ class MLArenaClient:
             raise MLArenaError(f"upload_dataset_file failed: {_safe_error(resp)}")
         return resp.json()
 
+    def update_dataset(self, competition_id: int, dataset_id: int, *,
+                       label: str | None = None,
+                       description: str | None = None) -> dict:
+        """Update a dataset's label / description (creator scope).
+
+        PUT to `/api/creator_competition/competition/{id}/datasets/{dataset_id}`
+        (`datasets.py:118`). Only fields explicitly passed are sent. Rejected
+        once the competition is started. Returns `{"id", "label", "description"}`.
+
+        Requires a `creator`-scope token.
+        """
+        body: dict = {}
+        if label is not None:
+            body["label"] = label
+        if description is not None:
+            body["description"] = description
+        if not body:
+            raise MLArenaError("update_dataset requires at least one field")
+        resp = self._request("PUT",
+            self._url(
+                f"/creator_competition/competition/{competition_id}/datasets/{dataset_id}"
+            ),
+            headers=self._headers(json_body=True),
+            json=body,
+            timeout=30,
+        )
+        self._handle_response(resp)
+        if resp.status_code != 200:
+            raise MLArenaError(f"update_dataset failed: {_safe_error(resp)}")
+        return resp.json()
+
     def delete_dataset_file(self, competition_id: int, dataset_id: int,
                             file_id: int) -> dict:
         """Delete one file from a competition dataset (creator scope).
