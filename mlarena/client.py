@@ -783,6 +783,31 @@ class MLArenaClient:
             raise MLArenaError(f"upload_dataset_file failed: {_safe_error(resp)}")
         return resp.json()
 
+    def delete_dataset_file(self, competition_id: int, dataset_id: int,
+                            file_id: int) -> dict:
+        """Delete one file from a competition dataset (creator scope).
+
+        DELETE to
+        `/api/creator_competition/competition/{id}/datasets/{dataset_id}/files/{file_id}`
+        (`datasets.py:251`); removes the DB row and its GCS blob. Rejected once
+        the competition is started. Use this before re-uploading a file with the
+        same name — `upload_dataset_file` always adds a new row, so replacing a
+        file means delete-then-upload. Get `file_id` from `creator_datasets()`.
+
+        Requires a `creator`-scope token.
+        """
+        resp = self._request("DELETE",
+            self._url(
+                f"/creator_competition/competition/{competition_id}/datasets/{dataset_id}/files/{file_id}"
+            ),
+            headers=self._headers(),
+            timeout=60,
+        )
+        self._handle_response(resp)
+        if resp.status_code != 200:
+            raise MLArenaError(f"delete_dataset_file failed: {_safe_error(resp)}")
+        return resp.json()
+
     # ---- Direct attached agents (user scope) ----
 
     def create_attached_agent(self, competition_id: int, agent_name: str,
