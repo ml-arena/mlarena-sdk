@@ -139,7 +139,7 @@ method↔route table for the full surface.
 
 **Create + enroll**
 
-- `client.create_course(name, code=None, start_date, end_date, slug=None, description=None, visibility=None, instructor_name=None, competition_id=None)` — teacher scope. The response carries both `enrollment_link` (32-hex) and a short shareable `join_code`.
+- `client.create_course(name, code=None, start_date, end_date, slug=None, description=None, visibility=None, instructor_name=None)` — any token scope; creating a course makes the account a teacher (capped by `max_courses_limit`, default 1; admins exempt). Attach competitions afterwards via modules (`create_module` / `attach_competition` / `link_module`). The response carries both `enrollment_link` (32-hex) and a short shareable `join_code`.
 - `client.enroll_in_course(link_or_code, student_email=None, student_number=None, project_url=None)` — accepts either the enrollment link **or** the short join code (also `join_code=` / `enrollment_link=`).
 - `client.enrollment_info(link_or_code)` — preview a course before enrolling (public).
 - `client.list_courses(show_all=False, competition_id=None)` — your enrolled + active courses.

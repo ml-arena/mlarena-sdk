@@ -273,10 +273,19 @@ class MLArenaClient:
                            is_public: bool | None = None) -> dict:
         """Create a new competition via the creator-scope authoring flow.
 
-        The backend resolves the engine + default evaluation + default env
-        runtime from `kernel_version`. To pin a specific engine, use the
-        creator UI or post-creation patch endpoints — the API does not let
-        you pick an engine directly at creation time.
+        `kernel_version` carries a catalog KIND: one of `"flex_v1"`,
+        `"gymnasium"`, `"pettingzoo"`, `"file_v1"` (list them live via
+        `GET /creator_competition/available_kinds`). Since the worker
+        consolidation only two kernels exist — `gymnasium`/`pettingzoo` are
+        presets over the flex_v1 kernel that pair the flexkit loop-library
+        env template with the matching env-image family; the retired kernel
+        names (`grpc_gymnasiumv4`, `grpc_pettingzoov2`) are accepted as
+        aliases during the transition.
+
+        The backend resolves the engine + default evaluation + env-image
+        family from the kind. To pin a specific engine, use the creator UI
+        or post-creation patch endpoints — the API does not let you pick an
+        engine directly at creation time.
 
         If `tag_names` is given, each name is resolved against the public
         tag catalog (`GET /api/competition_tags/tags`) before the create
@@ -1337,20 +1346,27 @@ class MLArenaClient:
     def create_course(self, name: str, code: str | None = None,
                       start_date: str | None = None, end_date: str | None = None,
                       instructor_name: str | None = None,
-                      competition_id: int | None = None,
                       *,
                       slug: str | None = None,
                       description: str | None = None,
                       visibility: str | None = None,
                       teacher_user_id: int | None = None) -> dict:
-        """Create an academic course. Requires a `teacher`-scope token.
+        """Create an academic course — this is how you become a teacher.
 
         Mirrors `POST /api/academic_courses/` (`academic_courses/legacy.py`).
-        `start_date` / `end_date` are required ISO date strings (`YYYY-MM-DD`);
-        they are kept positional for backwards compatibility with the original
-        signature. The backend mints both the 32-hex `enrollment_link` and the
-        short shareable `join_code` and returns them in the course dict — read
-        them from there to share with students.
+        Creating a course is the self-serve teacher-onboarding action: it works
+        with any valid token scope and flips the owning account to a teacher.
+        Each account may own at most `max_courses_limit` courses (default 1);
+        admins are exempt. After creating, mint a `teacher`-scope key from your
+        Profile page to author modules/lessons and attach competitions.
+
+        `start_date` / `end_date` are optional ISO date strings (`YYYY-MM-DD`) —
+        a name is the only required field, so a course can be created without
+        term dates (a course with no end date never closes). They are kept
+        positional for backwards compatibility with the original signature. The
+        backend mints both the 32-hex `enrollment_link` and the short shareable
+        `join_code` and returns them in the course dict — read them from there to
+        share with students.
 
         Course-content fields (added with the course-content model):
             slug:        kebab URL slug (`^[a-z0-9-]+$`); auto-derived from the
@@ -1358,20 +1374,20 @@ class MLArenaClient:
             description: markdown landing-page intro.
             visibility:  `private` (default) | `unlisted` | `public`. Only
                          `public` courses appear in `course_catalog()`.
-            teacher_user_id: an admin who is not themselves a teacher must name
-                         the owning teacher.
-        Competitions now derive from the modules you link (see `link_module`);
-        `competition_id` remains for the legacy single-competition course.
+            teacher_user_id: an admin may name the owning teacher; otherwise the
+                         caller owns the course.
+        Competitions are attached afterwards via the modules you link (see
+        `create_module` / `attach_competition` / `link_module`).
         """
-        if start_date is None or end_date is None:
-            raise MLArenaError("create_course requires start_date and end_date")
-        body: dict = {"name": name, "start_date": start_date, "end_date": end_date}
+        body: dict = {"name": name}
+        if start_date is not None:
+            body["start_date"] = start_date
+        if end_date is not None:
+            body["end_date"] = end_date
         if code is not None:
             body["code"] = code
         if instructor_name is not None:
             body["instructor_name"] = instructor_name
-        if competition_id is not None:
-            body["competition_id"] = competition_id
         if slug is not None:
             body["slug"] = slug
         if description is not None:
@@ -1946,7 +1962,6 @@ class MLArenaClient:
                 start_date=course_spec["start_date"],
                 end_date=course_spec["end_date"],
                 instructor_name=course_spec.get("instructor_name"),
-                competition_id=course_spec.get("competition_id"),
                 slug=course_spec.get("slug"),
                 description=course_spec.get("description"),
                 visibility=course_spec.get("visibility"),
