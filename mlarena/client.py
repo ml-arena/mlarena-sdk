@@ -418,6 +418,8 @@ class MLArenaClient:
                         evaluation_deployment_nb_constraint_run: int | None = None,
                         evaluation_deployment_nb_initial_score_run: int | None = None,
                         evaluation_episode_budget_brackets: list | None = None,
+                        evaluation_frontend_precision: int | None = None,
+                        evaluation_metrics_schema: list | None = None,
                         ) -> dict:
         """Update competition settings + evaluation parameters.
 
@@ -436,6 +438,19 @@ class MLArenaClient:
                 n_episodes]` pairs implementing tiered early-stop.
                 Thresholds must be strictly ascending; n_episodes
                 non-decreasing; max 100 episodes per bracket.
+            evaluation_frontend_precision: decimal places for numeric
+                leaderboard metrics (default 2). Per-metric `precision` in
+                the schema overrides it.
+            evaluation_metrics_schema: the canonical leaderboard metric
+                declaration — an ordered list of descriptors, e.g.
+                `[{"key": "accuracy", "label": "Accuracy", "source": "env",
+                   "agg": "mean", "format": "percent"},
+                  {"key": "ram_max", "label": "RAM Max", "source": "platform",
+                   "agg": "max", "format": "bytes"}]`.
+                `source:"env"` keys are exactly what `env.evaluate` must
+                return in each `agent_results[i]["metrics_detail"]`
+                (equal-mapping, enforced at run time). See the leaderboard
+                envelope's per-row `MetricsSchema` field.
 
         Requires a `creator`-scope token and ownership (or admin) of the
         target competition.
@@ -461,6 +476,10 @@ class MLArenaClient:
             body["evaluation_deployment_nb_initial_score_run"] = evaluation_deployment_nb_initial_score_run
         if evaluation_episode_budget_brackets is not None:
             body["evaluation_episode_budget_brackets"] = evaluation_episode_budget_brackets
+        if evaluation_frontend_precision is not None:
+            body["evaluation_frontend_precision"] = evaluation_frontend_precision
+        if evaluation_metrics_schema is not None:
+            body["evaluation_metrics_schema"] = evaluation_metrics_schema
         if not body:
             raise MLArenaError("update_settings requires at least one field")
         resp = self._request("PUT",
@@ -872,7 +891,14 @@ class MLArenaClient:
 
     def upload_agent_file(self, competition_id: int, attache_agent_id: int,
                           file_path: str) -> dict:
-        """Upload (or overwrite) a single file in an existing agent attachment."""
+        """Upload (or overwrite) a single file in an existing agent attachment.
+
+        Returns the server response ``{"message", "status", "validation_message"}``.
+        Note: the file route returns HTTP 200 even when validation *rejects* the
+        attachment — the file is saved but the whole attachment is re-validated and
+        may come back ``status == "upload_failed"`` with an actionable
+        ``validation_message``. A 2xx here is not proof the agent is deployable;
+        inspect ``status`` (``submit()`` does this for you before deploying)."""
         if not os.path.isfile(file_path):
             raise SubmissionError(f"File not found: {file_path}")
         with open(file_path, "rb") as fh:
@@ -1237,10 +1263,29 @@ class MLArenaClient:
                 agent_py = os.path.join(tmp_dir, "agent.py")
                 with open(agent_py, "w") as f:
                     f.write(inspect.getsource(agent))
-                self.upload_agent_file(competition_id, attache_agent_id, agent_py)
+                last_upload = self.upload_agent_file(
+                    competition_id, attache_agent_id, agent_py)
             else:
+                last_upload = None
                 for path in files:
-                    self.upload_agent_file(competition_id, attache_agent_id, path)
+                    last_upload = self.upload_agent_file(
+                        competition_id, attache_agent_id, path)
+
+            # Fail fast on a rejected upload. The file route returns HTTP 200 even
+            # when validation rejects the *attachment* (status "upload_failed" with
+            # an actionable message, e.g. "Rename your file to 'agent.py'"), so
+            # upload_agent_file() cannot see it as an error. We check the final
+            # upload's status here — after every file is on disk, so a legitimately
+            # transient mid-sequence failure (multi-file upload) isn't misreported —
+            # and surface that message instead of letting deploy_agent() fail with
+            # the generic "Cannot deploy agent in 'upload_failed' state".
+            if last_upload and last_upload.get("status") == "upload_failed":
+                raise SubmissionError(
+                    f"Agent {attache_agent_id} did not pass upload validation: "
+                    f"{last_upload.get('validation_message') or 'files rejected'} "
+                    f"(fix the files and re-upload, or delete the attachment with "
+                    f"delete_agent({competition_id}, {attache_agent_id}))."
+                )
 
             deploy = self.deploy_agent(competition_id, attache_agent_id)
             self._last_agent_id = attache_agent_id
@@ -1276,21 +1321,56 @@ class MLArenaClient:
 
     # ---- Leaderboard (public read) ----
 
-    def leaderboard(self, competition_id: int | None = None):
+    def leaderboard(self, competition_id: int | None = None, top: int | None = None):
         """Get the leaderboard for a competition.
 
-        Mirrors `GET /api/leaderboard/competition/{id}` (`leaderboard.py:28`).
+        Mirrors `GET /api/leaderboard/competition/{id}` (`leaderboard.py`).
+
+        By default returns the full ranked list. Pass ``top=N`` to fetch only
+        the top N rows (the backend then returns a sliced envelope; this method
+        unwraps its ``leaders`` into the same DataFrame shape).
         """
         competition_id = competition_id or self._last_competition
         if competition_id is None:
             raise SubmissionError("No competition specified and no previous submission found")
+        params = {"limit": top} if top is not None else None
         resp = self._request("GET",
             self._url(f"/leaderboard/competition/{competition_id}"),
+            params=params,
             timeout=30,
         )
         self._handle_response(resp)
         resp.raise_for_status()
-        return _to_dataframe(resp.json())
+        data = resp.json()
+        # Sliced envelope when `top` was requested; full array otherwise.
+        if isinstance(data, dict):
+            return _to_dataframe(data.get("leaders", []))
+        return _to_dataframe(data)
+
+    def global_ranking(self, search: str | None = None, page: int = 1, per_page: int = 100):
+        """Global user ranking across all competitions (points + medals).
+
+        Mirrors `GET /api/ranking/` (`ranking.py`). Returns a DataFrame of the
+        requested page (default: top 100). Pass ``search`` to filter by
+        username; matched rows carry their true global rank.
+        """
+        params: dict = {"page": page, "per_page": per_page}
+        if search:
+            params["search"] = search
+        resp = self._request("GET", self._url("/ranking/"), params=params, timeout=30)
+        self._handle_response(resp)
+        resp.raise_for_status()
+        return _to_dataframe(resp.json().get("rankings", []))
+
+    def user_global_rank(self, user_id: int) -> dict:
+        """A user's global rank, percentile and medal counts.
+
+        Mirrors `GET /api/ranking/user/{id}` (`ranking.py`, auth required).
+        """
+        resp = self._request("GET", self._url(f"/ranking/user/{user_id}"), timeout=30)
+        self._handle_response(resp)
+        resp.raise_for_status()
+        return resp.json().get("stats", {})
 
     # ---- Course content: shared JSON-call helper ----------------------------
 
@@ -1364,9 +1444,9 @@ class MLArenaClient:
         a name is the only required field, so a course can be created without
         term dates (a course with no end date never closes). They are kept
         positional for backwards compatibility with the original signature. The
-        backend mints both the 32-hex `enrollment_link` and the short shareable
-        `join_code` and returns them in the course dict — read them from there to
-        share with students.
+        backend mints the course's `join_code` — the single enrollment token —
+        and returns it in the course dict; share that, or the
+        `/enroll/<join_code>` link built from it, with students.
 
         Course-content fields (added with the course-content model):
             slug:        kebab URL slug (`^[a-z0-9-]+$`); auto-derived from the
@@ -1401,32 +1481,28 @@ class MLArenaClient:
             ok=(200, 201), error_label="create_course",
         )
 
-    def enrollment_info(self, link_or_code: str) -> dict:
-        """Preview a course from an enrollment link or join code (no enroll).
+    def enrollment_info(self, join_code: str) -> dict:
+        """Preview a course from its join code (without enrolling).
 
-        Mirrors `GET /api/academic_courses/enroll/<link_or_code>` — the same
-        public lookup the console's EnrollPage makes. Accepts either the 32-hex
-        `enrollment_link` or the short `join_code`. Returns course meta plus
+        Mirrors `GET /api/academic_courses/enroll/<join_code>` — the same public
+        lookup the console's EnrollPage makes. Returns course meta plus
         `already_enrolled` / `has_student_info` when authenticated.
         """
         return self._course_call(
-            "GET", f"/academic_courses/enroll/{link_or_code}",
+            "GET", f"/academic_courses/enroll/{join_code}",
             error_label="enrollment_info",
         )
 
-    def enroll_in_course(self, link_or_code: str | None = None,
+    def enroll_in_course(self, join_code: str | None = None,
                          student_email: str | None = None,
                          student_number: str | None = None,
-                         project_url: str | None = None,
-                         *,
-                         enrollment_link: str | None = None,
-                         join_code: str | None = None) -> dict:
+                         project_url: str | None = None) -> dict:
         """Enroll the authenticated user in a course.
 
-        Mirrors `POST /api/academic_courses/enroll/<link_or_code>`. The token to
-        join with can be passed positionally (`link_or_code`) or, equivalently,
-        as `enrollment_link=` (the 32-hex link) or `join_code=` (the short
-        shareable code) — the backend resolves either form against the course.
+        Mirrors `POST /api/academic_courses/enroll/<join_code>`. A course has a
+        single enrollment token, its `join_code` — pass it positionally or as
+        `join_code=`. A full `/enroll/<join_code>` URL is not accepted; pass the
+        code itself.
 
         `student_email` / `student_number` fill the caller's global student
         identity when it isn't set yet (they never overwrite values already on
@@ -1435,11 +1511,8 @@ class MLArenaClient:
         stored on the enrollment. Returns `{message, competition_id,
         competition_ids}`.
         """
-        token = link_or_code or enrollment_link or join_code
-        if token is None:
-            raise MLArenaError(
-                "enroll_in_course requires an enrollment link or join code"
-            )
+        if join_code is None:
+            raise MLArenaError("enroll_in_course requires a join code")
         body: dict = {}
         if student_email is not None:
             body["student_email"] = student_email
@@ -1448,7 +1521,7 @@ class MLArenaClient:
         if project_url is not None:
             body["project_url"] = project_url
         return self._course_call(
-            "POST", f"/academic_courses/enroll/{token}", json_body=body,
+            "POST", f"/academic_courses/enroll/{join_code}", json_body=body,
             ok=(200, 201), error_label="enroll_in_course",
         )
 
@@ -1653,20 +1726,44 @@ class MLArenaClient:
 
     def attach_competition(self, module_id: int, competition_id: int,
                            label: str | None = None,
-                           position: int | None = None) -> dict:
+                           position: int | None = None,
+                           pass_threshold: float | None = None) -> dict:
         """Attach a competition to a module.
 
         Mirrors `POST /api/teacher/modules/{id}/competitions`. `position`
         defaults to the end of the module's competition list.
+
+        `pass_threshold` is the course's validation bar: a student validates the
+        competition when their best leaderboard value reaches it (`>=` — every
+        leaderboard ranks descending, so higher is always better). Omit it for
+        no pass/fail — do not pass 0, which would validate every entrant.
         """
         body: dict = {"competition_id": competition_id}
         if label is not None:
             body["label"] = label
         if position is not None:
             body["position"] = position
+        if pass_threshold is not None:
+            body["pass_threshold"] = pass_threshold
         return self._course_call(
             "POST", f"/teacher/modules/{module_id}/competitions", json_body=body,
             ok=(200, 201), error_label="attach_competition",
+        )
+
+    def update_competition_link(self, module_id: int, competition_id: int,
+                                **fields) -> dict:
+        """Update an existing attachment's `label` / `pass_threshold`.
+
+        Mirrors `PUT /api/teacher/modules/{id}/competitions/{competition_id}`.
+        Partial: only the keys you pass are written, and an explicit ``None``
+        clears that field — so ``update_competition_link(m, c,
+        pass_threshold=None)`` removes the bar, while omitting the key leaves
+        it alone.
+        """
+        return self._course_call(
+            "PUT",
+            f"/teacher/modules/{module_id}/competitions/{competition_id}",
+            json_body=fields, error_label="update_competition_link",
         )
 
     def detach_competition(self, module_id: int, competition_id: int) -> dict:
@@ -1928,6 +2025,7 @@ class MLArenaClient:
                 competitions:        # optional
                   - competition_id: 42
                     label: "CartPole"
+                    pass_threshold: 195.0   # optional — score that validates it
                 lessons:
                   - title: "What is RL?"
                     slug: what-is-rl       # optional
@@ -1941,7 +2039,7 @@ class MLArenaClient:
         Idempotency is explicit, not magical: pass `course.course_id` to update
         an existing course's meta, and a module's `module_id` to link an existing
         module rather than create a new one. Returns a summary
-        `{course_id, slug, enrollment_link, join_code, modules: [...]}`.
+        `{course_id, slug, join_code, modules: [...]}`.
         """
         base = os.path.abspath(path)
         manifest = _load_course_manifest(base)
@@ -1991,6 +2089,7 @@ class MLArenaClient:
                     self.attach_competition(
                         module_id, comp["competition_id"],
                         label=comp.get("label"), position=comp.get("position"),
+                        pass_threshold=comp.get("pass_threshold"),
                     )
                 module_summaries.append(
                     {"module_id": module_id, "title": m["title"],
@@ -2013,7 +2112,6 @@ class MLArenaClient:
         return {
             "course_id": course_id,
             "slug": course_out.get("slug"),
-            "enrollment_link": course_out.get("enrollment_link"),
             "join_code": course_out.get("join_code"),
             "modules": module_summaries,
         }
@@ -2082,7 +2180,11 @@ class MLArenaClient:
                 "summary": module.get("summary"),
                 "icon": module.get("icon"),
                 "competitions": [
-                    {"competition_id": c["competition_id"], "label": c.get("label")}
+                    {
+                        "competition_id": c["competition_id"],
+                        "label": c.get("label"),
+                        "pass_threshold": c.get("pass_threshold"),
+                    }
                     for c in module.get("competitions", [])
                 ],
                 "lessons": lessons_out,
