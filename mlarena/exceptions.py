@@ -13,6 +13,12 @@ class SubmissionError(MLArenaError):
     pass
 
 
-class CompetitionNotFoundError(MLArenaError):
-    """Raised when competition is not found."""
+class ChallengeNotFoundError(MLArenaError):
+    """Raised when challenge is not found."""
     pass
+
+
+# Deprecated spelling, kept so `except CompetitionNotFoundError` in existing
+# notebooks still catches the same error. It is the same class, not a subclass,
+# so isinstance checks against either name behave identically.
+CompetitionNotFoundError = ChallengeNotFoundError

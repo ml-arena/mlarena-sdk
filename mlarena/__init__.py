@@ -3,12 +3,13 @@ from urllib.parse import urlsplit
 from mlarena.client import MLArenaClient
 from mlarena.exceptions import (
     AuthenticationError,
-    CompetitionNotFoundError,
+    ChallengeNotFoundError,
+    CompetitionNotFoundError,  # deprecated alias of ChallengeNotFoundError
     MLArenaError,
     SubmissionError,
 )
 
-__version__ = "0.3.0"
+__version__ = "1.0.0"
 
 _LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 
