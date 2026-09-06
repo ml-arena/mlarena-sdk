@@ -382,12 +382,12 @@ class MLArenaClient:
         Mirrors `PUT /api/creator_competition/competition/{id}`. Only fields
         explicitly passed are sent — everything else is left untouched.
 
-        ``name`` and ``description`` are locked once the challenge has
-        started; the backend rejects updates to those. ``is_public`` is
-        editable at any time, including while the challenge is running, so
-        creators can hide an active challenge without stopping it. When
-        ``is_public=False``, only the owner, creator assistants, and admins
-        can view or interact with the challenge.
+        ``name`` is locked once the challenge has started — a rename strands
+        the links and course material already pointing at it. ``description``
+        and ``is_public`` stay editable while it runs, so a creator can fix the
+        blurb or hide an active challenge without stopping it (stopping
+        rewrites ``start_date_ts``). When ``is_public=False``, only the owner,
+        creator assistants, and admins can view or interact with the challenge.
         """
         body: dict = {}
         if name is not None:
