@@ -417,6 +417,7 @@ class MLArenaClient:
                         evaluation_metric: str | None = None,
                         evaluation_metric2: str | None = None,
                         evaluation_is_elo_score: bool | None = None,
+                        evaluation_is_stop_after_deployment: bool | None = None,
                         evaluation_deployment_nb_constraint_run: int | None = None,
                         evaluation_deployment_nb_initial_score_run: int | None = None,
                         evaluation_episode_budget_brackets: list | None = None,
@@ -428,14 +429,24 @@ class MLArenaClient:
         Mirrors `PUT /api/creator_competition/competition/{id}/settings` —
         the same call the console's Settings tab makes via `saveSettings()`.
         Only fields explicitly passed are sent; everything else is left
-        untouched. The backend rejects updates after the challenge has
-        been started.
+        untouched. Once the challenge has started only the fields that cannot
+        rescore an existing run still apply — the leaderboard labels
+        (`evaluation_metric`, `evaluation_metric2`,
+        `evaluation_frontend_precision`) and
+        `evaluation_is_stop_after_deployment`; everything else is rejected
+        with 400 until the challenge is stopped.
 
         Notable parameters:
             evaluation_metric: free-text label for the primary metric (e.g.
                 "reward", "accuracy", "bleu"). The DB column is String(20).
             evaluation_is_elo_score: when True, the leaderboard ranks by
                 ELO rather than mean metric (multi-agent kernels).
+            evaluation_is_stop_after_deployment: True (the creation default)
+                means an agent runs only its deployment runs and is never
+                matched again, which pins an ELO leaderboard to its bootstrap
+                ratings forever. Set False to let the matchmaker keep pairing
+                agents (~10 matches per challenge every 2h). Editable on a
+                running challenge.
             evaluation_episode_budget_brackets: list of `[threshold,
                 n_episodes]` pairs implementing tiered early-stop.
                 Thresholds must be strictly ascending; n_episodes
@@ -472,6 +483,8 @@ class MLArenaClient:
             body["evaluation_metric2"] = evaluation_metric2
         if evaluation_is_elo_score is not None:
             body["evaluation_is_elo_score"] = evaluation_is_elo_score
+        if evaluation_is_stop_after_deployment is not None:
+            body["evaluation_is_stop_after_deployment"] = evaluation_is_stop_after_deployment
         if evaluation_deployment_nb_constraint_run is not None:
             body["evaluation_deployment_nb_constraint_run"] = evaluation_deployment_nb_constraint_run
         if evaluation_deployment_nb_initial_score_run is not None:
@@ -1630,6 +1643,20 @@ class MLArenaClient:
         return self._course_call(
             "POST", f"/academic_courses/lessons/{lesson_id}/complete",
             json_body=body, error_label="mark_lesson_complete",
+        )
+
+    def mark_lesson_incomplete(self, lesson_id: int,
+                               course_id: int | None = None) -> dict:
+        """Undo a completion — back to in-progress, `completed_at` cleared.
+
+        Mirrors `POST /api/academic_courses/lessons/{id}/uncomplete`. The tick
+        is student-self-reported, so it is reversible. See `mark_lesson_viewed`
+        for the `course_id` disambiguation rule.
+        """
+        body = {"course_id": course_id} if course_id is not None else {}
+        return self._course_call(
+            "POST", f"/academic_courses/lessons/{lesson_id}/uncomplete",
+            json_body=body, error_label="mark_lesson_incomplete",
         )
 
     def my_progress(self, course_id: int) -> dict:
