@@ -196,6 +196,52 @@ class MLArenaClient:
         resp.raise_for_status()
         return resp.json()
 
+    # The infrastructure fields the console's admin panel edits
+    # (`frontend/src/hooks/creatorChallenge/useAdmin.js`, `emptyConfigFields`).
+    _ADMIN_CONFIGURATION_FIELDS = frozenset({
+        "engine_id", "docker_image_env_runtime_id",
+        "agent_max_time_per_step_second", "env_max_time_per_step_second",
+        "simulation_max_steps", "render_delay_second",
+    })
+
+    def update_challenge_configuration(self, challenge_id: int, **fields) -> dict:
+        """Patch a challenge's infrastructure configuration (admin only).
+
+        Mirrors `PUT /api/competitions/{id}/configuration` — the call the
+        console's admin panel makes to repoint a challenge at another engine.
+        Accepts `engine_id`, `docker_image_env_runtime_id`,
+        `agent_max_time_per_step_second`, `env_max_time_per_step_second`,
+        `simulation_max_steps`, `render_delay_second`; an unknown field raises
+        before any request. Only the fields you pass are changed.
+
+        A new challenge gets the default engine of its kind; pinning one with
+        more memory (e.g. `engine_id=...` for a scorer that needs 3Gi) is this
+        call. The route checks the account's admin flag, not the key scope, so
+        any key of an admin account works; a non-admin account is refused.
+        Nothing here checks that the engine runs the challenge's kernel — the
+        backend's image-consistency check rejects a mismatch at `run_benchmark`
+        and `start_challenge`.
+
+        Returns the updated configuration (`engine_id`, ...).
+        """
+        body = _filtered_fields(fields, self._ADMIN_CONFIGURATION_FIELDS,
+                                "update_challenge_configuration")
+        resp = self._request("PUT",
+            self._url(f"/competitions/{challenge_id}/configuration"),
+            headers=self._headers(json_body=True),
+            json=body,
+            timeout=30,
+        )
+        self._handle_response(resp)
+        if resp.status_code in (301, 302, 303, 307, 308):
+            # `admin_required` redirects a non-admin to the login page.
+            raise AuthenticationError(
+                "update_challenge_configuration requires an admin account")
+        if resp.status_code != 200:
+            raise MLArenaError(
+                f"update_challenge_configuration failed: {_safe_error(resp)}")
+        return resp.json()
+
     def creator_challenges(self) -> list:
         """List challenges the caller owns or assists on (creator scope).
 
@@ -414,6 +460,7 @@ class MLArenaClient:
                         max_upload_size_bytes: int | None = None,
                         max_upload_files: int | None = None,
                         max_active_agents_per_participant: int | None = None,
+                        submission_filename: str | None = None,
                         evaluation_metric: str | None = None,
                         evaluation_metric2: str | None = None,
                         evaluation_is_elo_score: bool | None = None,
@@ -437,6 +484,14 @@ class MLArenaClient:
         with 400 until the challenge is stopped.
 
         Notable parameters:
+            submission_filename: file_v1 only — the one file a participant
+                uploads, e.g. "submission.csv" (the default), "pitch.txt" or
+                "submission.csv.gz". A bare file name: letters, digits, '.',
+                '_' and '-', starting with a letter or digit, at most 128
+                characters. A name not ending in ".csv" skips the y_test.csv
+                column check at upload and the y_test.csv start requirement,
+                so env.py must validate the file itself. Frozen once the
+                challenge has started.
             evaluation_metric: free-text label for the primary metric (e.g.
                 "reward", "accuracy", "bleu"). The DB column is String(20).
             evaluation_is_elo_score: when True, the leaderboard ranks by
@@ -477,6 +532,8 @@ class MLArenaClient:
             body["max_upload_files"] = max_upload_files
         if max_active_agents_per_participant is not None:
             body["max_active_agents_per_participant"] = max_active_agents_per_participant
+        if submission_filename is not None:
+            body["submission_filename"] = submission_filename
         if evaluation_metric is not None:
             body["evaluation_metric"] = evaluation_metric
         if evaluation_metric2 is not None:
@@ -619,21 +676,30 @@ class MLArenaClient:
             raise MLArenaError(f"set_competition_markdown failed: {_safe_error(resp)}")
         return resp.json()
 
-    def upload_benchmark_file(self, challenge_id: int, file_path: str) -> dict:
-        """Upload a benchmark agent file (typically `agent.py`).
+    def upload_benchmark_file(self, challenge_id: int, file_path: str,
+                              filename: str | None = None) -> dict:
+        """Upload a benchmark file (`agent.py`, or a file_v1 submission file).
 
         Backend reads the benchmark folder when `run_benchmark` fires; you
-        must upload the agent before kicking the run.
+        must upload the agent before kicking the run. The upload is multipart
+        and byte-exact, so use it (not `update_benchmark_file_content`, which
+        writes text) for a binary submission such as `submission.csv.gz`.
+
+        `filename` stores the file under another name — e.g. a local
+        `benchmark_submission.csv.gz` as the challenge's `submission_filename`
+        — the same rename the console's benchmark drop zone does. Defaults to
+        the local file's base name.
         """
         if not os.path.isfile(file_path):
             raise MLArenaError(f"File not found: {file_path}")
+        upload_name = filename if filename is not None else os.path.basename(file_path)
         with open(file_path, "rb") as fh:
             resp = self._request("PUT",
                 self._url(
                     f"/creator_competition/competition/{challenge_id}/benchmark/files"
                 ),
                 headers=self._headers(),
-                files={"file": (os.path.basename(file_path), fh)},
+                files={"file": (upload_name, fh)},
                 timeout=120,
             )
         self._handle_response(resp)
