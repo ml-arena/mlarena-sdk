@@ -2,7 +2,7 @@
 
 Python SDK for [ML Arena](https://ml-arena.com) — make submissions, manage challenges, manage courses, and read leaderboards from any notebook or IDE.
 
-## Unreleased — one status shape on the wire
+## 2.0 — one status shape on the wire
 
 Every reply that describes a submission's status now carries the same flat
 block, and the SDK reads it instead of re-deriving the lifecycle:
