@@ -295,6 +295,17 @@ def test_challenge_admin_and_creator_routes():
     assert rec.last["path"] == "/creator_challenge/challenge/4/start"
 
 
+def test_update_settings_sends_the_metric_direction():
+    c, rec = make_client(scope="creator")
+    c.update_settings(4, evaluation_metric_order="asc",
+                      evaluation_episode_budget_brackets=[[0.5, 3], [0.1, 10]])
+    assert rec.last["path"] == "/creator_challenge/challenge/4/settings"
+    assert rec.last["json"] == {
+        "evaluation_metric_order": "asc",
+        "evaluation_episode_budget_brackets": [[0.5, 3], [0.1, 10]],
+    }
+
+
 def test_update_settings_max_active_submissions_key():
     c, rec = make_client(scope="creator")
     c.update_settings(4, max_active_submissions_per_participant=3)

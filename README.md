@@ -297,7 +297,8 @@ print(student.my_progress(landing["id"]))                # content % + next less
 
 ### Leaderboard
 
-- `client.leaderboard(challenge_id=None)` — defaults to last challenge; returns DataFrame if pandas is installed.
+- `client.leaderboard(challenge_id=None)` — defaults to last challenge; returns DataFrame if pandas is installed. Rows arrive in rank order; `RankedOrder` is `"desc"` (higher is better) or `"asc"` (lower is better, e.g. RMSE), and is always `"desc"` on an ELO board.
+- A challenge's direction is set with `client.update_settings(challenge_id, evaluation_metric_order="asc")` before it starts. Course pass bars follow it: `passed` means `value >= pass_threshold` under `"desc"` and `value <= pass_threshold` under `"asc"` (see `ranked_order` in `my_progress` / `course_progress`).
 
 ## Get your API key
 

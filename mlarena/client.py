@@ -197,7 +197,7 @@ class MLArenaClient:
         return resp.json()
 
     # The infrastructure fields the console's admin panel edits
-    # (`frontend/src/hooks/creatorChallenge/useAdmin.js`, `emptyConfigFields`).
+    # (`frontend/src/hooks/creatorChallenge/useAdmin.ts`, `emptyConfigFields`).
     _ADMIN_CONFIGURATION_FIELDS = frozenset({
         "engine_id", "docker_image_env_runtime_id",
         "agent_max_time_per_step_second", "env_max_time_per_step_second",
@@ -463,6 +463,7 @@ class MLArenaClient:
                         evaluation_metric: str | None = None,
                         evaluation_metric2: str | None = None,
                         evaluation_is_elo_score: bool | None = None,
+                        evaluation_metric_order: str | None = None,
                         evaluation_is_stop_after_deployment: bool | None = None,
                         evaluation_deployment_nb_constraint_run: int | None = None,
                         evaluation_deployment_nb_initial_score_run: int | None = None,
@@ -495,16 +496,29 @@ class MLArenaClient:
                 "reward", "accuracy", "bleu"). The DB column is String(20).
             evaluation_is_elo_score: when True, the leaderboard ranks by
                 ELO rather than mean metric (multi-agent kernels).
+            evaluation_metric_order: "desc" (the default: a higher score is
+                better) or "asc" (a lower score is better, e.g. RMSE). Decides
+                who wins each run, the episode budget tiers and, unless the
+                challenge is ELO-ranked (ELO is always higher-is-better), the
+                leaderboard order and course pass verdicts. Frozen once the
+                challenge has started; refused on an ELO challenge whose
+                submissions already have ratings. Checked against the stored
+                brackets and metrics schema, so a flip may need new brackets
+                in the same call.
             evaluation_is_stop_after_deployment: True (the creation default)
                 means an agent runs only its deployment runs and is never
                 matched again, which pins an ELO leaderboard to its bootstrap
                 ratings forever. Set False to let the matchmaker keep pairing
                 agents (~10 matches per challenge every 2h). Editable on a
                 running challenge.
-            evaluation_episode_budget_brackets: list of `[threshold,
-                n_episodes]` pairs implementing tiered early-stop.
-                Thresholds must be strictly ascending; n_episodes
-                non-decreasing; max 100 episodes per bracket.
+            evaluation_episode_budget_brackets: episode budget tiers, a list
+                of `[threshold, n_episodes]` pairs from the worst threshold to
+                the best. A submission whose running mean is worse than a
+                tier's threshold gets that tier's episodes; one that beats
+                every threshold gets the last tier's. Thresholds strictly
+                ascending under metric_order "desc", strictly descending
+                under "asc"; n_episodes non-decreasing; max 100 episodes per
+                bracket. A single pair is a fixed budget.
             evaluation_frontend_precision: decimal places for numeric
                 leaderboard metrics (default 2). Per-metric `precision` in
                 the schema overrides it.
@@ -517,7 +531,8 @@ class MLArenaClient:
                 `source:"env"` keys are exactly what `env.evaluate` must
                 return in each `agent_results[i]["metrics_detail"]`
                 (equal-mapping, enforced at run time). See the leaderboard
-                envelope's per-row `MetricsSchema` field.
+                envelope's per-row `MetricsSchema` field. A `higher_is_better`
+                on the `reward` descriptor must match metric_order.
 
         Requires a `creator`-scope token and ownership (or admin) of the
         target challenge.
@@ -539,6 +554,8 @@ class MLArenaClient:
             body["evaluation_metric2"] = evaluation_metric2
         if evaluation_is_elo_score is not None:
             body["evaluation_is_elo_score"] = evaluation_is_elo_score
+        if evaluation_metric_order is not None:
+            body["evaluation_metric_order"] = evaluation_metric_order
         if evaluation_is_stop_after_deployment is not None:
             body["evaluation_is_stop_after_deployment"] = evaluation_is_stop_after_deployment
         if evaluation_deployment_nb_constraint_run is not None:
@@ -1435,6 +1452,11 @@ class MLArenaClient:
         By default returns the full ranked list. Pass ``top=N`` to fetch only
         the top N rows (the backend then returns a sliced envelope; this method
         unwraps its ``leaders`` into the same DataFrame shape).
+
+        Rows come in server rank order. ``RankedOrder`` says which way the
+        board ranks (``"desc"``: higher is better, ``"asc"``: lower is better;
+        always ``"desc"`` when ``IsEloRanked``), and ``MetricOrder`` is the
+        direction of the metric itself.
         """
         challenge_id = challenge_id or self._last_challenge
         if challenge_id is None:
@@ -1755,7 +1777,9 @@ class MLArenaClient:
         results.
 
         Mirrors `GET /api/academic_courses/{course_id}/progress/me`. Requires
-        enrollment (or manage rights).
+        enrollment (or manage rights). Each challenge cell carries `value`,
+        `pass_threshold`, `passed` (null when there is nothing to judge) and
+        `ranked_order` ("desc": `passed` means value >= bar, "asc": <=).
         """
         return self._course_call(
             "GET", f"/academic_courses/{course_id}/progress/me",
@@ -1868,9 +1892,10 @@ class MLArenaClient:
         defaults to the end of the module's challenge list.
 
         `pass_threshold` is the course's validation bar: a student validates the
-        challenge when their best leaderboard value reaches it (`>=` — every
-        leaderboard ranks descending, so higher is always better). Omit it for
-        no pass/fail — do not pass 0, which would validate every entrant.
+        challenge when their best leaderboard value meets it in the direction
+        the challenge ranks (`>=` when its `ranked_order` is "desc", `<=` when
+        it is "asc"; the returned link carries `ranked_order`). Omit it for no
+        pass/fail — do not pass 0, which would validate every entrant.
         """
         body: dict = {"challenge_id": challenge_id}
         if label is not None:
@@ -2153,6 +2178,8 @@ class MLArenaClient:
         best result).
 
         Mirrors `GET /api/teacher/course/{id}/progress`. Requires teacher/TA/admin.
+        Challenge metas and cells carry `ranked_order` next to `pass_threshold`
+        (see `my_progress`).
         """
         return self._course_call(
             "GET", f"/teacher/course/{course_id}/progress",
