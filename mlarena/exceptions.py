@@ -9,7 +9,7 @@ class AuthenticationError(MLArenaError):
 
 
 class SubmissionError(MLArenaError):
-    """Raised when agent submission fails."""
+    """Raised when a submission operation fails."""
     pass
 
 

@@ -138,18 +138,30 @@ def test_delete_module_force_flag():
     _expect(rec.last["params"] is None, rec.last["params"])
 
 
-def test_attach_competition_body():
+def test_attach_challenge_body():
     c, rec = make_client(lambda *_: (201, {"id": 9}))
     c.attach_challenge(2, 42, label="CartPole")
-    _expect(rec.last["path"] == "/teacher/modules/2/competitions", rec.last["path"])
-    _expect(rec.last["json"] == {"competition_id": 42, "label": "CartPole"},
+    _expect(rec.last["path"] == "/teacher/modules/2/challenges", rec.last["path"])
+    _expect(rec.last["json"] == {"challenge_id": 42, "label": "CartPole"},
             rec.last["json"])
 
 
-def test_reorder_module_competitions():
+def test_update_and_detach_challenge_link_paths():
+    c, rec = make_client(lambda *_: (200, {"ok": True}))
+    c.update_challenge_link(2, 42, pass_threshold=None)
+    _expect(rec.last["method"] == "PUT", rec.last["method"])
+    _expect(rec.last["path"] == "/teacher/modules/2/challenges/42", rec.last["path"])
+    _expect(rec.last["json"] == {"pass_threshold": None}, rec.last["json"])
+
+    c.detach_challenge(2, 42)
+    _expect(rec.last["method"] == "DELETE", rec.last["method"])
+    _expect(rec.last["path"] == "/teacher/modules/2/challenges/42", rec.last["path"])
+
+
+def test_reorder_module_challenges():
     c, rec = make_client(lambda *_: (200, []))
     c.reorder_module_challenges(2, [3, 1])
-    _expect(rec.last["path"] == "/teacher/modules/2/competitions/reorder",
+    _expect(rec.last["path"] == "/teacher/modules/2/challenges/reorder",
             rec.last["path"])
     _expect(rec.last["json"] == {"ordered_ids": [3, 1]}, rec.last["json"])
 
@@ -304,6 +316,14 @@ def test_create_course_requires_dates_and_sends_extended_fields():
         _expect(body.get(k) == v, f"{k}={body.get(k)}")
 
 
+def test_list_courses_challenge_filter():
+    c, rec = make_client(lambda *_: (200, []))
+    c.list_courses(show_all=True, challenge_id=7)
+    _expect(rec.last["path"] == "/academic_courses/", rec.last["path"])
+    _expect(rec.last["params"] == {"show_all": "true", "challenge_id": 7},
+            rec.last["params"])
+
+
 def test_enroll_uses_join_code():
     c, rec = make_client(lambda *_: (201, {"message": "ok"}))
     c.enroll_in_course("CODE123")
@@ -338,13 +358,27 @@ def _author_router(method, path, kwargs):
         return (201, {"id": 300})
     if method == "PUT" and path.startswith("/teacher/lessons/"):
         return (200, {"id": 300, "is_published": True})
-    if method == "POST" and path.endswith("/competitions"):
+    if method == "POST" and path.endswith("/challenges"):
         return (201, {"id": 1})
     if method == "POST" and path.endswith("/modules"):  # link_module
         return (201, {"id": 1})
     if method == "PUT" and path.endswith("/modules/reorder"):
         return (200, [])
     return (200, {"ok": True})
+
+
+def _write_manifest(d, manifest):
+    import json
+    with open(os.path.join(d, "course.json"), "w") as fh:
+        json.dump(manifest, fh)
+
+
+def _one_module_manifest(module_links):
+    return {
+        "course": {"name": "Intro", "start_date": "2026-01-01",
+                   "end_date": "2026-06-01"},
+        "modules": [{"title": "Foundations", **module_links}],
+    }
 
 
 def test_author_course_from_dir():
@@ -362,7 +396,7 @@ def test_author_course_from_dir():
             "modules": [
                 {
                     "title": "Foundations", "visibility": "public",
-                    "competitions": [{"competition_id": 42, "label": "CartPole"}],
+                    "challenges": [{"challenge_id": 42, "label": "CartPole"}],
                     "lessons": [
                         {"title": "What is RL?", "file": "foundations/what-is-rl.md",
                          "is_published": True, "estimated_minutes": 10},
@@ -388,7 +422,9 @@ def test_author_course_from_dir():
     _expect(("POST", "/teacher/modules") in paths, paths)
     _expect(("POST", "/teacher/modules/200/lessons") in paths, paths)
     _expect(("PUT", "/teacher/lessons/300") in paths, paths)
-    _expect(("POST", "/teacher/modules/200/competitions") in paths, paths)
+    _expect(("POST", "/teacher/modules/200/challenges") in paths, paths)
+    attach = next(c for c in rec.calls if c["path"] == "/teacher/modules/200/challenges")
+    _expect(attach["json"] == {"challenge_id": 42, "label": "CartPole"}, attach["json"])
     _expect(("POST", "/teacher/course/100/modules") in paths, paths)
     _expect(("PUT", "/teacher/course/100/modules/reorder") in paths, paths)
 
@@ -402,6 +438,39 @@ def test_author_course_from_dir():
     _expect(link_calls == [200, 555], link_calls)
 
 
+def test_author_course_from_dir_reads_legacy_manifest_keys():
+    # course.yaml files written before SDK 2.0 say competitions: / competition_id:.
+    c, rec = make_client(_author_router)
+    with tempfile.TemporaryDirectory() as d:
+        _write_manifest(d, _one_module_manifest({
+            "competitions": [{"competition_id": 42, "label": "CartPole",
+                              "pass_threshold": 195.0}],
+        }))
+        c.author_course_from_dir(d)
+    attach = [call for call in rec.calls
+              if call["path"] == "/teacher/modules/200/challenges"]
+    _expect(len(attach) == 1, [call["path"] for call in rec.calls])
+    _expect(attach[0]["json"] == {"challenge_id": 42, "label": "CartPole",
+                                  "pass_threshold": 195.0}, attach[0]["json"])
+
+
+def test_author_course_from_dir_rejects_both_spellings():
+    for links in (
+        {"challenges": [{"challenge_id": 1}], "competitions": [{"competition_id": 1}]},
+        {"challenges": [{"challenge_id": 1, "competition_id": 1}]},
+    ):
+        c, rec = make_client(_author_router)
+        with tempfile.TemporaryDirectory() as d:
+            _write_manifest(d, _one_module_manifest(links))
+            try:
+                c.author_course_from_dir(d)
+                raise AssertionError(f"expected MLArenaError for {links}")
+            except MLArenaError:
+                pass
+        # Validated before the first request: nothing was created.
+        _expect(rec.calls == [], [call["path"] for call in rec.calls])
+
+
 def _export_router(method, path, kwargs):
     if path == "/academic_courses/intro":
         return (200, {
@@ -412,7 +481,8 @@ def _export_router(method, path, kwargs):
             "modules": [{
                 "module_id": 1, "title": "Foundations", "slug": "foundations",
                 "summary": "s", "icon": "book",
-                "competitions": [{"competition_id": 42, "label": "CartPole"}],
+                "challenges": [{"challenge_id": 42, "label": "CartPole",
+                                "name": "CartPole-v1", "pass_threshold": None}],
                 "lessons": [{"title": "What is RL?", "slug": "what-is-rl",
                              "kind": "lesson", "gated": False,
                              "is_published": True, "estimated_minutes": 10}],
@@ -431,13 +501,20 @@ def test_export_course_to_dir():
         _expect(os.path.isfile(body_path), "lesson body not written")
         with open(body_path) as fh:
             _expect("exported body" in fh.read(), "wrong body content")
-        has_manifest = (os.path.isfile(os.path.join(d, "course.yaml"))
-                        or os.path.isfile(os.path.join(d, "course.json")))
-        _expect(has_manifest, "manifest not written")
+        manifest_files = [os.path.join(d, n) for n in ("course.yaml", "course.json")
+                          if os.path.isfile(os.path.join(d, n))]
+        _expect(manifest_files, "manifest not written")
+        with open(manifest_files[0]) as fh:
+            written = fh.read()
+        _expect("challenge_id" in written and "competition" not in written, written)
 
     _expect(manifest["course"]["name"] == "Intro to RL", manifest)
     _expect(manifest["modules"][0]["lessons"][0]["file"]
             == os.path.join("foundations", "what-is-rl.md"), manifest)
+    _expect(manifest["modules"][0]["challenges"]
+            == [{"challenge_id": 42, "label": "CartPole", "pass_threshold": None}],
+            manifest["modules"][0])
+    _expect("competitions" not in manifest["modules"][0], manifest["modules"][0])
 
 
 # --------------------------------------------------------------------------- #

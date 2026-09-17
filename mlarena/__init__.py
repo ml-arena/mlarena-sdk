@@ -9,7 +9,7 @@ from mlarena.exceptions import (
     SubmissionError,
 )
 
-__version__ = "1.0.0"
+__version__ = "2.0.0"
 
 _LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 

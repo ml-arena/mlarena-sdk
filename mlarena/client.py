@@ -40,7 +40,7 @@ class MLArenaClient:
     def __init__(self, token: str, base_url: str):
         self._token = token
         self._base_url = base_url.rstrip("/")
-        self._last_agent_id = None
+        self._last_submission_id = None
         self._last_challenge = None
 
     def _headers(self, *, json_body: bool = False) -> dict:
@@ -160,7 +160,7 @@ class MLArenaClient:
 
         if page is not None or per_page is not None:
             params = {**base_params, "page": page or 1, "per_page": per_page or 24}
-            resp = self._request("GET",self._url("/competitions/"), params=params, timeout=30)
+            resp = self._request("GET",self._url("/challenges/"), params=params, timeout=30)
             resp.raise_for_status()
             return _to_dataframe(resp.json().get("items", []))
 
@@ -169,7 +169,7 @@ class MLArenaClient:
         per_page_n = 100
         while True:
             params = {**base_params, "page": page_n, "per_page": per_page_n}
-            resp = self._request("GET",self._url("/competitions/"), params=params, timeout=30)
+            resp = self._request("GET",self._url("/challenges/"), params=params, timeout=30)
             resp.raise_for_status()
             body = resp.json()
             items.extend(body.get("items", []))
@@ -182,8 +182,8 @@ class MLArenaClient:
         """Fetch a single challenge's detail (settings, limits, status).
 
         Useful for client-side preflight against `max_upload_size_bytes` and
-        `max_upload_files` before calling `upload_agent_file` / `submit`.
-        Mirrors `GET /api/competitions/{id}` (`competitions.py:164`).
+        `max_upload_files` before calling `upload_submission_file` / `submit`.
+        Mirrors `GET /api/challenges/{id}` (`challenges.py`, `get_challenge`).
 
         Includes an `engine` sub-object with the engine's
         `k8s_workload_value` plus `vm_health_ok` / `vm_health_checked_at`
@@ -191,7 +191,7 @@ class MLArenaClient:
         simulationmanager). `vm_health_ok=False` means the GPU VM is
         currently unreachable and submissions will queue rather than run.
         """
-        resp = self._request("GET",self._url(f"/competitions/{challenge_id}"), timeout=30)
+        resp = self._request("GET",self._url(f"/challenges/{challenge_id}"), timeout=30)
         self._handle_response(resp)
         resp.raise_for_status()
         return resp.json()
@@ -207,7 +207,7 @@ class MLArenaClient:
     def update_challenge_configuration(self, challenge_id: int, **fields) -> dict:
         """Patch a challenge's infrastructure configuration (admin only).
 
-        Mirrors `PUT /api/competitions/{id}/configuration` — the call the
+        Mirrors `PUT /api/challenges/{id}/configuration` — the call the
         console's admin panel makes to repoint a challenge at another engine.
         Accepts `engine_id`, `docker_image_env_runtime_id`,
         `agent_max_time_per_step_second`, `env_max_time_per_step_second`,
@@ -227,7 +227,7 @@ class MLArenaClient:
         body = _filtered_fields(fields, self._ADMIN_CONFIGURATION_FIELDS,
                                 "update_challenge_configuration")
         resp = self._request("PUT",
-            self._url(f"/competitions/{challenge_id}/configuration"),
+            self._url(f"/challenges/{challenge_id}/configuration"),
             headers=self._headers(json_body=True),
             json=body,
             timeout=30,
@@ -245,16 +245,17 @@ class MLArenaClient:
     def creator_challenges(self) -> list:
         """List challenges the caller owns or assists on (creator scope).
 
-        Mirrors `GET /api/creator_competition/competitions`
-        (`lifecycle.py:35`). Unlike `challenges()` this includes the caller's
-        **hidden** (`is_public=False`) challenges — useful for finding a
-        challenge you created but did not make public. Each item carries
+        Mirrors `GET /api/creator_challenge/challenges`
+        (`lifecycle.py`, `get_creator_challenges`). Unlike `challenges()`
+        this includes the caller's **hidden** (`is_public=False`) challenges
+        — useful for finding a challenge you created but did not make
+        public. Each item carries
         `id`, `name`, `is_started`, `is_public`, `kind`, `role`.
 
         Requires a `creator`-scope token.
         """
         resp = self._request("GET",
-            self._url("/creator_competition/competitions"),
+            self._url("/creator_challenge/challenges"),
             headers=self._headers(),
             timeout=30,
         )
@@ -266,8 +267,8 @@ class MLArenaClient:
     def datasets(self, challenge_id: int) -> dict:
         """List the public datasets attached to a challenge.
 
-        Mirrors `GET /api/competitions/{id}/datasets` (`competitions.py:854`,
-        `@auth_required('user')`). Returns
+        Mirrors `GET /api/challenges/{id}/datasets` (`challenges.py`,
+        `get_challenge_datasets`, `@auth_required('user')`). Returns
         ``{"datasets": [{"id", "label", "description",
         "files": [{"id", "label", "download_url", "file_size_bytes", ...}]}]}``
         where each ``download_url`` is a short-lived (60 min) signed URL the
@@ -276,7 +277,7 @@ class MLArenaClient:
         valid token scope.
         """
         resp = self._request("GET",
-            self._url(f"/competitions/{challenge_id}/datasets"),
+            self._url(f"/challenges/{challenge_id}/datasets"),
             headers=self._headers(),
             timeout=30,
         )
@@ -323,7 +324,7 @@ class MLArenaClient:
 
         `kernel_version` carries a catalog KIND: one of `"flex_v1"`,
         `"gymnasium"`, `"pettingzoo"`, `"file_v1"` (list them live via
-        `GET /creator_competition/available_kinds`). Since the worker
+        `GET /creator_challenge/available_kinds`). Since the worker
         consolidation only two kernels exist — `gymnasium`/`pettingzoo` are
         presets over the flex_v1 kernel that pair the flexkit loop-library
         env template with the matching env-image family.
@@ -334,7 +335,7 @@ class MLArenaClient:
         engine directly at creation time.
 
         If `tag_names` is given, each name is resolved against the public
-        tag catalog (`GET /api/competition_tags/tags`) before the create
+        tag catalog (`GET /api/challenge_tags/tags`) before the create
         call. Unknown names raise `MLArenaError` (fail fast — the catalog
         is admin-curated; new tags are not auto-created).
 
@@ -350,13 +351,13 @@ class MLArenaClient:
         if description is not None:
             body["description"] = description
         if copy_from_challenge_id is not None:
-            body["copy_from_competition_id"] = copy_from_challenge_id
+            body["copy_from_challenge_id"] = copy_from_challenge_id
         if tag_names:
             body["tag_ids"] = self._resolve_tag_names(tag_names)
         if is_public is not None:
             body["is_public"] = is_public
         resp = self._request("POST",
-            self._url("/creator_competition/competition"),
+            self._url("/creator_challenge/challenge"),
             headers=self._headers(json_body=True),
             json=body,
             timeout=60,
@@ -368,7 +369,7 @@ class MLArenaClient:
 
     def list_tags(self):
         """Return the public tag catalog. No auth required."""
-        resp = self._request("GET",self._url("/competition_tags/tags"), timeout=30)
+        resp = self._request("GET",self._url("/challenge_tags/tags"), timeout=30)
         resp.raise_for_status()
         return _to_dataframe(resp.json())
 
@@ -388,7 +389,7 @@ class MLArenaClient:
             raise MLArenaError("Provide exactly one of tag_names= or tag_ids=")
         ids = tag_ids if tag_ids is not None else self._resolve_tag_names(tag_names)
         resp = self._request("PUT",
-            self._url(f"/creator_competition/competition/{challenge_id}/tags"),
+            self._url(f"/creator_challenge/challenge/{challenge_id}/tags"),
             headers=self._headers(json_body=True),
             json={"tag_ids": ids},
             timeout=30,
@@ -405,7 +406,7 @@ class MLArenaClient:
         local seeds them as "gymnasium", and callers shouldn't have to know
         which environment they hit.
         """
-        catalog_resp = self._request("GET",self._url("/competition_tags/tags"), timeout=30)
+        catalog_resp = self._request("GET",self._url("/challenge_tags/tags"), timeout=30)
         catalog_resp.raise_for_status()
         catalog = catalog_resp.json()
         by_name_ci = {t["name"].casefold(): t["id"] for t in catalog}
@@ -423,7 +424,7 @@ class MLArenaClient:
                            is_public: bool | None = None) -> dict:
         """Patch top-level challenge fields (creator scope).
 
-        Mirrors `PUT /api/creator_competition/competition/{id}`. Only fields
+        Mirrors `PUT /api/creator_challenge/challenge/{id}`. Only fields
         explicitly passed are sent — everything else is left untouched.
 
         ``name`` is locked once the challenge has started — a rename strands
@@ -443,7 +444,7 @@ class MLArenaClient:
         if not body:
             raise MLArenaError("update_challenge requires at least one field")
         resp = self._request("PUT",
-            self._url(f"/creator_competition/competition/{challenge_id}"),
+            self._url(f"/creator_challenge/challenge/{challenge_id}"),
             headers=self._headers(json_body=True),
             json=body,
             timeout=30,
@@ -457,7 +458,7 @@ class MLArenaClient:
                         simulation_timeout_sec: int | None = None,
                         max_upload_size_bytes: int | None = None,
                         max_upload_files: int | None = None,
-                        max_active_agents_per_participant: int | None = None,
+                        max_active_submissions_per_participant: int | None = None,
                         submission_filename: str | None = None,
                         evaluation_metric: str | None = None,
                         evaluation_metric2: str | None = None,
@@ -471,7 +472,7 @@ class MLArenaClient:
                         ) -> dict:
         """Update challenge settings + evaluation parameters.
 
-        Mirrors `PUT /api/creator_competition/competition/{id}/settings` —
+        Mirrors `PUT /api/creator_challenge/challenge/{id}/settings` —
         the same call the console's Settings tab makes via `saveSettings()`.
         Only fields explicitly passed are sent; everything else is left
         untouched. Once the challenge has started only the fields that cannot
@@ -528,8 +529,8 @@ class MLArenaClient:
             body["max_upload_size_bytes"] = max_upload_size_bytes
         if max_upload_files is not None:
             body["max_upload_files"] = max_upload_files
-        if max_active_agents_per_participant is not None:
-            body["max_active_agents_per_participant"] = max_active_agents_per_participant
+        if max_active_submissions_per_participant is not None:
+            body["max_active_submissions_per_participant"] = max_active_submissions_per_participant
         if submission_filename is not None:
             body["submission_filename"] = submission_filename
         if evaluation_metric is not None:
@@ -553,7 +554,7 @@ class MLArenaClient:
         if not body:
             raise MLArenaError("update_settings requires at least one field")
         resp = self._request("PUT",
-            self._url(f"/creator_competition/competition/{challenge_id}/settings"),
+            self._url(f"/creator_challenge/challenge/{challenge_id}/settings"),
             headers=self._headers(json_body=True),
             json=body,
             timeout=30,
@@ -566,7 +567,7 @@ class MLArenaClient:
     def upload_env_file(self, challenge_id: int, file_path: str) -> dict:
         """Upload a single environment file (env.py, requirements.txt, …).
 
-        Multipart PUT to `/api/creator_competition/competition/{id}/env/files`.
+        Multipart PUT to `/api/creator_challenge/challenge/{id}/env/files`.
         Use this for binary files; for text content driven by a template,
         prefer `update_env_file_content`.
         """
@@ -575,7 +576,7 @@ class MLArenaClient:
         with open(file_path, "rb") as fh:
             resp = self._request("PUT",
                 self._url(
-                    f"/creator_competition/competition/{challenge_id}/env/files"
+                    f"/creator_challenge/challenge/{challenge_id}/env/files"
                 ),
                 headers=self._headers(),
                 files={"file": (os.path.basename(file_path), fh)},
@@ -606,7 +607,7 @@ class MLArenaClient:
             body["github_token"] = github_token
         resp = self._request("POST",
             self._url(
-                f"/creator_competition/competition/{challenge_id}/env/sync-github"
+                f"/creator_challenge/challenge/{challenge_id}/env/sync-github"
             ),
             headers=self._headers(json_body=True),
             json=body,
@@ -627,7 +628,7 @@ class MLArenaClient:
         """
         resp = self._request("PUT",
             self._url(
-                f"/creator_competition/competition/{challenge_id}/env/files"
+                f"/creator_challenge/challenge/{challenge_id}/env/files"
             ),
             headers=self._headers(json_body=True),
             json={"filename": filename, "content": content},
@@ -641,14 +642,14 @@ class MLArenaClient:
     def set_challenge_image(self, challenge_id: int, image_path: str) -> dict:
         """Upload (or replace) the challenge thumbnail (`miniature.png`).
 
-        Multipart POST to `/api/creator_competition/competition/{id}/image`.
+        Multipart POST to `/api/creator_challenge/challenge/{id}/image`.
         """
         if not os.path.isfile(image_path):
             raise MLArenaError(f"Image file not found: {image_path}")
         with open(image_path, "rb") as fh:
             resp = self._request("POST",
                 self._url(
-                    f"/creator_competition/competition/{challenge_id}/image"
+                    f"/creator_challenge/challenge/{challenge_id}/image"
                 ),
                 headers=self._headers(),
                 files={"file": (os.path.basename(image_path), fh)},
@@ -663,7 +664,7 @@ class MLArenaClient:
         """Replace the challenge overview markdown (`overview.md`)."""
         resp = self._request("PUT",
             self._url(
-                f"/creator_competition/competition/{challenge_id}/markdown"
+                f"/creator_challenge/challenge/{challenge_id}/markdown"
             ),
             headers=self._headers(json_body=True),
             json={"content": content},
@@ -679,9 +680,10 @@ class MLArenaClient:
         """Upload a benchmark file (`agent.py`, or a file_v1 submission file).
 
         Backend reads the benchmark folder when `run_benchmark` fires; you
-        must upload the agent before kicking the run. The upload is multipart
-        and byte-exact, so use it (not `update_benchmark_file_content`, which
-        writes text) for a binary submission such as `submission.csv.gz`.
+        must upload the benchmark file before kicking the run. The upload is
+        multipart and byte-exact, so use it (not
+        `update_benchmark_file_content`, which writes text) for a binary
+        submission such as `submission.csv.gz`.
 
         `filename` stores the file under another name — e.g. a local
         `benchmark_submission.csv.gz` as the challenge's `submission_filename`
@@ -694,7 +696,7 @@ class MLArenaClient:
         with open(file_path, "rb") as fh:
             resp = self._request("PUT",
                 self._url(
-                    f"/creator_competition/competition/{challenge_id}/benchmark/files"
+                    f"/creator_challenge/challenge/{challenge_id}/benchmark/files"
                 ),
                 headers=self._headers(),
                 files={"file": (upload_name, fh)},
@@ -710,7 +712,7 @@ class MLArenaClient:
         """Write a benchmark file by content (templated baseline agent)."""
         resp = self._request("PUT",
             self._url(
-                f"/creator_competition/competition/{challenge_id}/benchmark/files"
+                f"/creator_challenge/challenge/{challenge_id}/benchmark/files"
             ),
             headers=self._headers(json_body=True),
             json={"filename": filename, "content": content},
@@ -733,7 +735,7 @@ class MLArenaClient:
         """
         resp = self._request("POST",
             self._url(
-                f"/creator_competition/competition/{challenge_id}/benchmark/run"
+                f"/creator_challenge/challenge/{challenge_id}/benchmark/run"
             ),
             headers=self._headers(),
             timeout=60,
@@ -749,7 +751,7 @@ class MLArenaClient:
         """
         resp = self._request("GET",
             self._url(
-                f"/creator_competition/competition/{challenge_id}/benchmark/status"
+                f"/creator_challenge/challenge/{challenge_id}/benchmark/status"
             ),
             headers=self._headers(),
             timeout=30,
@@ -761,12 +763,13 @@ class MLArenaClient:
     def start_challenge(self, challenge_id: int) -> dict:
         """Flip a creator challenge into the started state.
 
-        Backend gates this behind: env.py uploaded, benchmark agent ACTIVE
-        with a non-null `mean_reward`. Failures bubble up as MLArenaError.
+        Backend gates this behind: env.py uploaded, benchmark submission
+        ACTIVE with a non-null `mean_reward`. Failures bubble up as
+        MLArenaError.
         """
         resp = self._request("PUT",
             self._url(
-                f"/creator_competition/competition/{challenge_id}/start"
+                f"/creator_challenge/challenge/{challenge_id}/start"
             ),
             headers=self._headers(),
             timeout=30,
@@ -779,13 +782,14 @@ class MLArenaClient:
     def stop_challenge(self, challenge_id: int) -> dict:
         """Flip a creator challenge back into the not-started state.
 
-        Mirrors `PUT /api/creator_competition/competition/{id}/stop`. Stopping
-        only clears `is_started`; it leaves agents, results and the benchmark
-        record untouched, so the challenge can be re-started afterwards.
+        Mirrors `PUT /api/creator_challenge/challenge/{id}/stop`. Stopping
+        only clears `is_started`; it leaves submissions, results and the
+        benchmark record untouched, so the challenge can be re-started
+        afterwards.
         """
         resp = self._request("PUT",
             self._url(
-                f"/creator_competition/competition/{challenge_id}/stop"
+                f"/creator_challenge/challenge/{challenge_id}/stop"
             ),
             headers=self._headers(),
             timeout=30,
@@ -799,13 +803,13 @@ class MLArenaClient:
                               agent_template: str) -> dict:
         """Set the default agent.py template handed to participants.
 
-        Mirrors `PUT /api/creator_competition/competition/{id}/agent-template`.
+        Mirrors `PUT /api/creator_challenge/challenge/{id}/agent-template`.
         The backend rejects this while the challenge is started, so stop it
         first (`stop_challenge`) and re-start afterwards if needed.
         """
         resp = self._request("PUT",
             self._url(
-                f"/creator_competition/competition/{challenge_id}/agent-template"
+                f"/creator_challenge/challenge/{challenge_id}/agent-template"
             ),
             headers=self._headers(json_body=True),
             json={"agent_template": agent_template},
@@ -820,9 +824,10 @@ class MLArenaClient:
                        description: str | None = None) -> dict:
         """Create a public dataset bucket on a challenge (creator scope).
 
-        Mirrors `POST /api/creator_competition/competition/{id}/datasets`
-        (`datasets.py:68`). Returns `{"id", "label", "description"}`; use the
-        returned `id` with `upload_dataset_file`. The backend rejects this once
+        Mirrors `POST /api/creator_challenge/challenge/{id}/datasets`
+        (`datasets.py`, `create_creator_dataset`). Returns
+        `{"id", "label", "description"}`; use the returned `id` with
+        `upload_dataset_file`. The backend rejects this once
         the challenge is started, so call it before `start_challenge`.
         Files uploaded here are served to participants via `datasets()`.
 
@@ -832,7 +837,7 @@ class MLArenaClient:
         if description is not None:
             body["description"] = description
         resp = self._request("POST",
-            self._url(f"/creator_competition/competition/{challenge_id}/datasets"),
+            self._url(f"/creator_challenge/challenge/{challenge_id}/datasets"),
             headers=self._headers(json_body=True),
             json=body,
             timeout=30,
@@ -845,14 +850,15 @@ class MLArenaClient:
     def creator_datasets(self, challenge_id: int) -> dict:
         """List a challenge's datasets + files from the creator side.
 
-        Mirrors `GET /api/creator_competition/competition/{id}/datasets`
-        (`datasets.py:24`). Like `datasets()` but creator-scoped (works on your
-        own hidden challenges). Returns `{"datasets": [{"id","label","files":[…]}]}`.
+        Mirrors `GET /api/creator_challenge/challenge/{id}/datasets`
+        (`datasets.py`, `get_creator_datasets`). Like `datasets()` but
+        creator-scoped (works on your own hidden challenges). Returns
+        `{"datasets": [{"id","label","files":[…]}]}`.
 
         Requires a `creator`-scope token.
         """
         resp = self._request("GET",
-            self._url(f"/creator_competition/competition/{challenge_id}/datasets"),
+            self._url(f"/creator_challenge/challenge/{challenge_id}/datasets"),
             headers=self._headers(),
             timeout=30,
         )
@@ -866,10 +872,10 @@ class MLArenaClient:
         """Upload one file into a challenge dataset (creator scope).
 
         Multipart POST to
-        `/api/creator_competition/competition/{id}/datasets/{dataset_id}/files`
-        (`datasets.py:193`); the file is stored in GCS and exposed to
-        participants through `datasets()` as a signed `download_url`. Rejected
-        once the challenge is started. Returns
+        `/api/creator_challenge/challenge/{id}/datasets/{dataset_id}/files`
+        (`datasets.py`, `upload_dataset_file`); the file is stored in GCS and
+        exposed to participants through `datasets()` as a signed
+        `download_url`. Rejected once the challenge is started. Returns
         `{"id", "label", "file_size_bytes"}`.
 
         Requires a `creator`-scope token.
@@ -879,7 +885,7 @@ class MLArenaClient:
         with open(file_path, "rb") as fh:
             resp = self._request("POST",
                 self._url(
-                    f"/creator_competition/competition/{challenge_id}/datasets/{dataset_id}/files"
+                    f"/creator_challenge/challenge/{challenge_id}/datasets/{dataset_id}/files"
                 ),
                 headers=self._headers(),
                 files={"file": (os.path.basename(file_path), fh)},
@@ -895,9 +901,9 @@ class MLArenaClient:
                        description: str | None = None) -> dict:
         """Update a dataset's label / description (creator scope).
 
-        PUT to `/api/creator_competition/competition/{id}/datasets/{dataset_id}`
-        (`datasets.py:118`). Only fields explicitly passed are sent. Rejected
-        once the challenge is started. Returns `{"id", "label", "description"}`.
+        PUT to `/api/creator_challenge/challenge/{id}/datasets/{dataset_id}`
+        (`datasets.py`, `update_creator_dataset`). Only fields explicitly
+        passed are sent. Rejected once the challenge is started. Returns `{"id", "label", "description"}`.
 
         Requires a `creator`-scope token.
         """
@@ -910,7 +916,7 @@ class MLArenaClient:
             raise MLArenaError("update_dataset requires at least one field")
         resp = self._request("PUT",
             self._url(
-                f"/creator_competition/competition/{challenge_id}/datasets/{dataset_id}"
+                f"/creator_challenge/challenge/{challenge_id}/datasets/{dataset_id}"
             ),
             headers=self._headers(json_body=True),
             json=body,
@@ -926,9 +932,9 @@ class MLArenaClient:
         """Delete one file from a challenge dataset (creator scope).
 
         DELETE to
-        `/api/creator_competition/competition/{id}/datasets/{dataset_id}/files/{file_id}`
-        (`datasets.py:251`); removes the DB row and its GCS blob. Rejected once
-        the challenge is started. Use this before re-uploading a file with the
+        `/api/creator_challenge/challenge/{id}/datasets/{dataset_id}/files/{file_id}`
+        (`datasets.py`, `delete_dataset_file`); removes the DB row and its
+        GCS blob. Rejected once the challenge is started. Use this before re-uploading a file with the
         same name — `upload_dataset_file` always adds a new row, so replacing a
         file means delete-then-upload. Get `file_id` from `creator_datasets()`.
 
@@ -936,7 +942,7 @@ class MLArenaClient:
         """
         resp = self._request("DELETE",
             self._url(
-                f"/creator_competition/competition/{challenge_id}/datasets/{dataset_id}/files/{file_id}"
+                f"/creator_challenge/challenge/{challenge_id}/datasets/{dataset_id}/files/{file_id}"
             ),
             headers=self._headers(),
             timeout=60,
@@ -946,44 +952,50 @@ class MLArenaClient:
             raise MLArenaError(f"delete_dataset_file failed: {_safe_error(resp)}")
         return resp.json()
 
-    # ---- Direct attached agents (user scope) ----
+    # ---- Submissions (user scope) ----
 
-    def create_attached_agent(self, challenge_id: int, agent_name: str,
-                              copy_from_agent_id: int | None = None) -> dict:
-        """Create a new agent attachment for `challenge_id`.
+    def create_submission(self, challenge_id: int, submission_name: str,
+                          copy_from_submission_id: int | None = None) -> dict:
+        """Create a new submission for `challenge_id`.
+
+        Mirrors `POST /api/submissions/challenge/{cid}` (`create_delete.py`).
+        With `copy_from_submission_id`, the files (and a compatible runtime) of
+        one of your existing submissions are copied into the new one. Returns
+        `{"message", "submission_id", "status", "validation_message",
+        "template_source", ...}`.
 
         Requires a `user`-scope token.
         """
-        body: dict = {"agent_name": agent_name}
-        if copy_from_agent_id is not None:
-            body["copy_from_agent_id"] = copy_from_agent_id
+        body: dict = {"submission_name": submission_name}
+        if copy_from_submission_id is not None:
+            body["copy_from_submission_id"] = copy_from_submission_id
         resp = self._request("POST",
-            self._url(f"/direct_attache_agents/competition/{challenge_id}"),
+            self._url(f"/submissions/challenge/{challenge_id}"),
             headers=self._headers(json_body=True),
             json=body,
             timeout=60,
         )
         self._handle_response(resp)
         if resp.status_code not in (200, 201):
-            raise SubmissionError(f"create_attached_agent failed: {_safe_error(resp)}")
+            raise SubmissionError(f"create_submission failed: {_safe_error(resp)}")
         return resp.json()
 
-    def upload_agent_file(self, challenge_id: int, attache_agent_id: int,
-                          file_path: str) -> dict:
-        """Upload (or overwrite) a single file in an existing agent attachment.
+    def upload_submission_file(self, challenge_id: int, submission_id: int,
+                               file_path: str) -> dict:
+        """Upload (or overwrite) a single file in an existing submission.
 
         Returns the server response ``{"message", "status", "validation_message"}``.
         Note: the file route returns HTTP 200 even when validation *rejects* the
-        attachment — the file is saved but the whole attachment is re-validated and
+        submission — the file is saved but the whole submission is re-validated and
         may come back ``status == "upload_failed"`` with an actionable
-        ``validation_message``. A 2xx here is not proof the agent is deployable;
+        ``validation_message``. A 2xx here is not proof the submission is deployable;
         inspect ``status`` (``submit()`` does this for you before deploying)."""
         if not os.path.isfile(file_path):
             raise SubmissionError(f"File not found: {file_path}")
         with open(file_path, "rb") as fh:
             resp = self._request("PUT",
                 self._url(
-                    f"/direct_attache_agents/competition/{challenge_id}/{attache_agent_id}/file"
+                    f"/submissions/challenge/{challenge_id}/{submission_id}/file"
                 ),
                 headers=self._headers(),
                 files={"file": (os.path.basename(file_path), fh)},
@@ -991,28 +1003,28 @@ class MLArenaClient:
             )
         self._handle_response(resp)
         if resp.status_code not in (200, 201):
-            raise SubmissionError(f"upload_agent_file failed: {_safe_error(resp)}")
+            raise SubmissionError(f"upload_submission_file failed: {_safe_error(resp)}")
         return resp.json()
 
-    def deploy_agent(self, challenge_id: int, attache_agent_id: int) -> dict:
-        """Trigger deployment of an uploaded agent."""
+    def deploy_submission(self, challenge_id: int, submission_id: int) -> dict:
+        """Trigger deployment of an uploaded submission."""
         resp = self._request("PUT",
             self._url(
-                f"/direct_attache_agents/competition/{challenge_id}/{attache_agent_id}/deploy"
+                f"/submissions/challenge/{challenge_id}/{submission_id}/deploy"
             ),
             headers=self._headers(),
             timeout=60,
         )
         self._handle_response(resp)
         if resp.status_code not in (200, 201, 202):
-            raise SubmissionError(f"deploy_agent failed: {_safe_error(resp)}")
+            raise SubmissionError(f"deploy_submission failed: {_safe_error(resp)}")
         return resp.json()
 
-    def agent_deploy_status(self, challenge_id: int, attache_agent_id: int) -> dict:
-        """Read the deploy / run status of an attached agent."""
+    def submission_deploy_status(self, challenge_id: int, submission_id: int) -> dict:
+        """Read the deploy quotas and last deploy of a submission."""
         resp = self._request("GET",
             self._url(
-                f"/direct_attache_agents/competition/{challenge_id}/{attache_agent_id}/deploy"
+                f"/submissions/challenge/{challenge_id}/{submission_id}/deploy"
             ),
             headers=self._headers(),
             timeout=30,
@@ -1021,18 +1033,18 @@ class MLArenaClient:
         resp.raise_for_status()
         return resp.json()
 
-    def delete_agent(self, challenge_id: int, attache_agent_id: int) -> dict:
-        """Soft-delete an attached agent (`DELETE /direct_attache_agents/competition/{cid}/{aid}`)."""
+    def delete_submission(self, challenge_id: int, submission_id: int) -> dict:
+        """Soft-delete a submission (`DELETE /api/submissions/challenge/{cid}/{sid}`)."""
         resp = self._request("DELETE",
             self._url(
-                f"/direct_attache_agents/competition/{challenge_id}/{attache_agent_id}"
+                f"/submissions/challenge/{challenge_id}/{submission_id}"
             ),
             headers=self._headers(),
             timeout=30,
         )
         self._handle_response(resp)
         if resp.status_code != 200:
-            raise SubmissionError(f"delete_agent failed: {_safe_error(resp)}")
+            raise SubmissionError(f"delete_submission failed: {_safe_error(resp)}")
         return resp.json()
 
     # ---- Runner / runtime selection (DockerImageAgentRuntime) ----
@@ -1040,12 +1052,12 @@ class MLArenaClient:
     def runtime_options(self, challenge_id: int):
         """List runtimes (language × framework × version) compatible with this challenge.
 
-        Mirrors `GET /api/direct_attache_agents/runtime_options/{cid}`
-        (`runtime.py:25`). Each entry: `{id, language, language_version,
-        framework, framework_version, requirement}`.
+        Mirrors `GET /api/submissions/runtime_options/{cid}`
+        (`runtime.py`, `get_runtime_options`). Each entry: `{id, language,
+        language_version, framework, framework_version, requirement}`.
         """
         resp = self._request("GET",
-            self._url(f"/direct_attache_agents/runtime_options/{challenge_id}"),
+            self._url(f"/submissions/runtime_options/{challenge_id}"),
             headers=self._headers(),
             timeout=30,
         )
@@ -1054,10 +1066,14 @@ class MLArenaClient:
             raise MLArenaError(f"runtime_options failed: {_safe_error(resp)}")
         return _to_dataframe(resp.json())
 
-    def agent_runtime(self, attache_agent_id: int) -> dict:
-        """Currently selected runtime for an attached agent (`runtime.py:88`)."""
+    def agent_runtime(self, submission_id: int) -> dict:
+        """Agent runtime currently pinned to a submission.
+
+        Mirrors `GET /api/submissions/agent_runtime/{sid}` (`runtime.py`,
+        `get_agent_runtime`).
+        """
         resp = self._request("GET",
-            self._url(f"/direct_attache_agents/agent_runtime/{attache_agent_id}"),
+            self._url(f"/submissions/agent_runtime/{submission_id}"),
             headers=self._headers(),
             timeout=30,
         )
@@ -1066,14 +1082,15 @@ class MLArenaClient:
             raise MLArenaError(f"agent_runtime failed: {_safe_error(resp)}")
         return resp.json()
 
-    def set_agent_runtime(self, attache_agent_id: int, runtime_id: int) -> dict:
-        """Pin a `DockerImageAgentRuntime` onto an attached agent (`runtime.py:151`).
+    def set_agent_runtime(self, submission_id: int, runtime_id: int) -> dict:
+        """Pin a `DockerImageAgentRuntime` onto a submission.
 
-        The backend rejects runtimes whose `docker_image_worker_envagent_id`
-        does not match the challenge's engine.
+        Mirrors `PUT /api/submissions/agent_runtime/{sid}` (`runtime.py`,
+        `update_agent_runtime`). The backend rejects runtimes whose
+        `docker_image_worker_envagent_id` does not match the challenge's engine.
         """
         resp = self._request("PUT",
-            self._url(f"/direct_attache_agents/agent_runtime/{attache_agent_id}"),
+            self._url(f"/submissions/agent_runtime/{submission_id}"),
             headers=self._headers(json_body=True),
             json={"docker_image_agent_runtime_id": runtime_id},
             timeout=30,
@@ -1111,53 +1128,58 @@ class MLArenaClient:
 
     # ---- File listing / reading / editing / deleting ----
 
-    def list_agent_files(self, challenge_id: int, attache_agent_id: int) -> dict:
-        """List files in an agent attachment with their content (or binary marker).
+    def list_submission_files(self, challenge_id: int, submission_id: int) -> dict:
+        """List files in a submission with their content (or binary marker).
 
-        Mirrors `GET …/competition/{cid}/{aid}/file` (`file.py:244`). Returns
-        the raw `{"files": {<name>: {content, language, is_binary, size}}}`
-        payload — keep the wrapper shallow so callers can drill into either
-        the file map or the metadata.
+        Mirrors `GET /api/submissions/challenge/{cid}/{sid}/file` (`file.py`,
+        `get_submission_files`). Returns the raw
+        `{"files": {<name>: {content, language, is_binary, size}}}` payload —
+        keep the wrapper shallow so callers can drill into either the file map
+        or the metadata.
         """
         resp = self._request("GET",
             self._url(
-                f"/direct_attache_agents/competition/{challenge_id}/{attache_agent_id}/file"
+                f"/submissions/challenge/{challenge_id}/{submission_id}/file"
             ),
             headers=self._headers(),
             timeout=30,
         )
         self._handle_response(resp)
         if resp.status_code != 200:
-            raise SubmissionError(f"list_agent_files failed: {_safe_error(resp)}")
+            raise SubmissionError(f"list_submission_files failed: {_safe_error(resp)}")
         return resp.json()
 
-    def get_agent_file_content(self, challenge_id: int, attache_agent_id: int,
-                               filename: str) -> str:
-        """Fetch the raw text content of one file in an agent attachment (`file.py:463`)."""
+    def get_submission_file_content(self, challenge_id: int, submission_id: int,
+                                    filename: str) -> str:
+        """Fetch the raw text content of one file in a submission.
+
+        Mirrors `GET /api/submissions/challenge/{cid}/{sid}/file/{filename}/content`
+        (`file.py`, `get_file_content`).
+        """
         resp = self._request("GET",
             self._url(
-                f"/direct_attache_agents/competition/{challenge_id}/{attache_agent_id}/file/{filename}/content"
+                f"/submissions/challenge/{challenge_id}/{submission_id}/file/{filename}/content"
             ),
             headers=self._headers(),
             timeout=30,
         )
         self._handle_response(resp)
         if resp.status_code != 200:
-            raise SubmissionError(f"get_agent_file_content failed: {_safe_error(resp)}")
+            raise SubmissionError(f"get_submission_file_content failed: {_safe_error(resp)}")
         return resp.json()["content"]
 
-    def update_agent_file_content(self, challenge_id: int, attache_agent_id: int,
-                                  filename: str, content: str) -> dict:
+    def update_submission_file_content(self, challenge_id: int, submission_id: int,
+                                       filename: str, content: str) -> dict:
         """Write a text file by content (template render → upload).
 
-        Multipart PUT to the same upload endpoint as `upload_agent_file`,
+        Multipart PUT to the same upload endpoint as `upload_submission_file`,
         carrying the content as the `file` part. Sibling of
         `update_env_file_content` on the creator side. The backend validates
-        the resulting attachment folder and returns `{status, validation_message}`.
+        the resulting submission folder and returns `{status, validation_message}`.
         """
         resp = self._request("PUT",
             self._url(
-                f"/direct_attache_agents/competition/{challenge_id}/{attache_agent_id}/file"
+                f"/submissions/challenge/{challenge_id}/{submission_id}/file"
             ),
             headers=self._headers(),
             files={"file": (filename, io.BytesIO(content.encode("utf-8")))},
@@ -1165,19 +1187,20 @@ class MLArenaClient:
         )
         self._handle_response(resp)
         if resp.status_code not in (200, 201):
-            raise SubmissionError(f"update_agent_file_content failed: {_safe_error(resp)}")
+            raise SubmissionError(f"update_submission_file_content failed: {_safe_error(resp)}")
         return resp.json()
 
-    def delete_agent_file(self, challenge_id: int, attache_agent_id: int,
-                          filename: str) -> dict:
-        """Delete one file from an agent attachment.
+    def delete_submission_file(self, challenge_id: int, submission_id: int,
+                               filename: str) -> dict:
+        """Delete one file from a submission.
 
         The backend overloads the upload PUT with a `delete_file=<name>` form
-        field — same endpoint, different verb-encoding (`file.py:128`).
+        field — same endpoint, different verb-encoding (`file.py`,
+        `update_attachment_file`).
         """
         resp = self._request("PUT",
             self._url(
-                f"/direct_attache_agents/competition/{challenge_id}/{attache_agent_id}/file"
+                f"/submissions/challenge/{challenge_id}/{submission_id}/file"
             ),
             headers=self._headers(),
             data={"delete_file": filename},
@@ -1185,56 +1208,57 @@ class MLArenaClient:
         )
         self._handle_response(resp)
         if resp.status_code != 200:
-            raise SubmissionError(f"delete_agent_file failed: {_safe_error(resp)}")
+            raise SubmissionError(f"delete_submission_file failed: {_safe_error(resp)}")
         return resp.json()
 
     # ---- Status / logs ----
 
-    def agent_status(self, challenge_id: int, attache_agent_id: int) -> dict:
-        """Rich agent status: `queue_info`, `run_info`, `last_status_message`.
+    def submission_status(self, challenge_id: int, submission_id: int) -> dict:
+        """Rich submission status: `queue_info`, `run_info`, `last_status_message`.
 
-        Mirrors `GET …/competition/{cid}/{aid}/status` (`status.py:210`).
-        Use this over `agent_deploy_status` when you want to see queue
-        position or per-run errors.
+        Mirrors `GET /api/submissions/challenge/{cid}/{sid}/status`
+        (`status.py`). Use this over `submission_deploy_status` when you want
+        to see queue position or per-run errors.
         """
         resp = self._request("GET",
             self._url(
-                f"/direct_attache_agents/competition/{challenge_id}/{attache_agent_id}/status"
+                f"/submissions/challenge/{challenge_id}/{submission_id}/status"
             ),
             headers=self._headers(),
             timeout=30,
         )
         self._handle_response(resp)
         if resp.status_code != 200:
-            raise SubmissionError(f"agent_status failed: {_safe_error(resp)}")
+            raise SubmissionError(f"submission_status failed: {_safe_error(resp)}")
         return resp.json()
 
-    def agent_games(self, attache_agent_id: int) -> dict:
-        """Recent games for an attached agent with signed log URLs.
+    def submission_games(self, submission_id: int) -> dict:
+        """Recent games for a submission with signed log URLs.
 
-        Mirrors `GET /api/direct_attache_agents/agent/{aid}/games`
-        (`monitor.py:25`). Each game carries a `signed_url` to the GCS render
-        log (60-day retention) plus reward/outcome and per-game metrics.
+        Mirrors `GET /api/submissions/submission/{sid}/games`
+        (`monitor.py`, `get_submission_games`). Each game carries a
+        `signed_url` to the GCS render log (60-day retention) plus
+        reward/outcome and per-game metrics.
         """
         resp = self._request("GET",
-            self._url(f"/direct_attache_agents/agent/{attache_agent_id}/games"),
+            self._url(f"/submissions/submission/{submission_id}/games"),
             headers=self._headers(),
             timeout=30,
         )
         self._handle_response(resp)
         if resp.status_code != 200:
-            raise SubmissionError(f"agent_games failed: {_safe_error(resp)}")
+            raise SubmissionError(f"submission_games failed: {_safe_error(resp)}")
         return resp.json()
 
     def recent_replays(self, challenge_id: int, limit: int = 10) -> dict:
         """List recent completed replays for a challenge.
 
-        Mirrors `GET /api/competitions/{id}/recent-replays`. Each replay
+        Mirrors `GET /api/challenges/{id}/recent-replays`. Each replay
         carries `simulation_id`, `created_at`, `render_delay_second`,
         `signed_url` (GCS render file) and `participants`.
         """
         resp = self._request("GET",
-            self._url(f"/competitions/{challenge_id}/recent-replays"),
+            self._url(f"/challenges/{challenge_id}/recent-replays"),
             headers=self._headers(),
             params={"limit": limit},
             timeout=30,
@@ -1244,32 +1268,32 @@ class MLArenaClient:
             raise SubmissionError(f"recent_replays failed: {_safe_error(resp)}")
         return resp.json()
 
-    def tail_logs(self, challenge_id: int, attache_agent_id: int, *,
+    def tail_logs(self, challenge_id: int, submission_id: int, *,
                   follow: bool = False, poll_sec: float = 5.0,
                   timeout_sec: float | None = None) -> Iterator[str]:
-        """Yield human-readable status / log lines for an attached agent.
+        """Yield human-readable status / log lines for a submission.
 
-        Polls `agent_status` and emits one line per status transition,
+        Polls `submission_status` and emits one line per status transition,
         including queue position for `deploy_queue` and per-run rewards /
         errors for `deploy_run`. With `follow=False` (default), returns once
-        the agent reaches a terminal state (`active`, `deploy_failed`,
+        the submission reaches a terminal state (`active`, `deploy_failed`,
         `upload_failed`, `deleted`); with `follow=True`, keeps polling until
         the caller breaks out. `timeout_sec` caps total wait time.
 
         Note: this does NOT stream pod stdout — that's only available via
-        the per-game signed URLs from `agent_games()`. For raw logs of a
+        the per-game signed URLs from `submission_games()`. For raw logs of a
         completed run, do:
 
-            for game in client.agent_games(aid)["games"]:
+            for game in client.submission_games(sid)["games"]:
                 if game["signed_url"]:
-                    print(self._request("GET",game["signed_url"]).text)
+                    print(requests.get(game["signed_url"]).text)
         """
         terminal = {"active", "deploy_failed", "upload_failed", "deleted"}
         last_signature = None
         deadline = (time.monotonic() + timeout_sec) if timeout_sec else None
 
         while True:
-            status = self.agent_status(challenge_id, attache_agent_id)
+            status = self.submission_status(challenge_id, submission_id)
             sig = (status.get("status"), status.get("last_status_message"))
             if sig != last_signature:
                 yield f"[{status.get('status')}] {status.get('last_status_message') or ''}".rstrip()
@@ -1303,13 +1327,15 @@ class MLArenaClient:
     # ---- One-shot submit helper (still used by the notebook flow) ----
 
     def submit(self, challenge_id: int, agent=None, files=None,
-               agent_name: str | None = None,
+               submission_name: str | None = None,
                runtime_id: int | None = None,
                runtime: dict | None = None) -> dict:
-        """Convenience: create attachment → (pick runner) → upload files → deploy.
+        """Convenience: create submission → (pick runner) → upload files → deploy.
 
         Either pass `agent=<class>` (its source is uploaded as `agent.py`) or
         `files=[...]` (each path is uploaded under its basename).
+        `submission_name` defaults to the class name, or to the first file's
+        base name without extension.
 
         Optional runner selection (between create and deploy):
             runtime_id: numeric `DockerImageAgentRuntime.id`.
@@ -1318,22 +1344,24 @@ class MLArenaClient:
                         first runtime matching every supplied key is used.
         Pass at most one of `runtime_id` / `runtime`. With neither, the
         backend's challenge-default runtime is kept.
+
+        Returns `{"submission_id": <id>, "deploy": <deploy response>}`.
         """
         if (agent is None) == (files is None):
             raise SubmissionError("Provide exactly one of agent= or files=")
         if runtime_id is not None and runtime is not None:
             raise SubmissionError("Provide at most one of runtime_id= or runtime=")
 
-        attach = self.create_attached_agent(
-            challenge_id, agent_name or _default_agent_name(agent, files)
+        created = self.create_submission(
+            challenge_id, submission_name or _default_submission_name(agent, files)
         )
-        attache_agent_id = attach["attache_agent_id"]
+        submission_id = created["submission_id"]
 
         # Pin runner before deploy so the JobPod uses the right image.
         if runtime is not None:
             runtime_id = self.resolve_runtime(challenge_id, **runtime)["id"]
         if runtime_id is not None:
-            self.set_agent_runtime(attache_agent_id, runtime_id)
+            self.set_agent_runtime(submission_id, runtime_id)
 
         tmp_dir = None
         try:
@@ -1342,36 +1370,35 @@ class MLArenaClient:
                 agent_py = os.path.join(tmp_dir, "agent.py")
                 with open(agent_py, "w") as f:
                     f.write(inspect.getsource(agent))
-                last_upload = self.upload_agent_file(
-                    challenge_id, attache_agent_id, agent_py)
+                last_upload = self.upload_submission_file(
+                    challenge_id, submission_id, agent_py)
             else:
                 last_upload = None
                 for path in files:
-                    last_upload = self.upload_agent_file(
-                        challenge_id, attache_agent_id, path)
+                    last_upload = self.upload_submission_file(
+                        challenge_id, submission_id, path)
 
             # Fail fast on a rejected upload. The file route returns HTTP 200 even
-            # when validation rejects the *attachment* (status "upload_failed" with
+            # when validation rejects the *submission* (status "upload_failed" with
             # an actionable message, e.g. "Rename your file to 'agent.py'"), so
-            # upload_agent_file() cannot see it as an error. We check the final
+            # upload_submission_file() cannot see it as an error. We check the final
             # upload's status here — after every file is on disk, so a legitimately
             # transient mid-sequence failure (multi-file upload) isn't misreported —
-            # and surface that message instead of letting deploy_agent() fail with
-            # the generic "Cannot deploy agent in 'upload_failed' state".
+            # and surface that message instead of letting deploy_submission() fail
+            # with the generic "Cannot deploy submission in 'upload_failed' state".
             if last_upload and last_upload.get("status") == "upload_failed":
                 raise SubmissionError(
-                    f"Agent {attache_agent_id} did not pass upload validation: "
+                    f"Submission {submission_id} did not pass upload validation: "
                     f"{last_upload.get('validation_message') or 'files rejected'} "
-                    f"(fix the files and re-upload, or delete the attachment with "
-                    f"delete_agent({challenge_id}, {attache_agent_id}))."
+                    f"(fix the files and re-upload, or delete the submission with "
+                    f"delete_submission({challenge_id}, {submission_id}))."
                 )
 
-            deploy = self.deploy_agent(challenge_id, attache_agent_id)
-            self._last_agent_id = attache_agent_id
+            deploy = self.deploy_submission(challenge_id, submission_id)
+            self._last_submission_id = submission_id
             self._last_challenge = challenge_id
             return {
-                "attache_agent_id": attache_agent_id,
-                "agent_id": attache_agent_id,
+                "submission_id": submission_id,
                 "deploy": deploy,
             }
         finally:
@@ -1379,31 +1406,31 @@ class MLArenaClient:
                 import shutil
                 shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    def status(self, agent_id: int | None = None,
+    def status(self, submission_id: int | None = None,
                challenge_id: int | None = None) -> dict:
-        """Return the rich status of a previously-submitted agent.
+        """Return the rich status of a previously-made submission.
 
         Defaults to the last submission made through this client. Both
-        agent_id and challenge_id are required by the backend route, so
-        callers using a non-default agent_id must also pass challenge_id.
-        Returns the same payload as `agent_status` (queue_info, run_info,
+        submission_id and challenge_id are required by the backend route, so
+        callers using a non-default submission_id must also pass challenge_id.
+        Returns the same payload as `submission_status` (queue_info, run_info,
         last_status_message), which is more informative than
-        `agent_deploy_status`.
+        `submission_deploy_status`.
         """
-        agent_id = agent_id or self._last_agent_id
+        submission_id = submission_id or self._last_submission_id
         challenge_id = challenge_id or self._last_challenge
-        if agent_id is None or challenge_id is None:
+        if submission_id is None or challenge_id is None:
             raise SubmissionError(
-                "agent_id and challenge_id are required (no previous submission found)"
+                "submission_id and challenge_id are required (no previous submission found)"
             )
-        return self.agent_status(challenge_id, agent_id)
+        return self.submission_status(challenge_id, submission_id)
 
     # ---- Leaderboard (public read) ----
 
     def leaderboard(self, challenge_id: int | None = None, top: int | None = None):
         """Get the leaderboard for a challenge.
 
-        Mirrors `GET /api/leaderboard/competition/{id}` (`leaderboard.py`).
+        Mirrors `GET /api/leaderboard/challenge/{id}` (`leaderboard.py`).
 
         By default returns the full ranked list. Pass ``top=N`` to fetch only
         the top N rows (the backend then returns a sliced envelope; this method
@@ -1414,7 +1441,7 @@ class MLArenaClient:
             raise SubmissionError("No challenge specified and no previous submission found")
         params = {"limit": top} if top is not None else None
         resp = self._request("GET",
-            self._url(f"/leaderboard/competition/{challenge_id}"),
+            self._url(f"/leaderboard/challenge/{challenge_id}"),
             params=params,
             timeout=30,
         )
@@ -1587,8 +1614,8 @@ class MLArenaClient:
         identity when it isn't set yet (they never overwrite values already on
         the profile — set those via the Profile page / profile update). The
         backend requires both to be present before enrolling. `project_url` is
-        stored on the enrollment. Returns `{message, competition_id,
-        competition_ids}`.
+        stored on the enrollment. Returns `{message, challenge_ids,
+        course_slug}`.
         """
         if join_code is None:
             raise MLArenaError("enroll_in_course requires a join code")
@@ -1617,7 +1644,7 @@ class MLArenaClient:
         if show_all:
             params["show_all"] = "true"
         if challenge_id is not None:
-            params["competition_id"] = challenge_id
+            params["challenge_id"] = challenge_id
         return _to_dataframe(self._course_call(
             "GET", "/academic_courses/", params=params or None,
             error_label="list_courses",
@@ -1837,7 +1864,7 @@ class MLArenaClient:
                            pass_threshold: float | None = None) -> dict:
         """Attach a challenge to a module.
 
-        Mirrors `POST /api/teacher/modules/{id}/competitions`. `position`
+        Mirrors `POST /api/teacher/modules/{id}/challenges`. `position`
         defaults to the end of the module's challenge list.
 
         `pass_threshold` is the course's validation bar: a student validates the
@@ -1845,7 +1872,7 @@ class MLArenaClient:
         leaderboard ranks descending, so higher is always better). Omit it for
         no pass/fail — do not pass 0, which would validate every entrant.
         """
-        body: dict = {"competition_id": challenge_id}
+        body: dict = {"challenge_id": challenge_id}
         if label is not None:
             body["label"] = label
         if position is not None:
@@ -1853,7 +1880,7 @@ class MLArenaClient:
         if pass_threshold is not None:
             body["pass_threshold"] = pass_threshold
         return self._course_call(
-            "POST", f"/teacher/modules/{module_id}/competitions", json_body=body,
+            "POST", f"/teacher/modules/{module_id}/challenges", json_body=body,
             ok=(200, 201), error_label="attach_challenge",
         )
 
@@ -1861,7 +1888,7 @@ class MLArenaClient:
                                 **fields) -> dict:
         """Update an existing attachment's `label` / `pass_threshold`.
 
-        Mirrors `PUT /api/teacher/modules/{id}/competitions/{competition_id}`.
+        Mirrors `PUT /api/teacher/modules/{id}/challenges/{challenge_id}`.
         Partial: only the keys you pass are written, and an explicit ``None``
         clears that field — so ``update_challenge_link(m, c,
         pass_threshold=None)`` removes the bar, while omitting the key leaves
@@ -1869,18 +1896,18 @@ class MLArenaClient:
         """
         return self._course_call(
             "PUT",
-            f"/teacher/modules/{module_id}/competitions/{challenge_id}",
+            f"/teacher/modules/{module_id}/challenges/{challenge_id}",
             json_body=fields, error_label="update_challenge_link",
         )
 
     def detach_challenge(self, module_id: int, challenge_id: int) -> dict:
         """Detach a challenge from a module.
 
-        Mirrors `DELETE /api/teacher/modules/{id}/competitions/{competition_id}`.
+        Mirrors `DELETE /api/teacher/modules/{id}/challenges/{challenge_id}`.
         """
         return self._course_call(
             "DELETE",
-            f"/teacher/modules/{module_id}/competitions/{challenge_id}",
+            f"/teacher/modules/{module_id}/challenges/{challenge_id}",
             error_label="detach_challenge",
         )
 
@@ -1888,12 +1915,12 @@ class MLArenaClient:
                                     ordered_challenge_ids: list[int]) -> list:
         """Reorder a module's attached challenges.
 
-        Mirrors `PUT /api/teacher/modules/{id}/competitions/reorder`.
+        Mirrors `PUT /api/teacher/modules/{id}/challenges/reorder`.
         `ordered_challenge_ids` must be exactly the module's attached
         challenge ids in the desired order.
         """
         return self._course_call(
-            "PUT", f"/teacher/modules/{module_id}/competitions/reorder",
+            "PUT", f"/teacher/modules/{module_id}/challenges/reorder",
             json_body={"ordered_ids": ordered_challenge_ids},
             error_label="reorder_module_challenges",
         )
@@ -2170,8 +2197,8 @@ class MLArenaClient:
                 visibility: public   # optional (default private) — teacher reuse
                 is_published: true   # optional (default true) — false = hidden from students
                 module_id: 7         # optional — link this existing module instead of creating
-                competitions:        # optional
-                  - competition_id: 42
+                challenges:          # optional (`competitions:` also accepted)
+                  - challenge_id: 42        # (`competition_id:` also accepted)
                     label: "CartPole"
                     pass_threshold: 195.0   # optional — score that validates it
                 lessons:
@@ -2188,6 +2215,12 @@ class MLArenaClient:
         an existing course's meta, and a module's `module_id` to link an existing
         module rather than create a new one. Returns a summary
         `{course_id, slug, join_code, modules: [...]}`.
+
+        Manifests written before SDK 2.0 name a module's challenge list
+        `competitions:` and each entry's id `competition_id:`. Both spellings
+        are still read, permanently; `export_course_to_dir` writes
+        `challenges:` / `challenge_id:`. A module or entry that carries both
+        spellings is rejected.
         """
         base = os.path.abspath(path)
         manifest = _load_course_manifest(base)
@@ -2196,6 +2229,12 @@ class MLArenaClient:
 
         existing_course_id = course_spec.pop("course_id", None)
         cover = course_spec.pop("cover", None)
+        # Resolve every module's challenge links before the first request, so
+        # a malformed list fails before anything is created.
+        challenge_links = [
+            [(_manifest_challenge_id(link), link) for link in _manifest_challenge_links(m)]
+            for m in modules_spec
+        ]
 
         if existing_course_id is not None:
             self.update_course(existing_course_id, **_course_meta_fields(course_spec))
@@ -2234,11 +2273,11 @@ class MLArenaClient:
                     lesson_ids.append(
                         self._author_lesson(base, module_id, lesson_spec)["id"]
                     )
-                for comp in (m.get("competitions") or []):
+                for challenge_id, link in challenge_links[position]:
                     self.attach_challenge(
-                        module_id, comp["competition_id"],
-                        label=comp.get("label"), position=comp.get("position"),
-                        pass_threshold=comp.get("pass_threshold"),
+                        module_id, challenge_id,
+                        label=link.get("label"), position=link.get("position"),
+                        pass_threshold=link.get("pass_threshold"),
                     )
                 module_summaries.append(
                     {"module_id": module_id, "title": m["title"],
@@ -2331,13 +2370,13 @@ class MLArenaClient:
                 "summary": module.get("summary"),
                 "icon": module.get("icon"),
                 "is_published": module.get("is_published", True),
-                "competitions": [
+                "challenges": [
                     {
-                        "competition_id": c["competition_id"],
+                        "challenge_id": c["challenge_id"],
                         "label": c.get("label"),
                         "pass_threshold": c.get("pass_threshold"),
                     }
-                    for c in module.get("competitions", [])
+                    for c in module.get("challenges", [])
                 ],
                 "lessons": lessons_out,
             })
@@ -2421,6 +2460,37 @@ def _load_course_manifest(base: str) -> dict:
     )
 
 
+# course.yaml input alias: manifests on teachers' disks predate the rename and
+# say `competitions:` / `competition_id:`. Those keys are read permanently;
+# export writes only the new ones. Both spellings in one block is ambiguous, so
+# it fails loud instead of picking one.
+
+def _manifest_challenge_links(module_spec: dict) -> list:
+    """A manifest module's challenge list, under `challenges:` or the legacy
+    `competitions:` key."""
+    if "challenges" in module_spec and "competitions" in module_spec:
+        raise MLArenaError(
+            f"Module {module_spec.get('title')!r} has both 'challenges' and "
+            f"'competitions'; keep only 'challenges'"
+        )
+    if "competitions" in module_spec:
+        return module_spec["competitions"] or []
+    return module_spec.get("challenges") or []
+
+
+def _manifest_challenge_id(link_spec: dict) -> int:
+    """A manifest challenge entry's id, under `challenge_id:` or the legacy
+    `competition_id:` key. An entry with neither raises KeyError."""
+    if "challenge_id" in link_spec and "competition_id" in link_spec:
+        raise MLArenaError(
+            f"Challenge entry {link_spec!r} has both 'challenge_id' and "
+            f"'competition_id'; keep only 'challenge_id'"
+        )
+    if "competition_id" in link_spec:
+        return link_spec["competition_id"]
+    return link_spec["challenge_id"]
+
+
 def _dump_course_manifest(base: str, manifest: dict) -> None:
     """Write a manifest as ``course.yaml`` (PyYAML if available) else ``course.json``."""
     try:
@@ -2433,12 +2503,12 @@ def _dump_course_manifest(base: str, manifest: dict) -> None:
             json.dump(manifest, fh, indent=2, ensure_ascii=False)
 
 
-def _default_agent_name(agent, files) -> str:
+def _default_submission_name(agent, files) -> str:
     if agent is not None:
-        return getattr(agent, "__name__", "agent")
+        return getattr(agent, "__name__", "submission")
     if files:
         return os.path.splitext(os.path.basename(files[0]))[0]
-    return "agent"
+    return "submission"
 
 
 def _safe_error(resp: requests.Response, fallback: str = "request failed") -> str:
@@ -2463,17 +2533,24 @@ def _to_dataframe(data):
         return rows
 
 
-# --- Backwards compatibility for the competition -> challenge rename ---------
-# The vocabulary changed in 1.0.0, but existing notebooks and scripts are not
-# expected to change with it: every old method name still resolves, and every
-# method that took `competition_id=` still accepts it. Both paths emit a
-# DeprecationWarning and forward to the new spelling, so nothing breaks today
-# and the warning tells people what to migrate to.
+# --- Backwards compatibility for the Python names ----------------------------
+# 1.0.0 renamed "competition" to "challenge"; 2.0.0 renamed the participant's
+# entry ("attached agent") to "submission". Existing notebooks and scripts are
+# not expected to change with either: every old method name still resolves,
+# and every old keyword argument is still accepted. Both paths emit a
+# DeprecationWarning and forward to the new spelling. This covers the Python
+# API only — the client speaks only the current REST routes and payload keys,
+# so the values these methods return carry the new keys (`submission_id`, ...).
 
 _LEGACY_KWARGS = {
     "competition_id": "challenge_id",
     "copy_from_competition_id": "copy_from_challenge_id",
     "ordered_competition_ids": "ordered_challenge_ids",
+    "agent_name": "submission_name",
+    "attache_agent_id": "submission_id",
+    "agent_id": "submission_id",
+    "copy_from_agent_id": "copy_from_submission_id",
+    "max_active_agents_per_participant": "max_active_submissions_per_participant",
 }
 
 _RENAMED_METHODS = {
@@ -2491,6 +2568,17 @@ _RENAMED_METHODS = {
     "update_competition_link": "update_challenge_link",
     "detach_competition": "detach_challenge",
     "reorder_module_competitions": "reorder_module_challenges",
+    "create_attached_agent": "create_submission",
+    "upload_agent_file": "upload_submission_file",
+    "deploy_agent": "deploy_submission",
+    "agent_deploy_status": "submission_deploy_status",
+    "delete_agent": "delete_submission",
+    "list_agent_files": "list_submission_files",
+    "get_agent_file_content": "get_submission_file_content",
+    "update_agent_file_content": "update_submission_file_content",
+    "delete_agent_file": "delete_submission_file",
+    "agent_status": "submission_status",
+    "agent_games": "submission_games",
 }
 
 

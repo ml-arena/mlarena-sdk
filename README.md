@@ -1,6 +1,69 @@
 # mlarena
 
-Python SDK for [ML Arena](https://ml-arena.com) — submit agents, manage challenges, manage courses, and read leaderboards from any notebook or IDE.
+Python SDK for [ML Arena](https://ml-arena.com) — make submissions, manage challenges, manage courses, and read leaderboards from any notebook or IDE.
+
+## 2.0 — requires the renamed backend
+
+2.0.0 speaks only the renamed REST API: `/api/challenges`, `/api/challenge_tags`,
+`/api/creator_challenge/challenge/…`, `/api/submissions/…`,
+`/api/leaderboard/challenge/…`, `/api/teacher/modules/{id}/challenges`, with
+`challenge_*` and `submission_*` payload keys. The server switched in one
+release, with no compatibility routes:
+
+- **SDK 2.x needs the renamed backend.** An older server answers every
+  renamed route with HTTP 404.
+- **SDK 1.x gets HTTP 404 from every renamed route of the new backend.**
+  Upgrade with `pip install -U mlarena-sdk`.
+
+The thing a participant hands to a challenge — formerly an "attached agent" —
+is now a **submission**. The methods follow:
+
+| 1.x | 2.0 |
+|---|---|
+| `create_attached_agent(challenge_id, agent_name, copy_from_agent_id=None)` | `create_submission(challenge_id, submission_name, copy_from_submission_id=None)` |
+| `upload_agent_file` | `upload_submission_file` |
+| `update_agent_file_content` | `update_submission_file_content` |
+| `list_agent_files` | `list_submission_files` |
+| `get_agent_file_content` | `get_submission_file_content` |
+| `delete_agent_file` | `delete_submission_file` |
+| `deploy_agent` | `deploy_submission` |
+| `agent_deploy_status` | `submission_deploy_status` |
+| `agent_status` | `submission_status` |
+| `agent_games` | `submission_games` |
+| `delete_agent` | `delete_submission` |
+
+Keyword arguments: `attache_agent_id=` / `agent_id=` → `submission_id=`,
+`agent_name=` → `submission_name=`, `copy_from_agent_id=` →
+`copy_from_submission_id=`, and `update_settings(max_active_agents_per_participant=)`
+→ `max_active_submissions_per_participant=`.
+
+**Old Python names keep working.** As in 1.0, every old method name and
+keyword argument still resolves, emits a `DeprecationWarning`, and forwards to
+the new one.
+
+**Returned data uses the new keys, with no alias.** These dicts come straight
+from the server, so code that reads them must change:
+
+- `create_submission()` returns `submission_id` (was `attache_agent_id`).
+- `submit()` returns `{"submission_id", "deploy"}`. The `attache_agent_id` and
+  `agent_id` keys are gone: `sub["attache_agent_id"]` becomes
+  `sub["submission_id"]`.
+- `leaderboard()` columns: `SubmissionName`, `IsMySubmission`,
+  `submissionId` (were `AgentName`, `IsMyAgent`, `agentAttachId`).
+- Course payloads: `enroll_in_course()` returns `challenge_ids`, a course
+  landing module lists `challenges: [{"challenge_id", …}]`, and
+  `my_progress()` reports `challenges` (all were `competition…`).
+  `list_courses(challenge_id=…)` filters by challenge.
+
+**`course.yaml` manifests:** `export_course_to_dir` now writes
+`challenges:` / `challenge_id:` under each module. `author_course_from_dir`
+still reads the older `competitions:` / `competition_id:` keys, so existing
+course directories keep working.
+
+**Unchanged:** `agent_runtime(submission_id)`, `set_agent_runtime(submission_id, runtime_id)`,
+`update_agent_template`, `submit(challenge_id, agent=MyAgent)` and the uploaded
+`agent.py`. These name the agent that runs in a code challenge, not the
+submission.
 
 ## 1.0.0 — "competition" is now "challenge"
 
@@ -37,8 +100,8 @@ Renamed: `competitions`→`challenges`, `competition`→`challenge`,
 `CompetitionNotFoundError` is now `ChallengeNotFoundError` (the old name is an
 alias for the same class, so `except CompetitionNotFoundError` still catches it).
 
-The REST routes are unchanged — the server still speaks `/api/competitions`.
-Only the client vocabulary moved.
+In 1.0 only the client vocabulary moved; the server still spoke
+`/api/competitions`. 2.0 follows the server's route rename (see above).
 
 ## Install
 
@@ -58,7 +121,7 @@ client = mlarena.connect(api_key="mlk_user_a1b2c3d4_<32-hex-secret>")
 # List challenges (public, no auth)
 client.challenges()
 
-# Submit an agent class — creates an attachment, uploads, and deploys.
+# Submit an agent class — creates a submission, uploads, and deploys.
 class MyAgent:
     def predict(self, observation):
         return 0
@@ -79,7 +142,7 @@ client.leaderboard(42)
 
 The token's *scope* segment dictates which routes you can call:
 
-- `mlk_user_…` — submit agents, check status, manage your own attachments, enroll in and read courses, track your own lesson progress.
+- `mlk_user_…` — make submissions, check status, manage your own submissions, enroll in and read courses, track your own lesson progress.
 - `mlk_creator_…` — create / update challenges you own.
 - `mlk_teacher_…` — create academic courses and author course content (modules, lessons, course composition).
 
@@ -91,28 +154,28 @@ A `user`-scope token cannot call a `creator`-required route (and vice versa). Mi
 
 Create a client. `api_key` must be the full `mlk_<scope>_<lookup>_<secret>` token.
 
-### Agents (user scope)
+### Submissions (user scope)
 
-- `client.submit(challenge_id, agent=None, files=None, agent_name=None, runtime_id=None, runtime=None)` — one-shot create + (pick runner) + upload + deploy.
-- `client.create_attached_agent(challenge_id, agent_name, copy_from_agent_id=None)`
-- `client.upload_agent_file(challenge_id, attache_agent_id, file_path)` — multipart upload from disk.
-- `client.update_agent_file_content(challenge_id, attache_agent_id, filename, content)` — upload from a string (template render → upload).
-- `client.list_agent_files(challenge_id, attache_agent_id)` — list files with their content / binary marker.
-- `client.get_agent_file_content(challenge_id, attache_agent_id, filename)` — fetch one file's text.
-- `client.delete_agent_file(challenge_id, attache_agent_id, filename)`
-- `client.deploy_agent(challenge_id, attache_agent_id)`
-- `client.delete_agent(challenge_id, attache_agent_id)`
-- `client.agent_status(challenge_id, attache_agent_id)` — rich status (queue, runs, errors).
-- `client.agent_deploy_status(challenge_id, attache_agent_id)` — deploy quotas + last deploy.
-- `client.agent_games(attache_agent_id)` — recent games with signed log URLs (60-day GCS retention).
-- `client.tail_logs(challenge_id, attache_agent_id, follow=False, poll_sec=5.0)` — generator of status / run lines.
-- `client.status(agent_id=None, challenge_id=None)` — defaults to the last submission.
+- `client.submit(challenge_id, agent=None, files=None, submission_name=None, runtime_id=None, runtime=None)` — one-shot create + (pick runner) + upload + deploy. Returns `{"submission_id", "deploy"}`.
+- `client.create_submission(challenge_id, submission_name, copy_from_submission_id=None)`
+- `client.upload_submission_file(challenge_id, submission_id, file_path)` — multipart upload from disk.
+- `client.update_submission_file_content(challenge_id, submission_id, filename, content)` — upload from a string (template render → upload).
+- `client.list_submission_files(challenge_id, submission_id)` — list files with their content / binary marker.
+- `client.get_submission_file_content(challenge_id, submission_id, filename)` — fetch one file's text.
+- `client.delete_submission_file(challenge_id, submission_id, filename)`
+- `client.deploy_submission(challenge_id, submission_id)`
+- `client.delete_submission(challenge_id, submission_id)`
+- `client.submission_status(challenge_id, submission_id)` — rich status (queue, runs, errors).
+- `client.submission_deploy_status(challenge_id, submission_id)` — deploy quotas + last deploy.
+- `client.submission_games(submission_id)` — recent games with signed log URLs (60-day GCS retention).
+- `client.tail_logs(challenge_id, submission_id, follow=False, poll_sec=5.0)` — generator of status / run lines.
+- `client.status(submission_id=None, challenge_id=None)` — defaults to the last submission.
 
 ### Runners (DockerImageAgentRuntime, user scope)
 
 - `client.runtime_options(challenge_id)` — list runtimes compatible with the challenge.
-- `client.agent_runtime(attache_agent_id)` — read the runtime currently pinned to an agent.
-- `client.set_agent_runtime(attache_agent_id, runtime_id)` — pin a runtime by id.
+- `client.agent_runtime(submission_id)` — read the agent runtime currently pinned to a submission.
+- `client.set_agent_runtime(submission_id, runtime_id)` — pin a runtime by id.
 - `client.resolve_runtime(challenge_id, language=None, framework=None, framework_version=None)` — resolve a (lang, framework, version) spec to one runtime row.
 
 ## Full participant workflow
@@ -128,21 +191,21 @@ cid = 42  # challenge id
 runtimes = c.runtime_options(cid)
 py_gym = c.resolve_runtime(cid, language="python", framework="gymnasium")
 
-# 2. Create the agent + pin runner + upload files + deploy in one call
+# 2. Create the submission + pin runner + upload files + deploy in one call
 sub = c.submit(cid, files=["agent.py", "model.pkl"], runtime_id=py_gym["id"])
-aid = sub["attache_agent_id"]
+sid = sub["submission_id"]
 
 # 3. Inspect / edit a file in place after the initial upload
-src = c.get_agent_file_content(cid, aid, "agent.py")
-c.update_agent_file_content(cid, aid, "agent.py", src.replace("epsilon=0.1", "epsilon=0.05"))
-c.deploy_agent(cid, aid)  # redeploy after edit
+src = c.get_submission_file_content(cid, sid, "agent.py")
+c.update_submission_file_content(cid, sid, "agent.py", src.replace("epsilon=0.1", "epsilon=0.05"))
+c.deploy_submission(cid, sid)  # redeploy after edit
 
 # 4. Watch status / run progress until terminal
-for line in c.tail_logs(cid, aid):
+for line in c.tail_logs(cid, sid):
     print(line)
 
 # 5. Pull stdout from completed games via signed URLs (60d retention)
-for game in c.agent_games(aid)["games"]:
+for game in c.submission_games(sid)["games"]:
     if game["signed_url"]:
         print(requests.get(game["signed_url"]).text)
 
@@ -221,7 +284,7 @@ print(student.my_progress(landing["id"]))                # content % + next less
 ### Course authoring (teacher scope)
 
 - `client.create_module(title, slug=None, summary=None, icon=None, visibility="private")`, `list_modules(library=None)`, `get_module`, `update_module(id, **fields)`, `delete_module(id, force=False)`, `fork_module(id)`.
-- `client.attach_challenge(module_id, challenge_id, label=None, position=None)`, `detach_challenge`, `reorder_module_challenges`.
+- `client.attach_challenge(module_id, challenge_id, label=None, position=None, pass_threshold=None)`, `update_challenge_link`, `detach_challenge`, `reorder_module_challenges`.
 - `client.create_lesson(module_id, title, kind="lesson", slug=None, parent_lesson_id=None, body_md="", gated=False)`, `get_lesson`, `update_lesson(id, **fields)`, `delete_lesson`, `reorder_lessons`.
 - `client.upload_lesson_media(lesson_id, file_path)`, `delete_lesson_media`, `preview_lesson(lesson_id, body_md=None)` — validates `mlarena:` directives (fails loud on unknown).
 - `client.update_course(id, **fields)`, `set_course_cover`, `list_course_modules`, `link_module(course_id, module_id, position=None)`, `unlink_module`, `reorder_modules`, `course_progress(course_id)` — teacher follow dashboard.
