@@ -1001,12 +1001,14 @@ class MLArenaClient:
                                file_path: str) -> dict:
         """Upload (or overwrite) a single file in an existing submission.
 
-        Returns the server response ``{"message", "status", "validation_message"}``.
+        Returns the server response: ``message``, ``validation_message`` and the
+        status block (see ``submission_status()``).
         Note: the file route returns HTTP 200 even when validation *rejects* the
         submission — the file is saved but the whole submission is re-validated and
         may come back ``status == "upload_failed"`` with an actionable
         ``validation_message``. A 2xx here is not proof the submission is deployable;
-        inspect ``status`` (``submit()`` does this for you before deploying)."""
+        read ``is_deployable`` (``submit()`` checks it once, on
+        ``submission_status()``, after every pre-deploy step and before deploying)."""
         if not os.path.isfile(file_path):
             raise SubmissionError(f"File not found: {file_path}")
         with open(file_path, "rb") as fh:
@@ -1038,7 +1040,11 @@ class MLArenaClient:
         return resp.json()
 
     def submission_deploy_status(self, challenge_id: int, submission_id: int) -> dict:
-        """Read the deploy quotas and last deploy of a submission."""
+        """Read the deploy quotas and last deploy of a submission.
+
+        `latestDeploy` carries that attempt's own outcome: `status`
+        (`queued` | `running` | `succeeded` | `failed` | `cancelled`),
+        `finished_at_ts` and `failure_message`."""
         resp = self._request("GET",
             self._url(
                 f"/submissions/challenge/{challenge_id}/{submission_id}/deploy"
@@ -1231,11 +1237,25 @@ class MLArenaClient:
     # ---- Status / logs ----
 
     def submission_status(self, challenge_id: int, submission_id: int) -> dict:
-        """Rich submission status: `queue_info`, `run_info`, `last_status_message`.
+        """Rich submission status: the status block, `queue_info`, `run_info`.
 
         Mirrors `GET /api/submissions/challenge/{cid}/{sid}/status`
         (`status.py`). Use this over `submission_deploy_status` when you want
         to see queue position or per-run errors.
+
+        Returns `submission_name`, `user_id`, `is_public`, `is_owner`,
+        `queue_info`, `run_info`, and the status block every submission payload
+        carries:
+
+        - `status` — one of `created`, `uploading`, `upload_failed`,
+          `upload_validated`, `deploy_queue`, `deploy_run`, `deploy_failed`,
+          `active`, `deleted`.
+        - `phase` — `upload` | `deployment` | `active` | `terminal`.
+        - `last_status_message` — the row's latest message, or None.
+        - `status_update_ts` — ISO-8601 UTC, or None.
+        - `is_uploadable` / `is_deployable` / `is_settled` — the server's own
+          answer to "may I upload / deploy / stop polling". Read these instead
+          of comparing `status` against a set of your own.
         """
         resp = self._request("GET",
             self._url(
@@ -1293,9 +1313,9 @@ class MLArenaClient:
         Polls `submission_status` and emits one line per status transition,
         including queue position for `deploy_queue` and per-run rewards /
         errors for `deploy_run`. With `follow=False` (default), returns once
-        the submission reaches a terminal state (`active`, `deploy_failed`,
-        `upload_failed`, `deleted`); with `follow=True`, keeps polling until
-        the caller breaks out. `timeout_sec` caps total wait time.
+        the server reports the submission as settled (`is_settled`: nothing
+        in flight); with `follow=True`, keeps polling until the caller breaks
+        out. `timeout_sec` caps total wait time.
 
         Note: this does NOT stream pod stdout — that's only available via
         the per-game signed URLs from `submission_games()`. For raw logs of a
@@ -1305,7 +1325,6 @@ class MLArenaClient:
                 if game["signed_url"]:
                     print(requests.get(game["signed_url"]).text)
         """
-        terminal = {"active", "deploy_failed", "upload_failed", "deleted"}
         last_signature = None
         deadline = (time.monotonic() + timeout_sec) if timeout_sec else None
 
@@ -1332,7 +1351,9 @@ class MLArenaClient:
                     if r.get("status") == "error":
                         yield f"    error[{r.get('error_type')}]: {r.get('error_message')}"
 
-            if status.get("status") in terminal:
+            # The server decides what "done" means; direct key access so a
+            # backend that does not send the block fails loudly here.
+            if status["is_settled"]:
                 if not follow:
                     return
 
@@ -1362,6 +1383,11 @@ class MLArenaClient:
         Pass at most one of `runtime_id` / `runtime`. With neither, the
         backend's challenge-default runtime is kept.
 
+        After the uploads, the submission's `is_deployable` is checked (one
+        `submission_status` call) and a `SubmissionError` carrying the
+        server's `last_status_message` is raised rather than deploying files
+        the backend already rejected.
+
         Returns `{"submission_id": <id>, "deploy": <deploy response>}`.
         """
         if (agent is None) == (files is None):
@@ -1387,26 +1413,25 @@ class MLArenaClient:
                 agent_py = os.path.join(tmp_dir, "agent.py")
                 with open(agent_py, "w") as f:
                     f.write(inspect.getsource(agent))
-                last_upload = self.upload_submission_file(
+                self.upload_submission_file(
                     challenge_id, submission_id, agent_py)
             else:
-                last_upload = None
                 for path in files:
-                    last_upload = self.upload_submission_file(
+                    self.upload_submission_file(
                         challenge_id, submission_id, path)
 
             # Fail fast on a rejected upload. The file route returns HTTP 200 even
-            # when validation rejects the *submission* (status "upload_failed" with
-            # an actionable message, e.g. "Rename your file to 'agent.py'"), so
-            # upload_submission_file() cannot see it as an error. We check the final
-            # upload's status here — after every file is on disk, so a legitimately
-            # transient mid-sequence failure (multi-file upload) isn't misreported —
-            # and surface that message instead of letting deploy_submission() fail
-            # with the generic "Cannot deploy submission in 'upload_failed' state".
-            if last_upload and last_upload.get("status") == "upload_failed":
+            # when validation rejects the *submission* (an actionable message, e.g.
+            # "Rename your file to 'agent.py'"), so upload_submission_file() cannot
+            # see it as an error. Ask the status route whether the submission may
+            # deploy — that is the same fact the Deploy button reads, and it is
+            # asked after every file is on disk, so a legitimately transient
+            # mid-sequence failure (multi-file upload) isn't misreported.
+            status = self.submission_status(challenge_id, submission_id)
+            if not status["is_deployable"]:
                 raise SubmissionError(
                     f"Submission {submission_id} did not pass upload validation: "
-                    f"{last_upload.get('validation_message') or 'files rejected'} "
+                    f"{status['last_status_message'] or 'files rejected'} "
                     f"(fix the files and re-upload, or delete the submission with "
                     f"delete_submission({challenge_id}, {submission_id}))."
                 )
@@ -1430,8 +1455,8 @@ class MLArenaClient:
         Defaults to the last submission made through this client. Both
         submission_id and challenge_id are required by the backend route, so
         callers using a non-default submission_id must also pass challenge_id.
-        Returns the same payload as `submission_status` (queue_info, run_info,
-        last_status_message), which is more informative than
+        Returns the same payload as `submission_status` (the status block,
+        queue_info, run_info), which is more informative than
         `submission_deploy_status`.
         """
         submission_id = submission_id or self._last_submission_id

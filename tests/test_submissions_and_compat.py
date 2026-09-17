@@ -158,9 +158,10 @@ def test_runtime_routes_keep_agent_runtime_segment():
     assert rec.last["json"] == {"docker_image_agent_runtime_id": 3}
 
 
-def test_tail_logs_polls_submission_status():
+def test_tail_logs_stops_on_is_settled():
     c, rec = make_client(lambda *_: (200, {"status": "active",
-                                           "last_status_message": "done"}))
+                                           "last_status_message": "done",
+                                           "is_settled": True}))
     lines = list(c.tail_logs(4, 11))
     assert lines == ["[active] done"]
     assert rec.last["path"] == "/submissions/challenge/4/11/status"
@@ -171,14 +172,26 @@ def test_tail_logs_polls_submission_status():
 # --------------------------------------------------------------------------- #
 
 
-def _submit_router(upload_status="upload_validated"):
+def _submit_router(is_deployable=True):
+    """Fake backend for submit(): the status route answers with the block."""
     def router(method, path, kwargs):
         if method == "POST" and path == "/submissions/challenge/4":
             return (201, {"submission_id": 11, "status": "created"})
         if path.startswith("/submissions/runtime_options/"):
             return (200, [{"id": 7, "language": "python", "framework": "torch"}])
         if path.endswith("/file"):
-            return (200, {"status": upload_status, "validation_message": "bad name"})
+            return (200, {"message": "File operation successful",
+                          "validation_message": "bad name"})
+        if path.endswith("/status"):
+            return (200, {
+                "status": "upload_validated" if is_deployable else "upload_failed",
+                "phase": "upload",
+                "last_status_message": "bad name",
+                "status_update_ts": None,
+                "is_uploadable": True,
+                "is_deployable": is_deployable,
+                "is_settled": True,
+            })
         if path.endswith("/deploy"):
             return (200, {"message": "queued"})
         return (200, {"status": "deploy_queue"})
@@ -201,6 +214,7 @@ def test_submit_with_agent_class_returns_submission_id_and_deploy():
         ("GET", "/submissions/runtime_options/4"),
         ("PUT", "/submissions/agent_runtime/11"),
         ("PUT", "/submissions/challenge/4/11/file"),
+        ("GET", "/submissions/challenge/4/11/status"),
         ("PUT", "/submissions/challenge/4/11/deploy"),
     ], seq
     assert rec.calls[0]["json"] == {"submission_name": "MyAgent"}
@@ -218,12 +232,13 @@ def test_submit_with_files_uses_submission_name():
         out = c.submit(4, files=[f1])
         assert rec.calls[0]["json"] == {"submission_name": "submission"}
         c.submit(4, files=[f1], submission_name="named")
-        assert rec.calls[-3]["json"] == {"submission_name": "named"}
+        # create, upload, status, deploy — the create body is four calls back.
+        assert rec.calls[-4]["json"] == {"submission_name": "named"}
     assert set(out) == {"submission_id", "deploy"}
 
 
-def test_submit_upload_failed_raises_before_deploy():
-    c, rec = make_client(_submit_router(upload_status="upload_failed"))
+def test_submit_not_deployable_raises_before_deploy():
+    c, rec = make_client(_submit_router(is_deployable=False))
     try:
         c.submit(4, agent=MyAgent)
         raise AssertionError("expected SubmissionError")

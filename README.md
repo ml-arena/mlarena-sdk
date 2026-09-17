@@ -2,6 +2,27 @@
 
 Python SDK for [ML Arena](https://ml-arena.com) — make submissions, manage challenges, manage courses, and read leaderboards from any notebook or IDE.
 
+## Unreleased — one status shape on the wire
+
+Every reply that describes a submission's status now carries the same flat
+block, and the SDK reads it instead of re-deriving the lifecycle:
+
+- **New keys on every submission reply:** `phase`, `status_update_ts`,
+  `is_uploadable`, `is_deployable`, `is_settled`, next to `status` and
+  `last_status_message`. See *Submission status block* below.
+- **`submission_status()` renames `name` to `submission_name`.**
+- **The `deploying` status is gone.** A deploy goes from `upload_validated`
+  (or `deploy_failed`) straight to `deploy_queue` in one transaction. Code
+  that tested for `"deploying"` can drop the branch.
+- **`tail_logs()` stops on `is_settled`** rather than on its own list of
+  terminal statuses, so a new in-flight status never makes it hang.
+- **`submit()` checks `is_deployable`** (one extra `submission_status` call
+  after the uploads) before deploying, and raises `SubmissionError` with the
+  server's `last_status_message` when the files were rejected.
+
+No Python name changed, so no deprecation alias applies: these are the
+server's response keys.
+
 ## 2.0 — requires the renamed backend
 
 2.0.0 speaks only the renamed REST API: `/api/challenges`, `/api/challenge_tags`,
@@ -165,11 +186,32 @@ Create a client. `api_key` must be the full `mlk_<scope>_<lookup>_<secret>` toke
 - `client.delete_submission_file(challenge_id, submission_id, filename)`
 - `client.deploy_submission(challenge_id, submission_id)`
 - `client.delete_submission(challenge_id, submission_id)`
-- `client.submission_status(challenge_id, submission_id)` — rich status (queue, runs, errors).
+- `client.submission_status(challenge_id, submission_id)` — rich status: the status block (see below) plus `submission_name`, `queue_info`, `run_info`.
 - `client.submission_deploy_status(challenge_id, submission_id)` — deploy quotas + last deploy.
 - `client.submission_games(submission_id)` — recent games with signed log URLs (60-day GCS retention).
-- `client.tail_logs(challenge_id, submission_id, follow=False, poll_sec=5.0)` — generator of status / run lines.
+- `client.tail_logs(challenge_id, submission_id, follow=False, poll_sec=5.0)` — generator of status / run lines; stops on `is_settled`.
 - `client.status(submission_id=None, challenge_id=None)` — defaults to the last submission.
+
+#### Submission status block
+
+Every reply that carries a submission's status carries the same flat block, so
+you never have to keep a list of status strings of your own:
+
+| key | meaning |
+|---|---|
+| `status` | `created`, `uploading`, `upload_failed`, `upload_validated`, `deploy_queue`, `deploy_run`, `deploy_failed`, `active`, `deleted` |
+| `phase` | `upload` \| `deployment` \| `active` \| `terminal` |
+| `last_status_message` | the row's latest message, or `None` |
+| `status_update_ts` | ISO-8601 UTC, or `None` |
+| `is_uploadable` | files may be added, replaced or deleted |
+| `is_deployable` | a deploy may be started |
+| `is_settled` | nothing is in flight — a poller may stop |
+
+```python
+st = c.submission_status(cid, sid)
+if st["is_deployable"]:
+    c.deploy_submission(cid, sid)
+```
 
 ### Runners (DockerImageAgentRuntime, user scope)
 
@@ -200,7 +242,7 @@ src = c.get_submission_file_content(cid, sid, "agent.py")
 c.update_submission_file_content(cid, sid, "agent.py", src.replace("epsilon=0.1", "epsilon=0.05"))
 c.deploy_submission(cid, sid)  # redeploy after edit
 
-# 4. Watch status / run progress until terminal
+# 4. Watch status / run progress until the submission settles
 for line in c.tail_logs(cid, sid):
     print(line)
 
