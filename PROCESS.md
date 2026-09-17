@@ -54,6 +54,8 @@ Methods on `MLArenaClient` map 1:1 to backend blueprints — same shape the fron
 
 When the table above drifts from `client.py`, fix `client.py` — the table is a parity contract.
 
+`create_module(..., is_published=False)` / `update_module(id, is_published=…)` toggle the student-facing draft gate (distinct from `visibility`, which is teacher reuse); a manifest module block takes the same `is_published` key, defaulting to true so existing course dirs publish unchanged.
+
 The course-content methods mirror the routes in `02-BACKEND-API.md` (`backend/app/views/teacher/{modules,lessons,course_content}.py` and `backend/app/views/academic_courses/{consumption,legacy,course_assets}.py`). `author_course_from_dir` / `export_course_to_dir` are pure compositions of the public authoring/consumption methods — they add no endpoint (the `submit()` idiom).
 
 ## Auth scopes

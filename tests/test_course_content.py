@@ -140,7 +140,7 @@ def test_delete_module_force_flag():
 
 def test_attach_competition_body():
     c, rec = make_client(lambda *_: (201, {"id": 9}))
-    c.attach_competition(2, 42, label="CartPole")
+    c.attach_challenge(2, 42, label="CartPole")
     _expect(rec.last["path"] == "/teacher/modules/2/competitions", rec.last["path"])
     _expect(rec.last["json"] == {"competition_id": 42, "label": "CartPole"},
             rec.last["json"])
@@ -148,7 +148,7 @@ def test_attach_competition_body():
 
 def test_reorder_module_competitions():
     c, rec = make_client(lambda *_: (200, []))
-    c.reorder_module_competitions(2, [3, 1])
+    c.reorder_module_challenges(2, [3, 1])
     _expect(rec.last["path"] == "/teacher/modules/2/competitions/reorder",
             rec.last["path"])
     _expect(rec.last["json"] == {"ordered_ids": [3, 1]}, rec.last["json"])

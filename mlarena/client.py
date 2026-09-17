@@ -183,7 +183,7 @@ class MLArenaClient:
 
         Useful for client-side preflight against `max_upload_size_bytes` and
         `max_upload_files` before calling `upload_agent_file` / `submit`.
-        Mirrors `GET /api/competitions/{id}` (`challenges.py:164`).
+        Mirrors `GET /api/competitions/{id}` (`competitions.py:164`).
 
         Includes an `engine` sub-object with the engine's
         `k8s_workload_value` plus `vm_health_ok` / `vm_health_checked_at`
@@ -245,11 +245,11 @@ class MLArenaClient:
     def creator_challenges(self) -> list:
         """List challenges the caller owns or assists on (creator scope).
 
-        Mirrors `GET /api/creator_competition/challenges`
+        Mirrors `GET /api/creator_competition/competitions`
         (`lifecycle.py:35`). Unlike `challenges()` this includes the caller's
         **hidden** (`is_public=False`) challenges — useful for finding a
         challenge you created but did not make public. Each item carries
-        `id`, `name`, `is_started`, `is_public`, `simulation_version`, `role`.
+        `id`, `name`, `is_started`, `is_public`, `kind`, `role`.
 
         Requires a `creator`-scope token.
         """
@@ -260,13 +260,13 @@ class MLArenaClient:
         )
         self._handle_response(resp)
         if resp.status_code != 200:
-            raise MLArenaError(f"creator_competitions failed: {_safe_error(resp)}")
+            raise MLArenaError(f"creator_challenges failed: {_safe_error(resp)}")
         return resp.json()
 
     def datasets(self, challenge_id: int) -> dict:
         """List the public datasets attached to a challenge.
 
-        Mirrors `GET /api/competitions/{id}/datasets` (`challenges.py:854`,
+        Mirrors `GET /api/competitions/{id}/datasets` (`competitions.py:854`,
         `@auth_required('user')`). Returns
         ``{"datasets": [{"id", "label", "description",
         "files": [{"id", "label", "download_url", "file_size_bytes", ...}]}]}``
@@ -326,9 +326,7 @@ class MLArenaClient:
         `GET /creator_competition/available_kinds`). Since the worker
         consolidation only two kernels exist — `gymnasium`/`pettingzoo` are
         presets over the flex_v1 kernel that pair the flexkit loop-library
-        env template with the matching env-image family; the retired kernel
-        names (`grpc_gymnasiumv4`, `grpc_pettingzoov2`) are accepted as
-        aliases during the transition.
+        env template with the matching env-image family.
 
         The backend resolves the engine + default evaluation + env-image
         family from the kind. To pin a specific engine, use the creator UI
@@ -344,7 +342,7 @@ class MLArenaClient:
         search, and direct URLs at creation time. Only the owner, creator
         assistants, and admins can view or interact with a hidden
         challenge; everyone else gets 404. Visibility can be toggled later
-        via `update_competition(is_public=...)`. Defaults to public.
+        via `update_challenge(is_public=...)`. Defaults to public.
 
         Requires a `creator`-scope token.
         """
@@ -365,7 +363,7 @@ class MLArenaClient:
         )
         self._handle_response(resp)
         if resp.status_code not in (200, 201):
-            raise MLArenaError(f"create_competition failed: {_safe_error(resp)}")
+            raise MLArenaError(f"create_challenge failed: {_safe_error(resp)}")
         return resp.json()
 
     def list_tags(self):
@@ -397,7 +395,7 @@ class MLArenaClient:
         )
         self._handle_response(resp)
         if resp.status_code != 200:
-            raise MLArenaError(f"set_competition_tags failed: {_safe_error(resp)}")
+            raise MLArenaError(f"set_challenge_tags failed: {_safe_error(resp)}")
         return resp.json()
 
     def _resolve_tag_names(self, tag_names: list[str]) -> list[int]:
@@ -443,7 +441,7 @@ class MLArenaClient:
         if is_public is not None:
             body["is_public"] = is_public
         if not body:
-            raise MLArenaError("update_competition requires at least one field")
+            raise MLArenaError("update_challenge requires at least one field")
         resp = self._request("PUT",
             self._url(f"/creator_competition/competition/{challenge_id}"),
             headers=self._headers(json_body=True),
@@ -452,7 +450,7 @@ class MLArenaClient:
         )
         self._handle_response(resp)
         if resp.status_code != 200:
-            raise MLArenaError(f"update_competition failed: {_safe_error(resp)}")
+            raise MLArenaError(f"update_challenge failed: {_safe_error(resp)}")
         return resp.json()
 
     def update_settings(self, challenge_id: int, *,
@@ -658,7 +656,7 @@ class MLArenaClient:
             )
         self._handle_response(resp)
         if resp.status_code not in (200, 201):
-            raise MLArenaError(f"set_competition_image failed: {_safe_error(resp)}")
+            raise MLArenaError(f"set_challenge_image failed: {_safe_error(resp)}")
         return resp.json()
 
     def set_challenge_markdown(self, challenge_id: int, content: str) -> dict:
@@ -673,7 +671,7 @@ class MLArenaClient:
         )
         self._handle_response(resp)
         if resp.status_code != 200:
-            raise MLArenaError(f"set_competition_markdown failed: {_safe_error(resp)}")
+            raise MLArenaError(f"set_challenge_markdown failed: {_safe_error(resp)}")
         return resp.json()
 
     def upload_benchmark_file(self, challenge_id: int, file_path: str,
@@ -775,7 +773,7 @@ class MLArenaClient:
         )
         self._handle_response(resp)
         if resp.status_code != 200:
-            raise MLArenaError(f"start_competition failed: {_safe_error(resp)}")
+            raise MLArenaError(f"start_challenge failed: {_safe_error(resp)}")
         return resp.json()
 
     def stop_challenge(self, challenge_id: int) -> dict:
@@ -794,7 +792,7 @@ class MLArenaClient:
         )
         self._handle_response(resp)
         if resp.status_code != 200:
-            raise MLArenaError(f"stop_competition failed: {_safe_error(resp)}")
+            raise MLArenaError(f"stop_challenge failed: {_safe_error(resp)}")
         return resp.json()
 
     def update_agent_template(self, challenge_id: int,
@@ -803,7 +801,7 @@ class MLArenaClient:
 
         Mirrors `PUT /api/creator_competition/competition/{id}/agent-template`.
         The backend rejects this while the challenge is started, so stop it
-        first (`stop_competition`) and re-start afterwards if needed.
+        first (`stop_challenge`) and re-start afterwards if needed.
         """
         resp = self._request("PUT",
             self._url(
@@ -825,7 +823,7 @@ class MLArenaClient:
         Mirrors `POST /api/creator_competition/competition/{id}/datasets`
         (`datasets.py:68`). Returns `{"id", "label", "description"}`; use the
         returned `id` with `upload_dataset_file`. The backend rejects this once
-        the challenge is started, so call it before `start_competition`.
+        the challenge is started, so call it before `start_challenge`.
         Files uploaded here are served to participants via `datasets()`.
 
         Requires a `creator`-scope token.
@@ -952,7 +950,7 @@ class MLArenaClient:
 
     def create_attached_agent(self, challenge_id: int, agent_name: str,
                               copy_from_agent_id: int | None = None) -> dict:
-        """Create a new agent attachment for `competition_id`.
+        """Create a new agent attachment for `challenge_id`.
 
         Requires a `user`-scope token.
         """
@@ -1386,8 +1384,8 @@ class MLArenaClient:
         """Return the rich status of a previously-submitted agent.
 
         Defaults to the last submission made through this client. Both
-        agent_id and competition_id are required by the backend route, so
-        callers using a non-default agent_id must also pass competition_id.
+        agent_id and challenge_id are required by the backend route, so
+        callers using a non-default agent_id must also pass challenge_id.
         Returns the same payload as `agent_status` (queue_info, run_info,
         last_status_message), which is more informative than
         `agent_deploy_status`.
@@ -1396,7 +1394,7 @@ class MLArenaClient:
         challenge_id = challenge_id or self._last_challenge
         if agent_id is None or challenge_id is None:
             raise SubmissionError(
-                "agent_id and competition_id are required (no previous submission found)"
+                "agent_id and challenge_id are required (no previous submission found)"
             )
         return self.agent_status(challenge_id, agent_id)
 
@@ -1538,7 +1536,7 @@ class MLArenaClient:
             teacher_user_id: an admin may name the owning teacher; otherwise the
                          caller owns the course.
         Challenges are attached afterwards via the modules you link (see
-        `create_module` / `attach_competition` / `link_module`).
+        `create_module` / `attach_challenge` / `link_module`).
         """
         body: dict = {"name": name}
         if start_date is not None:
@@ -1611,7 +1609,7 @@ class MLArenaClient:
         """List courses (enrolled + currently-active by default).
 
         Mirrors `GET /api/academic_courses/`. With `show_all=True` returns every
-        course; with `competition_id` returns courses attached to that
+        course; with `challenge_id` returns courses attached to that
         challenge. Each row carries `is_enrolled` for the caller. Returns a
         DataFrame if pandas is installed, else a list of dicts.
         """
@@ -1741,15 +1739,27 @@ class MLArenaClient:
 
     def create_module(self, title: str, slug: str | None = None,
                       summary: str | None = None, icon: str | None = None,
-                      visibility: str = "private") -> dict:
+                      visibility: str = "private",
+                      is_published: bool = True) -> dict:
         """Create an owned, reusable content module. Requires a `teacher` token.
 
         Mirrors `POST /api/teacher/modules`. `slug` (kebab, `^[a-z0-9-]+$`) is
         auto-derived from the title when omitted and is unique per owner.
-        `visibility` is `private` (default) | `unlisted` | `public`; only
-        `public` modules are forkable/linkable by other teachers.
+
+        Two independent flags, easy to confuse:
+
+        * `visibility` — *library sharing*: which other **teachers** may
+          link/fork it. `private` (default) | `unlisted` | `public`; only
+          `public` modules are forkable/linkable by other teachers.
+        * `is_published` — the *student* gate. `False` makes the module a draft:
+          it stays linked to its courses but disappears from every learner
+          surface — lesson list, lesson bodies, attached challenges, progress
+          denominators — until you publish it. Use it to keep a section you are
+          still writing hidden inside an already-shared course.
         """
-        body: dict = {"title": title, "visibility": visibility}
+        body: dict = {
+            "title": title, "visibility": visibility, "is_published": is_published,
+        }
         if slug is not None:
             body["slug"] = slug
         if summary is not None:
@@ -1784,10 +1794,12 @@ class MLArenaClient:
     def update_module(self, module_id: int, **fields) -> dict:
         """Update module meta — owner only. Mirrors `PUT /api/teacher/modules/{id}`.
 
-        Accepts `title`, `summary`, `icon`, `visibility` (the slug is immutable
-        for URL stability). Only the fields you pass are changed.
+        Accepts `title`, `summary`, `icon`, `visibility`, `is_published` (the
+        slug is immutable for URL stability). Only the fields you pass are
+        changed, so `update_module(id, is_published=False)` sends a module back
+        to draft without touching anything else.
         """
-        allowed = {"title", "summary", "icon", "visibility"}
+        allowed = {"title", "summary", "icon", "visibility", "is_published"}
         body = _filtered_fields(fields, allowed, "update_module")
         return self._course_call(
             "PUT", f"/teacher/modules/{module_id}", json_body=body,
@@ -1825,7 +1837,7 @@ class MLArenaClient:
                            pass_threshold: float | None = None) -> dict:
         """Attach a challenge to a module.
 
-        Mirrors `POST /api/teacher/modules/{id}/challenges`. `position`
+        Mirrors `POST /api/teacher/modules/{id}/competitions`. `position`
         defaults to the end of the module's challenge list.
 
         `pass_threshold` is the course's validation bar: a student validates the
@@ -1842,7 +1854,7 @@ class MLArenaClient:
             body["pass_threshold"] = pass_threshold
         return self._course_call(
             "POST", f"/teacher/modules/{module_id}/competitions", json_body=body,
-            ok=(200, 201), error_label="attach_competition",
+            ok=(200, 201), error_label="attach_challenge",
         )
 
     def update_challenge_link(self, module_id: int, challenge_id: int,
@@ -1869,7 +1881,7 @@ class MLArenaClient:
         return self._course_call(
             "DELETE",
             f"/teacher/modules/{module_id}/competitions/{challenge_id}",
-            error_label="detach_competition",
+            error_label="detach_challenge",
         )
 
     def reorder_module_challenges(self, module_id: int,
@@ -1883,7 +1895,7 @@ class MLArenaClient:
         return self._course_call(
             "PUT", f"/teacher/modules/{module_id}/competitions/reorder",
             json_body={"ordered_ids": ordered_challenge_ids},
-            error_label="reorder_module_competitions",
+            error_label="reorder_module_challenges",
         )
 
     # ---- Course authoring: lessons (teacher scope) --------------------------
@@ -2155,9 +2167,10 @@ class MLArenaClient:
                 slug: foundations    # optional
                 summary: "..."       # optional
                 icon: book           # optional
-                visibility: public   # optional (default private)
+                visibility: public   # optional (default private) — teacher reuse
+                is_published: true   # optional (default true) — false = hidden from students
                 module_id: 7         # optional — link this existing module instead of creating
-                challenges:        # optional
+                competitions:        # optional
                   - competition_id: 42
                     label: "CartPole"
                     pass_threshold: 195.0   # optional — score that validates it
@@ -2213,6 +2226,7 @@ class MLArenaClient:
                 created = self.create_module(
                     title=m["title"], slug=m.get("slug"), summary=m.get("summary"),
                     icon=m.get("icon"), visibility=m.get("visibility", "private"),
+                    is_published=bool(m.get("is_published", True)),
                 )
                 module_id = created["id"]
                 lesson_ids = []
@@ -2281,7 +2295,9 @@ class MLArenaClient:
         The inverse of `author_course_from_dir` — for backup / versioning a
         course as files. Reads the public consumption surface (landing + lesson
         bodies), so it works for a course you can view (public, or one you own /
-        are enrolled in; owners also get draft lessons). Returns the manifest dict.
+        are enrolled in; owners also get draft lessons *and draft modules* — for
+        anyone else an unpublished module is simply absent, so exporting someone
+        else's course gives you the published cut of it). Returns the manifest dict.
         """
         landing = self.course(slug)
         base = os.path.abspath(path)
@@ -2314,6 +2330,7 @@ class MLArenaClient:
                 "slug": module_slug,
                 "summary": module.get("summary"),
                 "icon": module.get("icon"),
+                "is_published": module.get("is_published", True),
                 "competitions": [
                     {
                         "competition_id": c["competition_id"],
