@@ -191,7 +191,7 @@ wheels = [
 
 [[package]]
 name = "mlarena-sdk"
-version = "2.0.0"
+version = "2.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "requests", version = "2.32.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.9'" },

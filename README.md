@@ -2,6 +2,26 @@
 
 Python SDK for [ML Arena](https://ml-arena.com) — make submissions, manage challenges, manage courses, and read leaderboards from any notebook or IDE.
 
+## 2.1 — waiting, typed errors, and more of the submission surface
+
+Additive over 2.0: nothing renamed, nothing removed.
+
+- **`submit(wait=True, timeout_sec=…)`** blocks until the deploy settles and
+  adds the final status block under `"status"`. It is a client-side
+  composition of `tail_logs()` + `submission_status()`, not a new endpoint.
+  The default `wait=False` behaves exactly as before.
+- **`tail_logs()` emits a line only when what it says changed**, so a long
+  deploy no longer reprints every run on every poll, and it **raises
+  `SubmissionError` on `timeout_sec`** instead of returning as if the
+  submission had finished.
+- **Typed 403/404 errors:** `NotFoundError` with `ChallengeNotFoundError` and
+  `SubmissionNotFoundError` under it, and `PermissionDeniedError` — a subclass
+  of `AuthenticationError`, which is what a 403 raised before, so existing
+  `except AuthenticationError` still catches it.
+- **New methods:** `download_submission_file`, `upload_submission_docs`,
+  `delete_submission_docs`, `copyable_submissions`, `submission_overview`,
+  `my_submissions`, `set_submission_visibility`.
+
 ## 2.0 — one status shape on the wire
 
 Every reply that describes a submission's status now carries the same flat
@@ -15,17 +35,10 @@ block, and the SDK reads it instead of re-deriving the lifecycle:
   (or `deploy_failed`) straight to `deploy_queue` in one transaction. Code
   that tested for `"deploying"` can drop the branch.
 - **`tail_logs()` stops on `is_settled`** rather than on its own list of
-  terminal statuses, so a new in-flight status never makes it hang. It now
-  also emits each line only when what it says changed (a long deploy no longer
-  reprints every run on every poll), and **raises `SubmissionError` on
-  `timeout_sec`** instead of returning as if the submission had finished.
+  terminal statuses, so a new in-flight status never makes it hang.
 - **`submit()` checks `is_deployable`** (one extra `submission_status` call
   after the uploads) before deploying, and raises `SubmissionError` with the
   server's `last_status_message` when the files were rejected.
-- **`submit(wait=True, timeout_sec=…)`** blocks until the deploy settles and
-  adds the final status block under `"status"`. It is a client-side
-  composition of `tail_logs()` + `submission_status()`, not a new endpoint.
-  The default `wait=False` behaves exactly as before.
 
 No Python name changed, so no deprecation alias applies: these are the
 server's response keys.

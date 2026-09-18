@@ -668,10 +668,15 @@ def test_client_source_has_no_old_route_or_payload_key():
         assert hits == [], (old, hits)
 
 
-def test_version_is_2_0_0():
-    assert mlarena.__version__ == "2.0.0"
+def test_the_two_version_strings_agree():
+    """`pyproject.toml` is what the wheel is built and published under;
+    `__version__` is what the installed package reports. A bump that touches
+    only one of them ships a wheel whose metadata and runtime disagree, which
+    is invisible until someone reads `mlarena.__version__` to check what they
+    have. Asserting they match, rather than pinning a literal, keeps the guard
+    without making every release edit this file."""
     with open(os.path.join(SDK_ROOT, "pyproject.toml"), encoding="utf-8") as fh:
-        assert 'version = "2.0.0"' in fh.read()
+        assert f'version = "{mlarena.__version__}"' in fh.read()
 
 
 # --------------------------------------------------------------------------- #
