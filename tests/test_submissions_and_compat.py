@@ -24,22 +24,32 @@ import mlarena
 from mlarena import client as client_module
 from mlarena.client import MLArenaClient
 from mlarena.exceptions import (
+    AuthenticationError,
     ChallengeNotFoundError,
     CompetitionNotFoundError,
+    NotFoundError,
+    PermissionDeniedError,
     SubmissionError,
+    SubmissionNotFoundError,
 )
 
 SDK_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 
 class FakeResponse:
-    def __init__(self, status_code=200, json_data=None):
+    def __init__(self, status_code=200, json_data=None, content=b""):
         self.status_code = status_code
         self._json = {} if json_data is None else json_data
         self.text = ""
+        self.content = content
 
     def json(self):
         return self._json
+
+    def iter_content(self, chunk_size=1):
+        """Streamed downloads (`download_submission_file`) read the body this
+        way; one chunk is enough to prove the bytes land unmodified."""
+        yield self.content
 
     def raise_for_status(self):
         if self.status_code >= 400:
@@ -158,6 +168,87 @@ def test_runtime_routes_keep_agent_runtime_segment():
     assert rec.last["json"] == {"docker_image_agent_runtime_id": 3}
 
 
+def test_submission_file_download_and_docs_routes():
+    """Parity with the console: the download button, the Documentation panel
+    and the "copy an existing submission" picker."""
+    c, rec = make_client(lambda m, p, k: (200, None, b"\x80weights")
+                         if p.endswith("/file/model.pt") else None)
+    with tempfile.TemporaryDirectory() as d:
+        out = c.download_submission_file(4, 11, "model.pt", dest_dir=d)
+        assert (rec.last["method"], rec.last["path"]) == (
+            "GET", "/submissions/challenge/4/11/file/model.pt")
+        # Bytes, not decoded text: this is how weights come back out.
+        with open(out, "rb") as fh:
+            assert fh.read() == b"\x80weights"
+
+        c.upload_submission_docs(4, 11, _tmp_file(d, "README.md", b"# hi\n"))
+    assert (rec.last["method"], rec.last["path"]) == (
+        "PUT", "/submissions/challenge/4/11/docs")
+    assert rec.last["files"]["file"][0] == "README.md"
+
+    c.delete_submission_docs(4, 11, "README.md")
+    assert (rec.last["method"], rec.last["path"]) == (
+        "DELETE", "/submissions/challenge/4/11/docs")
+    assert rec.last["params"] == {"filename": "README.md"}
+
+    c.copyable_submissions()
+    assert (rec.last["method"], rec.last["path"]) == (
+        "GET", "/submissions/copyable_submissions")
+
+
+def test_submission_docs_upload_needs_a_real_file():
+    c, _ = make_client()
+    try:
+        c.upload_submission_docs(4, 11, "/nope/README.md")
+        raise AssertionError("expected SubmissionError")
+    except SubmissionError as exc:
+        assert "File not found" in str(exc)
+
+
+def test_new_submission_methods_map_errors_like_their_neighbours():
+    c, _ = make_client(lambda *_: (500, {"error": "boom"}))
+    for label, call in (
+        ("download_submission_file",
+         lambda: c.download_submission_file(4, 11, "model.pt", dest_dir=tempfile.mkdtemp())),
+        ("delete_submission_docs", lambda: c.delete_submission_docs(4, 11, "a.md")),
+        ("copyable_submissions", lambda: c.copyable_submissions()),
+    ):
+        try:
+            call()
+            raise AssertionError(f"expected SubmissionError from {label}")
+        except SubmissionError as exc:
+            assert f"{label} failed: boom" in str(exc)
+
+
+# --------------------------------------------------------------------------- #
+# tail_logs()
+# --------------------------------------------------------------------------- #
+
+
+class FakeClock:
+    """Stands in for the module's `time`: no real waiting, and a monotonic
+    clock that only advances when the generator sleeps."""
+
+    def __init__(self):
+        self.now = 0.0
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
+def with_fake_clock(fn):
+    clock = FakeClock()
+    real = client_module.time
+    client_module.time = clock
+    try:
+        return fn()
+    finally:
+        client_module.time = real
+
+
 def test_tail_logs_stops_on_is_settled():
     c, rec = make_client(lambda *_: (200, {"status": "active",
                                            "last_status_message": "done",
@@ -165,6 +256,97 @@ def test_tail_logs_stops_on_is_settled():
     lines = list(c.tail_logs(4, 11))
     assert lines == ["[active] done"]
     assert rec.last["path"] == "/submissions/challenge/4/11/status"
+
+
+def test_tail_logs_returns_on_a_never_deployed_submission():
+    """`created` is settled — nothing is running on the row. Before the server
+    answered that, the client's own terminal list did not contain `created`
+    and the loop never ended."""
+    c, rec = make_client(lambda *_: (200, {"status": "created",
+                                           "last_status_message": None,
+                                           "is_settled": True}))
+    assert with_fake_clock(lambda: list(c.tail_logs(4, 11))) == ["[created]"]
+    assert len(rec.calls) == 1
+
+
+def test_tail_logs_does_not_repeat_unchanged_run_lines():
+    state = {"polls": 0}
+
+    def router(method, path, kwargs):
+        state["polls"] += 1
+        if state["polls"] <= 3:
+            return (200, {
+                "status": "deploy_run",
+                "last_status_message": "running",
+                "is_settled": False,
+                "run_info": {"results": [
+                    {"job_status": "running", "agent_nb_steps": 5,
+                     "submission_reward": 1.0, "game_outcome": None,
+                     "error_type": None},
+                ]},
+            })
+        return (200, {"status": "active", "last_status_message": "done",
+                      "is_settled": True, "run_info": {"results": []}})
+
+    c, _ = make_client(router)
+    lines = with_fake_clock(lambda: list(c.tail_logs(4, 11)))
+
+    assert lines == [
+        "[deploy_run] running",
+        "  run: job_status=running steps=5 reward=1.0 outcome=None",
+        "[active] done",
+    ], lines
+
+
+def test_tail_logs_emits_a_run_line_again_when_it_changes():
+    state = {"polls": 0}
+
+    def router(method, path, kwargs):
+        state["polls"] += 1
+        # A run is failed when it carries an `error_type`, not when a derived
+        # status string says "error": `job_status` is the job's own column.
+        if state["polls"] == 1:
+            steps, job_status, error_type = 5, "running", None
+        elif state["polls"] == 2:
+            steps, job_status, error_type = 9, "failed", "code_error"
+        else:
+            return (200, {"status": "deploy_failed", "last_status_message": "crash",
+                          "is_settled": True, "run_info": {"results": []}})
+        return (200, {
+            "status": "deploy_run",
+            "last_status_message": "running",
+            "is_settled": False,
+            "run_info": {"results": [
+                {"job_status": job_status, "agent_nb_steps": steps,
+                 "submission_reward": 1.0, "game_outcome": None,
+                 "error_type": error_type, "error_message": "boom"},
+            ]},
+        })
+
+    c, _ = make_client(router)
+    lines = with_fake_clock(lambda: list(c.tail_logs(4, 11)))
+
+    assert lines == [
+        "[deploy_run] running",
+        "  run: job_status=running steps=5 reward=1.0 outcome=None",
+        "  run: job_status=failed steps=9 reward=1.0 outcome=None",
+        "    error[code_error]: boom",
+        "[deploy_failed] crash",
+    ], lines
+
+
+def test_tail_logs_raises_on_timeout_instead_of_returning_silently():
+    c, _ = make_client(lambda *_: (200, {"status": "deploy_run",
+                                         "last_status_message": "running",
+                                         "is_settled": False,
+                                         "run_info": {"results": []}}))
+    try:
+        with_fake_clock(lambda: list(
+            c.tail_logs(4, 11, poll_sec=5.0, timeout_sec=10.0)))
+        raise AssertionError("expected SubmissionError")
+    except SubmissionError as exc:
+        assert "timed out after 10.0s" in str(exc)
+        assert "still 'deploy_run'" in str(exc)
 
 
 # --------------------------------------------------------------------------- #
@@ -246,6 +428,27 @@ def test_submit_not_deployable_raises_before_deploy():
         assert "Submission 11 did not pass upload validation: bad name" in str(exc)
         assert "delete_submission(4, 11)" in str(exc)
     assert not any(call["path"].endswith("/deploy") for call in rec.calls)
+
+
+def test_submit_without_wait_returns_as_soon_as_the_deploy_is_accepted():
+    """Default behaviour is unchanged: no extra status poll after the deploy."""
+    c, rec = make_client(_submit_router())
+    out = c.submit(4, agent=MyAgent)
+    assert set(out) == {"submission_id", "deploy"}
+    assert rec.calls[-1]["path"] == "/submissions/challenge/4/11/deploy"
+
+
+def test_submit_wait_polls_until_settled_and_returns_the_status():
+    c, rec = make_client(_submit_router())
+    out = with_fake_clock(lambda: c.submit(4, agent=MyAgent, wait=True))
+
+    assert set(out) == {"submission_id", "deploy", "status"}
+    assert out["status"]["is_settled"] is True
+    # The wait is a client-side composition of the public routes — no new
+    # endpoint: after the deploy it only polls /status again.
+    paths = [call["path"] for call in rec.calls]
+    after_deploy = paths[paths.index("/submissions/challenge/4/11/deploy") + 1:]
+    assert after_deploy == ["/submissions/challenge/4/11/status"] * 2, after_deploy
 
 
 def test_status_requires_ids():
@@ -469,3 +672,107 @@ def test_version_is_2_0_0():
     assert mlarena.__version__ == "2.0.0"
     with open(os.path.join(SDK_ROOT, "pyproject.toml"), encoding="utf-8") as fh:
         assert 'version = "2.0.0"' in fh.read()
+
+
+# --------------------------------------------------------------------------- #
+# The read / monitor surface: one error contract, one exception per resource,
+# and the routes the console had to itself.
+# --------------------------------------------------------------------------- #
+
+
+def test_a_missing_submission_is_a_submission_not_found_error():
+    """A 404 on a submission used to raise `ChallengeNotFoundError`."""
+    c, _ = make_client(lambda *_: (404, {"error": "Submission not found"}))
+
+    for call in (
+        lambda: c.submission_status(4, 11),
+        lambda: c.submission_games(11),
+        lambda: c.submission_overview(4, 11),
+        lambda: c.submission_deploy_status(4, 11),
+        lambda: c.delete_submission(4, 11),
+        lambda: c.set_submission_visibility(11, True),
+    ):
+        try:
+            call()
+            raise AssertionError("expected SubmissionNotFoundError")
+        except SubmissionNotFoundError as exc:
+            # The server's reason, not "Not found".
+            assert str(exc) == "Submission not found", str(exc)
+        # `NotFoundError` is the catch-all for "it is not there".
+        assert issubclass(SubmissionNotFoundError, NotFoundError)
+        assert issubclass(ChallengeNotFoundError, NotFoundError)
+
+
+def test_a_403_is_a_permission_denied_that_carries_the_reason():
+    """It raised `AuthenticationError("Access denied")` — the wrong name, and
+    the server's reason dropped. `PermissionDeniedError` still *is* an
+    `AuthenticationError`, so existing `except` clauses keep working."""
+    c, _ = make_client(lambda *_: (403, {"error": "You may not deploy this"}))
+    try:
+        c.deploy_submission(4, 11)
+        raise AssertionError("expected PermissionDeniedError")
+    except PermissionDeniedError as exc:
+        assert str(exc) == "You may not deploy this"
+        assert isinstance(exc, AuthenticationError)
+
+
+def test_a_failed_deploy_status_keeps_the_servers_reason():
+    """It ended on `raise_for_status()`, which threw the body away."""
+    c, _ = make_client(lambda *_: (500, {"error": "the engine is down"}))
+    try:
+        c.submission_deploy_status(4, 11)
+        raise AssertionError("expected SubmissionError")
+    except SubmissionError as exc:
+        assert "the engine is down" in str(exc)
+
+
+def test_my_submissions_route_and_shape():
+    c, rec = make_client(lambda *_: (200, {
+        "submissions": [{"id": 11, "challenge_id": 4}],
+        "started_submissions_count": 1,
+        "deployment_limits": {"daily_deploys_remaining": 3},
+    }))
+
+    out = c.my_submissions()
+
+    assert rec.last["method"] == "GET"
+    assert rec.last["path"] == "/submissions/mine"
+    assert out["deployment_limits"]["daily_deploys_remaining"] == 3
+
+
+def test_set_submission_visibility_route_and_body():
+    c, rec = make_client(lambda *_: (200, {"is_public": True}))
+
+    out = c.set_submission_visibility(11, True)
+
+    assert rec.last["method"] == "PUT"
+    assert rec.last["path"] == "/submissions/submission/11/visibility"
+    assert rec.last["json"] == {"is_public": True}
+    assert out == {"is_public": True}
+
+
+def test_submission_overview_route():
+    c, rec = make_client(lambda *_: (200, {"rank": 2, "last_error_type": None}))
+
+    out = c.submission_overview(4, 11)
+
+    assert rec.last["method"] == "GET"
+    assert rec.last["path"] == "/submission_result/4/11/overview"
+    assert out["rank"] == 2
+
+
+def test_the_client_reads_no_retired_payload_key():
+    """The keys this surface renamed. They are gone from the server, so a
+    `.get()` left behind here would silently read None forever.
+
+    Only *quoted* occurrences count: the docstrings name the old spellings on
+    purpose, in backticks, so a reader upgrading knows what moved.
+    """
+    with open(os.path.join(SDK_ROOT, "mlarena", "client.py"), encoding="utf-8") as fh:
+        src = fh.read()
+    for old in ("position_in_queue", "steps_completed", "current_reward",
+                "deploymentLimits", "latestDeploy", "creation_date",
+                "daily_deploys_count", "isEloRanked", "latest_error",
+                "submission_performance"):
+        for literal in (f'"{old}"', f"'{old}'"):
+            assert literal not in src, literal

@@ -15,10 +15,17 @@ block, and the SDK reads it instead of re-deriving the lifecycle:
   (or `deploy_failed`) straight to `deploy_queue` in one transaction. Code
   that tested for `"deploying"` can drop the branch.
 - **`tail_logs()` stops on `is_settled`** rather than on its own list of
-  terminal statuses, so a new in-flight status never makes it hang.
+  terminal statuses, so a new in-flight status never makes it hang. It now
+  also emits each line only when what it says changed (a long deploy no longer
+  reprints every run on every poll), and **raises `SubmissionError` on
+  `timeout_sec`** instead of returning as if the submission had finished.
 - **`submit()` checks `is_deployable`** (one extra `submission_status` call
   after the uploads) before deploying, and raises `SubmissionError` with the
   server's `last_status_message` when the files were rejected.
+- **`submit(wait=True, timeout_sec=…)`** blocks until the deploy settles and
+  adds the final status block under `"status"`. It is a client-side
+  composition of `tail_logs()` + `submission_status()`, not a new endpoint.
+  The default `wait=False` behaves exactly as before.
 
 No Python name changed, so no deprecation alias applies: these are the
 server's response keys.
@@ -177,19 +184,26 @@ Create a client. `api_key` must be the full `mlk_<scope>_<lookup>_<secret>` toke
 
 ### Submissions (user scope)
 
-- `client.submit(challenge_id, agent=None, files=None, submission_name=None, runtime_id=None, runtime=None)` — one-shot create + (pick runner) + upload + deploy. Returns `{"submission_id", "deploy"}`.
+- `client.submit(challenge_id, agent=None, files=None, submission_name=None, runtime_id=None, runtime=None, wait=False, timeout_sec=None, poll_sec=5.0)` — one-shot create + (pick runner) + upload + deploy. Returns `{"submission_id", "deploy"}`, plus `"status"` with `wait=True`.
 - `client.create_submission(challenge_id, submission_name, copy_from_submission_id=None)`
-- `client.upload_submission_file(challenge_id, submission_id, file_path)` — multipart upload from disk.
+- `client.copyable_submissions()` — your submissions that can seed a new one (the ids `copy_from_submission_id` takes), across every challenge.
+- `client.upload_submission_file(challenge_id, submission_id, file_path)` — multipart upload from disk. The file is stored under its basename: on a file challenge that name must be `challenge(cid)["submission_filename"]`, which is not always `submission.csv`.
 - `client.update_submission_file_content(challenge_id, submission_id, filename, content)` — upload from a string (template render → upload).
 - `client.list_submission_files(challenge_id, submission_id)` — list files with their content / binary marker.
 - `client.get_submission_file_content(challenge_id, submission_id, filename)` — fetch one file's text.
+- `client.download_submission_file(challenge_id, submission_id, filename, dest_dir=".")` — write one file to disk byte-for-byte; the only way to get binary files (model weights) back out.
 - `client.delete_submission_file(challenge_id, submission_id, filename)`
+- `client.upload_submission_docs(challenge_id, submission_id, file_path)` — attach a markdown write-up to an **active** submission (`.md` only); does not touch its status.
+- `client.delete_submission_docs(challenge_id, submission_id, filename)`
 - `client.deploy_submission(challenge_id, submission_id)`
 - `client.delete_submission(challenge_id, submission_id)`
-- `client.submission_status(challenge_id, submission_id)` — rich status: the status block (see below) plus `submission_name`, `queue_info`, `run_info`.
+- `client.my_submissions()` — every submission you have made, across every challenge, with `deployment_limits`.
+- `client.set_submission_visibility(submission_id, is_public)` — show or hide a submission in public listings.
+- `client.submission_status(challenge_id, submission_id)` — rich status: the status block (see below) plus `submission_name`, `queue_info`, `run_info`, `latest_deploy`.
 - `client.submission_deploy_status(challenge_id, submission_id)` — deploy quotas + last deploy.
-- `client.submission_games(submission_id)` — recent games with signed log URLs (60-day GCS retention).
-- `client.tail_logs(challenge_id, submission_id, follow=False, poll_sec=5.0)` — generator of status / run lines; stops on `is_settled`.
+- `client.submission_overview(challenge_id, submission_id)` — aggregate score, rank, last-24h resource use and the newest run's failure.
+- `client.submission_games(submission_id)` — recent games with signed log URLs (60-day GCS retention). Each row's `run` is the same run shape `submission_status` serves.
+- `client.tail_logs(challenge_id, submission_id, follow=False, poll_sec=5.0, timeout_sec=None)` — generator of status / run lines; stops on `is_settled`, emits a line only when what it says changed, and raises `SubmissionError` if `timeout_sec` runs out.
 - `client.status(submission_id=None, challenge_id=None)` — defaults to the last submission.
 
 #### Submission status block
@@ -212,6 +226,24 @@ st = c.submission_status(cid, sid)
 if st["is_deployable"]:
     c.deploy_submission(cid, sid)
 ```
+
+#### Why a run ended
+
+`submission_status()["run_info"]["results"]`, `submission_games()[...]["run"]`
+and `submission_overview()` all describe a run the same way. A run carries the
+job's own `job_status` (`pending` | `running` | `completed` | `failed` |
+`cancelled` | `reaped`) and, when your agent is why it ended, `error_type`
+(`code_error` | `pod_crash` | `simulation_error` | `unknown`) with
+`error_message`:
+
+```python
+for run in c.submission_status(cid, sid)["run_info"]["results"]:
+    if run["error_type"]:
+        print(run["error_type"], run["error_message"])
+```
+
+`run_info` and `latest_deploy` are served in **every** post-deploy state, so the
+reason a deploy failed is still there once it has failed.
 
 ### Runners (DockerImageAgentRuntime, user scope)
 

@@ -6,7 +6,10 @@ from mlarena.exceptions import (
     ChallengeNotFoundError,
     CompetitionNotFoundError,  # deprecated alias of ChallengeNotFoundError
     MLArenaError,
+    NotFoundError,
+    PermissionDeniedError,
     SubmissionError,
+    SubmissionNotFoundError,
 )
 
 __version__ = "2.0.0"
