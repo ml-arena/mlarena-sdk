@@ -1475,11 +1475,17 @@ class MLArenaClient:
         (`submission_result.py`) — what the console's Dashboard tab shows.
 
         Returns `created_at_ts`, `mean_reward`, `elo_score`, `number_of_runs`,
-        `last_end_run_ts`, the warm-up counterparts, the last-24h resource
-        aggregates (`max_ram_usage`, `avg_cpu_usage`, `avg_steps`,
-        `runs_last_24h`, `max_vram_bytes`), `submissions_in_queue`, and the
-        challenge context for reading them (`rank`, `is_elo_score`,
-        `ranked_order`, `metric`, `frontend_precision`, `has_gpu`).
+        `last_end_run_ts`, the last-24h resource aggregates (`max_ram_usage`,
+        `avg_cpu_usage`, `avg_steps`, `runs_last_24h`, `max_vram_bytes`),
+        `submissions_in_queue`, and the challenge context for reading them
+        (`rank`, `is_elo_score`, `ranked_order`, `metric`,
+        `frontend_precision`, `has_gpu`).
+
+        The warm-up counterparts (`warmup_mean_reward`, `warmup_number_of_runs`,
+        `warmup_elo_score`) that older backends served are gone: nothing had
+        written them a real value since the Celery deploy path was removed, so
+        they were always null. A backend still serving them is simply older —
+        this method returns the body verbatim either way.
 
         `last_error_type` / `last_error_message` are the newest run's failure,
         named as everywhere else. The message is None unless the submission is
