@@ -20,15 +20,28 @@ from typing import Iterator
 
 import requests
 
+from mlarena.chat import ChatConversation
 from mlarena.exceptions import (
     AuthenticationError,
     ChallengeNotFoundError,
+    ChatSessionNotFoundError,
     MLArenaError,
     NotFoundError,
     PermissionDeniedError,
     SubmissionError,
     SubmissionNotFoundError,
 )
+
+
+class _Unset:
+    """Default of a keyword the caller did not pass — distinct from `None`,
+    which `update_chat_settings` sends to clear a nullable limit."""
+
+    def __repr__(self) -> str:
+        return "UNSET"
+
+
+_UNSET = _Unset()
 
 
 class MLArenaClient:
@@ -180,9 +193,13 @@ class MLArenaClient:
         if tags:
             base_params["tags"] = ",".join(tags) if isinstance(tags, list) else tags
 
+        # Public route, but it answers differently to the caller it can
+        # identify (enrolled courses' challenges on page 1, admins' unstarted
+        # challenges): send the token.
         if page is not None or per_page is not None:
             params = {**base_params, "page": page or 1, "per_page": per_page or 24}
-            resp = self._request("GET",self._url("/challenges/"), params=params, timeout=30)
+            resp = self._request("GET", self._url("/challenges/"), params=params,
+                                 headers=self._headers(), timeout=30)
             resp.raise_for_status()
             return _to_dataframe(resp.json().get("items", []))
 
@@ -191,7 +208,8 @@ class MLArenaClient:
         per_page_n = 100
         while True:
             params = {**base_params, "page": page_n, "per_page": per_page_n}
-            resp = self._request("GET",self._url("/challenges/"), params=params, timeout=30)
+            resp = self._request("GET", self._url("/challenges/"), params=params,
+                                 headers=self._headers(), timeout=30)
             resp.raise_for_status()
             body = resp.json()
             items.extend(body.get("items", []))
@@ -213,7 +231,10 @@ class MLArenaClient:
         simulationmanager). `vm_health_ok=False` means the GPU VM is
         currently unreachable and submissions will queue rather than run.
         """
-        resp = self._request("GET",self._url(f"/challenges/{challenge_id}"), timeout=30)
+        # Public route, but a non-public course challenge is only visible to a
+        # caller the backend can identify: send the token.
+        resp = self._request("GET", self._url(f"/challenges/{challenge_id}"),
+                             headers=self._headers(), timeout=30)
         self._handle_response(resp)
         resp.raise_for_status()
         return resp.json()
@@ -1549,7 +1570,9 @@ class MLArenaClient:
 
         Mirrors `GET /api/challenges/{id}/recent-replays`. Each replay
         carries `simulation_id`, `created_at`, `render_delay_second`,
-        `signed_url` (GCS render file) and `participants`.
+        `signed_url` (GCS render file) and `participants`. Only runs from
+        the last 59 days are listed: the render bucket deletes blobs after
+        60 days, so an older `signed_url` would 404.
         """
         resp = self._request("GET",
             self._url(f"/challenges/{challenge_id}/recent-replays"),
@@ -1799,9 +1822,14 @@ class MLArenaClient:
         if challenge_id is None:
             raise SubmissionError("No challenge specified and no previous submission found")
         params = {"limit": top} if top is not None else None
+        # The route is public, but it answers differently to the caller it
+        # can identify: `IsMySubmission`, and non-public course challenges the
+        # caller is enrolled in. Without the bearer token every row came back
+        # as somebody else's.
         resp = self._request("GET",
             self._url(f"/leaderboard/challenge/{challenge_id}"),
             params=params,
+            headers=self._headers(),
             timeout=30,
         )
         self._handle_response(resp)
@@ -1839,6 +1867,448 @@ class MLArenaClient:
         self._handle_response(resp)
         resp.raise_for_status()
         return resp.json().get("stats", {})
+
+    # ---- Live data sources (public read proxy over the collection sidecar) --
+    #
+    # The `data_source_enabled` challenges are scored on data the platform
+    # collects (hourly weather for a city registry, a news feed). These
+    # methods mirror `GET /api/data_sources/*` (`views/data_sources.py`): no
+    # token scope is needed, the routes are public. A challenge names its
+    # slice in `challenge(id)["data_source_asset"]`. Timestamps are naive UTC
+    # ISO-8601 strings (no offset suffix). When the sidecar is down the server
+    # answers 503 `{"error", "upstream": "data_collection"}`, raised here as
+    # `MLArenaError` with that reason.
+
+    def _data_source_get(self, path: str, params: dict | None = None):
+        resp = self._request("GET", self._url(f"/data_sources{path}"),
+                             params=params, timeout=30)
+        self._handle_response(resp, not_found=NotFoundError)
+        if resp.status_code != 200:
+            raise MLArenaError(f"data source {path} failed: {_safe_error(resp)}")
+        return resp.json()
+
+    def data_source_weather_coverage(self, days: int = 60) -> dict:
+        """Day-by-day completeness of the weather table over the last ``days``
+        (1..400).
+
+        Mirrors `GET /api/data_sources/weather/coverage`. Returns
+        ``{"expected_cities", "first_hour", "last_hour", "days": [{"date",
+        "hours_present", "hours_complete", "rows", "rows_by_source"}]}`` —
+        one entry per calendar day that has any row, oldest first;
+        ``hours_complete`` counts the hours with a row for every city.
+        """
+        return self._data_source_get("/weather/coverage", {"days": days})
+
+    def data_source_weather_series(self, city: str, country: str,
+                                   hours: int = 168) -> dict:
+        """One city's hourly weather rows over the last ``hours`` (1..9600).
+
+        Mirrors `GET /api/data_sources/weather/series`. ``city`` / ``country``
+        are a pair from :meth:`data_source_weather_cities`; any other raises
+        ``NotFoundError``. Returns ``{"city_name", "country_code", "latitude",
+        "longitude", "points": [{"timestamp", "temperature", "rain",
+        "wind_speed", "wind_direction", "humidity", "clouds", "visibility",
+        "snow", "pressure", "apparent_temperature", "wind_gust", "source"}]}``,
+        oldest first; a missing hour is simply absent, and ``pressure`` /
+        ``apparent_temperature`` / ``wind_gust`` are null on older rows.
+        """
+        return self._data_source_get(
+            "/weather/series", {"city": city, "country": country, "hours": hours})
+
+    def data_source_weather_snapshot(self, hour: str | None = None) -> dict:
+        """Every city's weather at one hour (default: the latest hour present).
+
+        Mirrors `GET /api/data_sources/weather/snapshot`. ``hour`` is a naive
+        UTC ISO-8601 timestamp (``"2026-09-18T06:00:00"``). Returns
+        ``{"timestamp", "cities": [{"city_name", "country_code", "latitude",
+        "longitude", "temperature", "rain", "wind_speed", "wind_direction",
+        "humidity", "clouds", "pressure", "source"}]}``.
+        """
+        params = {"hour": hour} if hour is not None else None
+        return self._data_source_get("/weather/snapshot", params)
+
+    def data_source_weather_cities(self) -> list:
+        """The weather city registry, sorted by ``city_name``.
+
+        Mirrors `GET /api/data_sources/weather/cities`. Returns
+        ``[{"city_name", "country_code", "latitude", "longitude"}]``.
+        """
+        return self._data_source_get("/weather/cities")
+
+    def data_source_news_volume(self, days: int = 30) -> dict:
+        """Articles per day and per source over the last ``days`` (1..400).
+
+        Mirrors `GET /api/data_sources/news/volume`. Returns ``{"days":
+        [{"date", "total", "by_family"}], "sources": [{"source_key",
+        "source_label", "source_family", "total", "avg_chars", "latest"}]}``
+        — days oldest first, sources by total descending.
+        """
+        return self._data_source_get("/news/volume", {"days": days})
+
+    def data_source_news_sources(self, hours: int = 24) -> list:
+        """Per-source article counts over the last ``hours`` (1..9600).
+
+        Mirrors `GET /api/data_sources/news/sources`. Returns
+        ``[{"source_key", "source_label", "source_family", "n_items",
+        "min_chars", "avg_chars", "latest", "window_hours"}]`` by count
+        descending — the panel-sizing view: a source with 0 rows here cannot
+        be a daily class.
+        """
+        return self._data_source_get("/news/sources", {"hours": hours})
+
+    # ---- Chat challenges (`chat_v1`): one shared JSON-call helper -----------
+
+    def _chat_call(self, method: str, path: str, *,
+                   json_body: dict | None = None,
+                   params: dict | None = None,
+                   ok: tuple[int, ...] = (200,),
+                   error_label: str,
+                   not_found: type = ChallengeNotFoundError,
+                   timeout: int = 30) -> requests.Response:
+        """Single chokepoint for the `/api/chat/*` routes (`_course_call`'s
+        sibling). `not_found` names the class a 404 raises:
+        `ChallengeNotFoundError` on a challenge-scoped route,
+        `ChatSessionNotFoundError` on a session-scoped one. Any other
+        non-`ok` status — the 409s of §5.1, a 400 — raises `MLArenaError`
+        with the server's reason. Returns the response: `export_chat_session`
+        reads `text`, everything else `.json()`."""
+        resp = self._request(
+            method, self._url(path),
+            headers=self._headers(json_body=json_body is not None),
+            json=json_body, params=params, timeout=timeout,
+        )
+        self._handle_response(resp, not_found=not_found)
+        if resp.status_code not in ok:
+            raise MLArenaError(f"{error_label} failed: {_safe_error(resp)}")
+        return resp
+
+    # ---- Chat challenges: participant routes (user scope) --------------------
+
+    def chat_challenge(self, challenge_id: int) -> dict:
+        """The participant view of a chat challenge — `ChatChallengeView`.
+
+        Mirrors `GET /api/chat/challenge/{cid}` (`backend/app/views/chat/`,
+        plan §5.1). Returns `challenge_id`, `challenge_name`, `is_started`,
+        `manifest` (what the agent registered: `bot_name`, `tagline`,
+        `welcome_message`, `charter_md`, `rules_public_md`, the public
+        `scoring_rules`, its `tools`; None until the ChatPod is up),
+        `env_status` / `env_status_message`, `agent_online`, the limits
+        (`turn_timeout_sec`, `max_turns_per_session`,
+        `max_sessions_per_participant`; a None limit is unlimited),
+        `participant` (your group on this challenge: `submission_id`,
+        `team_name`, `members`, `total_amount_eur`, `session_count`, `rank`),
+        `sessions` (yours and your teammates', newest first) and
+        `open_session_id` (your open session, or None).
+
+        Raises `ChallengeNotFoundError` when the challenge is not a chat
+        challenge or is hidden from you.
+        """
+        return self._chat_call(
+            "GET", f"/chat/challenge/{challenge_id}",
+            error_label="chat_challenge",
+        ).json()
+
+    def open_chat_session(self, challenge_id: int) -> dict:
+        """Open a conversation with the agent. Returns the new `ChatSessionView`.
+
+        Mirrors `POST /api/chat/challenge/{cid}/sessions` with
+        `{"charter_accepted": true}`: calling this **is** accepting the
+        challenge's charter (`chat_challenge(cid)["manifest"]["charter_md"]`)
+        — the server keeps no session without it. Your group's submission is
+        created on the first session (born active: nothing to upload or
+        deploy) and your previous open session is closed — one open session
+        per user per challenge.
+
+        The reply is the same shape `chat_session()` returns: `session`,
+        `messages` (empty), `tool_calls`, `scoring_events`, `turn` (None),
+        `participant_total_amount_eur`, `can_send`.
+
+        Raises `ChallengeNotFoundError` on a non-chat or hidden challenge, and
+        `MLArenaError` with the server's reason when it refuses (409: the
+        challenge is not started, the agent is offline, or
+        `max_sessions_per_participant` is reached).
+        """
+        return self._chat_call(
+            "POST", f"/chat/challenge/{challenge_id}/sessions",
+            json_body={"charter_accepted": True}, ok=(200, 201),
+            error_label="open_chat_session",
+        ).json()
+
+    def chat_session(self, session_id: int) -> dict:
+        """One conversation with its evidence — `ChatSessionView`.
+
+        Mirrors `GET /api/chat/sessions/{sid}` (plan §5.1). Returns `session`
+        (`ChatSessionSummary`: `status` `open` | `closed` | `voided`, `title`,
+        `total_amount_eur`, counts, timestamps), `messages` (ordered),
+        `tool_calls` (what the agent called, with arguments and results),
+        `scoring_events` (each breach: `rule_key`, `label`, `amount_eur`,
+        `evidence`), `turn` (the in-flight or latest turn: `status`
+        `pending` | `running` | `completed` | `failed`, `progress` while
+        running, `error_message` when failed; None before the first message),
+        `participant_total_amount_eur` (your group's cumulative euros) and
+        `can_send`. Readable by the session's user, their teammates, the
+        challenge's creator / assistants and admins.
+
+        Cheap enough to poll — `send_chat_message(wait=True)` does.
+
+        Raises `ChatSessionNotFoundError` when the session does not exist or
+        is not yours to read.
+        """
+        return self._chat_call(
+            "GET", f"/chat/sessions/{session_id}",
+            error_label="chat_session", not_found=ChatSessionNotFoundError,
+        ).json()
+
+    def send_chat_message(self, session_id: int, content: str, *,
+                          wait: bool = True, timeout: float = 180,
+                          poll_interval: float = 0.7) -> dict:
+        """Send a message and, by default, wait for the agent's answer.
+
+        Mirrors `POST /api/chat/sessions/{sid}/messages` `{"content": ...}`
+        (plan §5.1), which answers 202 `{"turn_id", "message"}` as soon as the
+        turn is queued for the agent. `content` is 1..4000 characters.
+
+        With `wait=True` (default) the call then polls `chat_session()` every
+        `poll_interval` seconds — a client-side composition of the two public
+        routes, the console's own cadence; there is no wait endpoint — until
+        **that** turn's `status` is `completed` or `failed`, and returns the
+        final `ChatSessionView`: the assistant's reply is the message whose
+        `id` is `turn["assistant_message_id"]`, and the events this turn
+        earned are the `scoring_events` with `turn_id == turn["id"]`. A
+        `failed` turn raises `MLArenaError` carrying the turn's
+        `error_message`; the session stays open, so you may send again. Not
+        settled after `timeout` seconds raises `MLArenaError` too, naming the
+        state the turn was left in.
+
+        With `wait=False` the 202 body is returned as-is.
+
+        Raises `ChatSessionNotFoundError` when the session is not yours, and
+        `MLArenaError` with the server's reason when it refuses (409: a turn
+        is already in flight on this session, the session is not `open`, or
+        `max_turns_per_session` is reached).
+        """
+        accepted = self._chat_call(
+            "POST", f"/chat/sessions/{session_id}/messages",
+            json_body={"content": content}, ok=(200, 201, 202),
+            error_label="send_chat_message", not_found=ChatSessionNotFoundError,
+            timeout=60,
+        ).json()
+        if not wait:
+            return accepted
+        return self._wait_for_chat_turn(
+            session_id, accepted["turn_id"],
+            timeout=timeout, poll_interval=poll_interval,
+        )
+
+    def _wait_for_chat_turn(self, session_id: int, turn_id: int, *,
+                            timeout: float, poll_interval: float) -> dict:
+        """Poll `chat_session` until turn `turn_id` settles (see
+        `send_chat_message`). A view whose `turn` is another turn — the
+        previous one, still the latest for a moment — is not that turn
+        settling, so it is skipped rather than misread."""
+        deadline = time.monotonic() + timeout
+        while True:
+            view = self.chat_session(session_id)
+            turn = view["turn"]
+            if (turn is not None and turn["id"] == turn_id
+                    and turn["status"] in ("completed", "failed")):
+                if turn["status"] == "failed":
+                    raise MLArenaError(
+                        f"chat turn {turn_id} failed: {turn['error_message']}"
+                    )
+                return view
+            if time.monotonic() > deadline:
+                left_in = (turn["status"] if turn is not None
+                           and turn["id"] == turn_id else "not yet visible")
+                raise MLArenaError(
+                    f"send_chat_message timed out after {timeout}s: turn "
+                    f"{turn_id} of session {session_id} is still {left_in!r}. "
+                    f"Poll chat_session({session_id}) or raise timeout."
+                )
+            time.sleep(poll_interval)
+
+    def close_chat_session(self, session_id: int) -> dict:
+        """End a conversation: `open` → `closed`. Idempotent.
+
+        Mirrors `POST /api/chat/sessions/{sid}/close` (plan §5.1). What the
+        session earned stays banked; open a new one with
+        `open_chat_session()`.
+
+        Raises `ChatSessionNotFoundError` when the session is not yours.
+        """
+        return self._chat_call(
+            "POST", f"/chat/sessions/{session_id}/close",
+            error_label="close_chat_session", not_found=ChatSessionNotFoundError,
+        ).json()
+
+    def export_chat_session(self, session_id: int,
+                            format: str = "json") -> dict | str:
+        """The evidence file of one session — « la pièce à conviction ».
+
+        Mirrors `GET /api/chat/sessions/{sid}/export?format=json|md` (plan
+        §5.1): transcript, tool log, scoring events, totals and session
+        metadata. `format="json"` (default) returns the parsed document;
+        `format="md"` returns the Markdown text. Same readers as
+        `chat_session()`.
+
+        Raises `MLArenaError` on any other `format`, and
+        `ChatSessionNotFoundError` when the session is not yours.
+        """
+        if format not in ("json", "md"):
+            raise MLArenaError(
+                f"export_chat_session: format must be 'json' or 'md', got {format!r}"
+            )
+        resp = self._chat_call(
+            "GET", f"/chat/sessions/{session_id}/export",
+            params={"format": format}, error_label="export_chat_session",
+            not_found=ChatSessionNotFoundError, timeout=60,
+        )
+        return resp.json() if format == "json" else resp.text
+
+    def chat(self, challenge_id: int, *, timeout: float = 180,
+             poll_interval: float = 0.7, echo: bool = True) -> ChatConversation:
+        """A conversation object for a chat challenge (user scope).
+
+        A client-side composition of `open_chat_session`, `send_chat_message`
+        and `chat_session` — no endpoint of its own (the `submit()` idiom):
+
+            chat = client.chat(42)
+            reply = chat.say("Bonjour, j'ai perdu ma réservation")
+            chat.total_eur      # Decimal, this session's euros
+            chat.reset()        # close it, start over
+
+        `say()` opens the session on its first call (which accepts the
+        charter), waits for the answer, prints the scoring events it earned
+        and the reply, and returns the reply text. `timeout` and
+        `poll_interval` are passed to every `send_chat_message`; `echo=False`
+        prints nothing.
+        """
+        return ChatConversation(self, challenge_id, timeout=timeout,
+                                poll_interval=poll_interval, echo=echo)
+
+    # ---- Chat challenges: creator routes (creator scope + challenge access) --
+
+    def chat_admin(self, challenge_id: int) -> dict:
+        """The creator view of a chat challenge — `ChatChallengeAdminView`.
+
+        Mirrors `GET /api/chat/challenge/{cid}/admin` (plan §5.2). Returns the
+        LLM connection (`llm_base_url`, `llm_model`, `llm_api_key_set` — a
+        boolean, the key itself is never served), the limits, the agent's
+        health (`env_status`, `env_status_message`, `env_status_at`,
+        `worker_ref`, `last_seen_at`, `agent_online`), the registered
+        `manifest` and `counts` (`sessions`, `open_sessions`, `turns`,
+        `scoring_events`, `total_amount_eur`, `participants`).
+
+        Requires a `creator`-scope token and access to the challenge.
+        """
+        return self._chat_call(
+            "GET", f"/chat/challenge/{challenge_id}/admin",
+            error_label="chat_admin",
+        ).json()
+
+    def update_chat_settings(self, challenge_id: int, *,
+                             llm_base_url: str | _Unset = _UNSET,
+                             llm_model: str | _Unset = _UNSET,
+                             llm_api_key: str | _Unset = _UNSET,
+                             turn_timeout_sec: int | _Unset = _UNSET,
+                             max_turns_per_session: int | None | _Unset = _UNSET,
+                             max_sessions_per_participant: int | None | _Unset = _UNSET,
+                             ) -> dict:
+        """Point the challenge at its LLM and set its limits.
+
+        Mirrors `PUT /api/chat/challenge/{cid}/settings`
+        (`UpdateChatSettingsRequest`, plan §5.2) — the console's Chat tab.
+        Only the keywords you pass are sent; the rest is left untouched.
+        Allowed while the challenge is started (the agent reads the LLM
+        config on every turn).
+
+        - `llm_base_url` / `llm_model` — an OpenAI-compatible chat-completions
+          endpoint (`…/v1`) and the model name. Both must be set before the
+          challenge can start.
+        - `llm_api_key` — write-only: `""` clears it, and `chat_admin()`
+          reports only `llm_api_key_set`.
+        - `turn_timeout_sec` — how long one answer may take.
+        - `max_turns_per_session` / `max_sessions_per_participant` — pass
+          `None` explicitly to lift a limit (unlimited).
+
+        Returns the updated `ChatChallengeAdminView`. Raises `MLArenaError`
+        when called with no field at all.
+        """
+        passed = {
+            "llm_base_url": llm_base_url,
+            "llm_model": llm_model,
+            "llm_api_key": llm_api_key,
+            "turn_timeout_sec": turn_timeout_sec,
+            "max_turns_per_session": max_turns_per_session,
+            "max_sessions_per_participant": max_sessions_per_participant,
+        }
+        body = {key: value for key, value in passed.items() if value is not _UNSET}
+        if not body:
+            raise MLArenaError(
+                f"update_chat_settings requires at least one field from "
+                f"{sorted(passed)}"
+            )
+        return self._chat_call(
+            "PUT", f"/chat/challenge/{challenge_id}/settings",
+            json_body=body, error_label="update_chat_settings",
+        ).json()
+
+    def chat_sessions(self, challenge_id: int,
+                      status: str | None = None) -> dict:
+        """Every session of the challenge, for the creator.
+
+        Mirrors `GET /api/chat/challenge/{cid}/sessions` (plan §5.2). Returns
+        `{"sessions": [...]}` — each a `ChatSessionSummary` (user, team's
+        submission, `status`, counts, `total_amount_eur`) plus
+        `submission_name`. `status` filters on `open` | `closed` | `voided`.
+        """
+        params = {"status": status} if status is not None else None
+        return self._chat_call(
+            "GET", f"/chat/challenge/{challenge_id}/sessions",
+            params=params, error_label="chat_sessions",
+        ).json()
+
+    def void_chat_session(self, session_id: int, reason: str) -> dict:
+        """Annul a session — « l'annulation de la manche ».
+
+        Mirrors `POST /api/chat/sessions/{sid}/void` `{"reason": ...}` (plan
+        §5.2): the session becomes `voided` and its scoring events leave the
+        group's total (recomputed in the same transaction). Undo with
+        `unvoid_chat_session()`.
+
+        Raises `ChatSessionNotFoundError` when the session is not on a
+        challenge you may manage.
+        """
+        return self._chat_call(
+            "POST", f"/chat/sessions/{session_id}/void",
+            json_body={"reason": reason}, error_label="void_chat_session",
+            not_found=ChatSessionNotFoundError,
+        ).json()
+
+    def unvoid_chat_session(self, session_id: int) -> dict:
+        """Reinstate a voided session; its events count again.
+
+        Mirrors `POST /api/chat/sessions/{sid}/unvoid` (plan §5.2).
+
+        Raises `ChatSessionNotFoundError` when the session is not on a
+        challenge you may manage.
+        """
+        return self._chat_call(
+            "POST", f"/chat/sessions/{session_id}/unvoid",
+            error_label="unvoid_chat_session", not_found=ChatSessionNotFoundError,
+        ).json()
+
+    def export_chat_evidence(self, challenge_id: int) -> dict:
+        """Every session's evidence in one document — the review dossier.
+
+        Mirrors `GET /api/chat/challenge/{cid}/export` (plan §5.2): the
+        per-session export of `export_chat_session(format="json")` for every
+        session of the challenge, in one JSON.
+        """
+        return self._chat_call(
+            "GET", f"/chat/challenge/{challenge_id}/export",
+            error_label="export_chat_evidence", timeout=120,
+        ).json()
 
     # ---- Course content: shared JSON-call helper ----------------------------
 

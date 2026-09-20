@@ -47,6 +47,16 @@ class SubmissionNotFoundError(NotFoundError):
     pass
 
 
+class ChatSessionNotFoundError(NotFoundError):
+    """Raised when a chat session is not found, or is not yours to read.
+
+    A session is readable by its user, their teammates, the challenge's
+    creator / assistants and admins; anyone else gets the same 404 as for an
+    id that does not exist (see `SubmissionNotFoundError`).
+    """
+    pass
+
+
 # Deprecated spelling, kept so `except CompetitionNotFoundError` in existing
 # notebooks still catches the same error. It is the same class, not a subclass,
 # so isinstance checks against either name behave identically.

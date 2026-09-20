@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mlarena-sdk"
-version = "2.1.0"
+version = "2.2.0"
 description = "Python SDK for ML Arena - make submissions, manage challenges, courses, and view leaderboards"
 readme = "README.md"
 license = "MIT"

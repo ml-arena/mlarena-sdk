@@ -473,14 +473,23 @@ def test_challenge_read_routes():
     assert rec.last["path"] == "/challenges/"
     c.challenges(page=1)
     assert rec.last["path"] == "/challenges/"
+    # The list route surfaces the caller's enrolled-course challenges on
+    # page 1 and, for admins, unstarted ones: the token must travel.
+    assert rec.last["headers"]["Authorization"].startswith("Bearer ")
     c.challenge(4)
     assert rec.last["path"] == "/challenges/4"
+    # Public route, but a non-public course challenge is only visible to the
+    # caller the backend can identify: the token must travel.
+    assert rec.last["headers"]["Authorization"].startswith("Bearer ")
     c.datasets(4)
     assert rec.last["path"] == "/challenges/4/datasets"
     c.recent_replays(4)
     assert rec.last["path"] == "/challenges/4/recent-replays"
     c.leaderboard(4)
     assert rec.last["path"] == "/leaderboard/challenge/4"
+    # Same: `IsMySubmission` is computed from the caller the token names. It
+    # was always False over the SDK because no token was sent.
+    assert rec.last["headers"]["Authorization"].startswith("Bearer ")
 
 
 def test_challenge_admin_and_creator_routes():

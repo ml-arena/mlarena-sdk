@@ -1,9 +1,11 @@
 from urllib.parse import urlsplit
 
+from mlarena.chat import ChatConversation
 from mlarena.client import MLArenaClient
 from mlarena.exceptions import (
     AuthenticationError,
     ChallengeNotFoundError,
+    ChatSessionNotFoundError,
     CompetitionNotFoundError,  # deprecated alias of ChallengeNotFoundError
     MLArenaError,
     NotFoundError,
@@ -12,7 +14,7 @@ from mlarena.exceptions import (
     SubmissionNotFoundError,
 )
 
-__version__ = "2.1.0"
+__version__ = "2.2.0"
 
 _LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 
