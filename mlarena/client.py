@@ -1992,7 +1992,8 @@ class MLArenaClient:
         `manifest` (what the agent registered: `bot_name`, `tagline`,
         `welcome_message`, `charter_md`, `rules_public_md`, the public
         `scoring_rules`, its `tools`; None until the ChatPod is up),
-        `env_status` / `env_status_message`, `agent_online`, the limits
+        `env_status` (the error text behind an `"error"` is creator-only:
+        `chat_admin()`), `agent_online`, the limits
         (`turn_timeout_sec`, `max_turns_per_session`,
         `max_sessions_per_participant`; a None limit is unlimited),
         `participant` (your group on this challenge: `submission_id`,
