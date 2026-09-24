@@ -1,90 +1,97 @@
-# mlarena-sdk
+# mlarena-sdk — Python SDK
 
-**Purpose:** Python SDK that wraps the public ML Arena REST API (`/api/...`). Lets users make submissions, author challenges, manage academic courses, and read leaderboards from a notebook or script.
+**Purpose**: Python client (`mlarena-sdk` 3.0.0 on PyPI, import `mlarena`) over the public backend REST routes (`/api/*`).
 
-**Key Features:**
-- Bearer-token auth with scope-segmented keys (`mlk_user_…`, `mlk_creator_…`, `mlk_teacher_…`).
-- One-shot helpers (`submit`, `status`, `leaderboard`) layered on top of the granular REST methods.
-- 2.0.0 speaks only the renamed wire (`/api/challenges`, `/api/submissions`, `challenge_*` / `submission_*` keys). Old **Python** names still resolve through `_RENAMED_METHODS` / `_LEGACY_KWARGS` / `_deprecated_alias` at the bottom of `client.py`.
-- No `/api/sdk/*` namespace — the SDK calls the same canonical blueprints the React frontend calls.
+**Key features**:
+- Bearer-token auth with scope-segmented keys `mlk_<scope>_<lookup>_<secret>` (`user`, `creator`, `teacher`).
+- One method per backend route, plus client-side compositions (`submit`, `status`, `tail_logs`, `resolve_runtime`, `download_dataset`, `chat`, `author_course_from_dir`, `export_course_to_dir`) that add no endpoint.
+- Reads the backend's names as served (snake_case `LeaderboardRow`, `RunResult`, the submission status block); keeps no status set or key map of its own.
+- Deprecated Python names from before the challenge/submission rename still resolve (published client).
 
-**Links:**
-- API contract: [`../backend/PROCESS.md`](../backend/PROCESS.md) (route groups)
-- Frontend consumer of the same routes: [`../frontend/PROCESS.md`](../frontend/PROCESS.md)
-- [`../ARCHITECTURE.md`](../ARCHITECTURE.md) — end-to-end request trace
+**Links**: [`../ARCHITECTURE.md`](../ARCHITECTURE.md) · [`../backend/PROCESS.md`](../backend/PROCESS.md) (route groups, schemas) · [`../frontend/PROCESS.md`](../frontend/PROCESS.md) (peer consumer) · [`../CLAUDE.md`](../CLAUDE.md) (parity rule) · [`../docs/drift_alignment.md`](../docs/drift_alignment.md) §5 (parity gaps)
 
-## Frontend ↔ SDK parity rule (load-bearing)
+## Parity rule
 
-**The SDK and the React console (frontend) are peers over the same REST surface. Every user-facing workflow must be reachable from both.**
-
-- No SDK-only endpoint. No frontend-only endpoint. No `/api/sdk/*` blueprint.
-- When you add a backend route for the frontend, the SDK gets a method with matching semantics in the same change. When you add a method here, the frontend hook is expected to use the same route.
-- When you change a route's contract (path, payload, status codes, auth scope), update both consumers in lockstep — the SDK's `client.py` and the corresponding `frontend/src/services/*` + `frontend/src/hooks/**`.
-- Auth is the *only* legitimate axis of divergence: the frontend uses session cookies, the SDK uses bearer tokens. The route, payload, and response shape must not branch on the caller.
-- If a workflow genuinely needs SDK-only ergonomics (e.g. `submit()` bundling create + upload + deploy), build it as a *client-side composition of the public routes* — not a new backend endpoint.
-
-Reviewers should reject PRs that introduce SDK-exclusive or frontend-exclusive routes.
+The SDK and the React console are peers over one REST surface; every user-facing workflow is reachable from both.
+- No `/api/sdk/*`, no SDK-only or frontend-only route. A route change updates `mlarena/client.py` and `frontend/src/services/*` (+ hook) in the same change.
+- Auth is the only divergence: session cookie (console) vs bearer token (SDK). Route, payload and response never branch on the caller.
+- SDK ergonomics are compositions of public routes, never new endpoints.
 
 ## Module map
 
-| File | Purpose |
+| File | Role |
 |---|---|
-| `mlarena/__init__.py` | `connect(api_key, base_url=…)` factory returning `MLArenaClient` |
-| `mlarena/client.py` | All REST methods; mirrors backend route groups |
-| `mlarena/chat.py` | `ChatConversation` — `client.chat(cid)`, the notebook face of a chat challenge (a composition of the `/api/chat/*` methods, no endpoint) |
-| `mlarena/exceptions.py` | `MLArenaError`, `AuthenticationError` (+ `PermissionDeniedError`), `NotFoundError` with `ChallengeNotFoundError` (old name `CompetitionNotFoundError` is the same class), `SubmissionNotFoundError`, `ChatSessionNotFoundError`, `SubmissionError` |
+| `mlarena/__init__.py` | `connect(api_key, base_url="https://ml-arena.com", allow_insecure=False)` → `MLArenaClient`; refuses `http://` to a non-loopback host unless `allow_insecure`. `__version__`. |
+| `mlarena/client.py` | `MLArenaClient`: every REST method; `_handle_response` / `_failed` error mapping; `_RENAMED_METHODS`, `_LEGACY_KWARGS`, `_deprecated_alias` at the bottom. |
+| `mlarena/chat.py` | `ChatConversation` (`client.chat(cid)`): `say`, `reset`, `transcript`, `total_amount_eur` — a loop over the `/api/chat/*` methods. |
+| `mlarena/exceptions.py` | `MLArenaError` (`status_code`, `body`) → `AuthenticationError` (401) → `PermissionDeniedError` (403); `NotFoundError` → `ChallengeNotFoundError`, `SubmissionNotFoundError`, `ChatSessionNotFoundError`; `MaintenanceError` (503 with `maintenance_mode: true`; any other 503 stays `MLArenaError`); `SubmissionError`. |
+| `tests/` | Offline unit tests (`test_submissions_and_compat.py`, `test_chat.py`, `test_course_content.py`, `test_creator.py`, `test_teacher_admin.py`, `test_teams.py`). |
 
-## Method ↔ route groups
+## Methods ↔ routes
 
-Methods on `MLArenaClient` map 1:1 to backend blueprints — same shape the frontend uses.
-
-| SDK method group | Backend blueprint | Frontend equivalent |
+| Methods | Backend routes | Frontend service |
 |---|---|---|
-| `challenges()`, `challenge()`, `datasets()`, `download_dataset()`, `recent_replays()`, `list_tags()` | `/api/challenges`, `/api/challenge_tags` | `services/apiService.ts`, `pages/Challenge/View.js` (datasets), `components/Challenge/RecentReplays.js`, `hooks/creatorChallenge/useTags.ts` |
-| `update_challenge_configuration` (admin account: engine pin, runtime, step limits) | `PUT /api/challenges/{id}/configuration` | `hooks/creatorChallenge/useAdmin.ts` |
-| `create_challenge`, `update_challenge`, `update_settings`, `set_challenge_tags`, `upload_env_file`, `update_env_file_content`, `set_challenge_image`, `set_challenge_markdown`, `upload_benchmark_file`, `update_benchmark_file_content`, `run_benchmark`, `benchmark_status`, `create_dataset`, `upload_dataset_file`, `start_challenge`, `update_agent_template` | `/api/creator_challenge/*` (`…/challenge/{id}/agent-template` keeps its segment) | `services/creatorChallengeApi.ts` + `hooks/creatorChallenge/*` |
-| `create_submission`, `copyable_submissions`, `upload_submission_file`, `update_submission_file_content`, `list_submission_files`, `get_submission_file_content`, `download_submission_file`, `delete_submission_file`, `upload_submission_docs`, `delete_submission_docs`, `deploy_submission`, `submission_deploy_status`, `submission_status`, `submission_games`, `tail_logs`, `runtime_options`, `agent_runtime`, `set_agent_runtime`, `resolve_runtime`, `delete_submission`, `my_submissions`, `set_submission_visibility`, `submission_overview`, `submit`, `status` | `/api/submissions/*` (`mine`, `challenge/{cid}/{sid}/…`, `challenge/{cid}/{sid}/file/{name}` download, `challenge/{cid}/{sid}/docs`, `copyable_submissions`, `submission/{sid}/games`, `submission/{sid}/visibility`, `runtime_options/{cid}`, `agent_runtime/{sid}`), `/api/submission_result/{cid}/{sid}/overview` | `hooks/Submission/*` (`useSubmission`, `useSubmissionDeploy`, `useSubmissionFileManagement`, `useRuntimeOptions`), `components/Submission/Monitor/DocumentationManager.tsx`, `components/Submission/NameYourSubmissionModal.tsx` |
-| `leaderboard` | `/api/leaderboard/challenge/{id}` | `services/leaderboardApi.ts`, `hooks/challenge/useLeaderboardData` |
-| `data_source_weather_coverage`, `data_source_weather_series`, `data_source_weather_snapshot`, `data_source_weather_cities`, `data_source_news_volume`, `data_source_news_sources` (public, no scope) | `/api/data_sources/weather/{coverage,series,snapshot,cities}`, `/api/data_sources/news/{volume,sources}` — read proxy over the data-collection sidecar; a challenge's slice is `challenge(id)["data_source_asset"]`; sidecar down ⇒ 503 `{"error","upstream":"data_collection"}` raised as `MLArenaError`, unknown city ⇒ `NotFoundError` | `services/dataSourcesApi.ts` |
-| `chat_challenge`, `open_chat_session`, `chat_session`, `send_chat_message`, `close_chat_session`, `export_chat_session` (user scope); `chat_admin`, `update_chat_settings`, `chat_sessions`, `void_chat_session`, `unvoid_chat_session`, `export_chat_evidence` (creator scope) | `/api/chat/*` — participant: `challenge/{cid}`, `challenge/{cid}/sessions`, `sessions/{sid}`, `sessions/{sid}/messages`, `sessions/{sid}/close`, `sessions/{sid}/export?format=`; creator: `challenge/{cid}/admin`, `challenge/{cid}/settings`, `challenge/{cid}/sessions?status=`, `sessions/{sid}/void`, `sessions/{sid}/unvoid`, `challenge/{cid}/export` (plan `docs/plan_chat_kernel.md` §5) | `services/chatApi.ts`, `pages/Chat/ChatPage.tsx` (`useChatSession`), creator editor `sections/ChatSection.tsx` + `sections/ChatSessionsSection.tsx` |
-| `chat(cid)` → `ChatConversation.say` / `reset` / `transcript` / `total_eur` | *(client-side composition — no endpoint)* | *(SDK-only ergonomic, like `submit()`; the console's `ChatPage` is the same loop over the same routes)* |
+| `me` | `/api/auth/current_user` | `context/AuthContext.tsx` |
+| `profile`, `update_profile` | `/api/profile/`, `/api/profile/update` | `apiService.ts` |
+| `challenge_team`, `create_team`, `update_team`, `delete_team`, `leave_team`, `remove_team_member`, `search_teams`, `invite_to_team`, `pending_invitations`, `received_invitations`, `respond_to_invitation`, `cancel_invitation` | `/api/teams/*` | `teamsApi.ts` |
+| `challenges`, `challenge`, `datasets`, `recent_replays`, `update_challenge_configuration` (admin) | `/api/challenges/*` | `apiService.ts` |
+| `list_tags` | `/api/challenge_tags/tags` | `apiService.ts` |
+| `creator_challenges`, `creator_challenge`, `available_kinds`, `copyable_challenges`, `create_challenge`, `update_challenge`, `update_settings`, `challenge_tags`, `set_challenge_tags`, `list_env_files`, `upload_env_file`, `update_env_file_content`, `delete_env_file`, `check_env`, `sync_env_from_github`, `challenge_image`, `set_challenge_image`, `delete_challenge_image`, `challenge_markdown`, `set_challenge_markdown`, `list_benchmark_files`, `upload_benchmark_file`, `update_benchmark_file_content`, `delete_benchmark_file`, `run_benchmark`, `benchmark_status`, `start_challenge`, `stop_challenge`, `update_agent_template`, `csv_ground_truth`, `create_dataset`, `creator_datasets`, `upload_dataset_file`, `update_dataset`, `delete_dataset`, `delete_dataset_file`, `creator_runs`, `creator_submissions`, `clean_redeploy_submission`, `clean_redeploy_all`, `soft_delete_submission`, `challenge_assistants`, `add_challenge_assistant`, `remove_challenge_assistant` | `/api/creator_challenge/*` | `creatorChallengeApi.ts` |
+| `create_submission`, `copyable_submissions`, `upload_submission_file`, `update_submission_file_content`, `list_submission_files`, `get_submission_file_content`, `download_submission_file`, `delete_submission_file`, `upload_submission_docs`, `delete_submission_docs`, `deploy_submission`, `submission_deploy_status`, `submission_status`, `submission_games`, `set_submission_visibility`, `runtime_options`, `agent_runtime`, `set_agent_runtime`, `delete_submission`, `my_submissions` | `/api/submissions/*` | `submissionsApi.ts` |
+| `submission_overview` | `/api/submission_result/{cid}/{sid}/overview` | `submissionsApi.ts` |
+| `leaderboard` | `/api/leaderboard/challenge/{id}` | `leaderboardApi.ts` |
+| `global_ranking`, `user_global_rank` | `/api/ranking/`, `/api/ranking/user/{id}` | `leaderboardApi.ts` |
+| `data_source_weather_{coverage,series,snapshot,cities}`, `data_source_news_{volume,sources}` | `/api/data_sources/*` | `dataSourcesApi.ts` |
+| `chat_challenge`, `open_chat_session`, `chat_session`, `send_chat_message`, `close_chat_session`, `export_chat_session` (user); `chat_admin`, `update_chat_settings`, `chat_sessions`, `void_chat_session`, `unvoid_chat_session`, `export_chat_evidence` (creator) | `/api/chat/*` | `chatApi.ts` |
+| `create_course`, `list_courses`, `enrollment_info`, `enroll_in_course` | `/api/academic_courses/`, `/api/academic_courses/enroll/{join_code}` | `coursesApi.ts` |
+| `course_catalog`, `course`, `module_overview`, `lesson`, `mark_lesson_viewed`, `mark_lesson_complete`, `mark_lesson_incomplete`, `my_progress`, `download_lesson_media` | `/api/academic_courses/*` (consumption, assets) | `coursesApi.ts` |
+| `create_module`, `list_modules`, `get_module`, `update_module`, `delete_module`, `fork_module`, `attach_challenge`, `update_challenge_link`, `detach_challenge`, `reorder_module_challenges` | `/api/teacher/modules/*` | `coursesApi.ts` |
+| `create_lesson`, `get_lesson`, `update_lesson`, `delete_lesson`, `reorder_lessons`, `list_lesson_media`, `upload_lesson_media`, `delete_lesson_media`, `preview_lesson` | `/api/teacher/lessons/*`, `/api/teacher/modules/{id}/lessons*` | `coursesApi.ts` |
+| `update_course`, `set_course_cover`, `list_course_modules`, `link_module`, `unlink_module`, `reorder_modules`, `add_course_challenge`, `remove_course_challenge`, `course_progress` | `/api/teacher/course/{id}/*` | `coursesApi.ts` |
+| `teacher_courses`, `challenges_for_course`, `course_students`, `remove_student`, `export_course_csv` | `/api/teacher/courses`, `/api/teacher/challenges-for-course`, `/api/teacher/students/{cid}`, `/api/teacher/student/{cid}/{uid}`, `/api/teacher/export-csv/{cid}` | `coursesApi.ts` |
+| `course_assistants`, `add_course_assistant`, `remove_course_assistant`, `course_cover` | `/api/teacher/course/{id}/assistants*`, `/api/academic_courses/assets/courses/{id}/cover` | `coursesApi.ts` |
+| `submit`, `status`, `tail_logs`, `resolve_runtime`, `download_dataset`, `chat`, `author_course_from_dir`, `export_course_to_dir` | compositions — no endpoint | — |
 
-`leaderboard` rows carry `MetricsSchema` (the challenge's declared metric columns) and `MeanMetricsDetail` (the precomputed per-metric aggregate) — passthrough columns in the returned DataFrame, no client code needed. `update_settings` accepts `evaluation_metrics_schema` (ordered descriptor list) + `evaluation_frontend_precision` to author them; `source:"env"` descriptor keys are exactly what `env.evaluate` must return in `metrics_detail`. `update_settings(submission_filename=…)` names a file_v1 challenge's upload (e.g. `submission.csv.gz`, which skips the `y_test.csv` column check); pair it with `upload_benchmark_file(id, path, filename=…)` for a binary benchmark — `update_benchmark_file_content` is text-only.
-| `create_course`, `enroll_in_course`, `enrollment_info`, `list_courses` | `/api/academic_courses/` (list/enroll/create) | `services/coursesApi.ts`, `pages/EnrollPage.tsx` |
-| `course_catalog`, `course`, `module_overview`, `lesson`, `mark_lesson_viewed`, `mark_lesson_complete`, `my_progress` | `/api/academic_courses/*` (consumption — catalog/landing/module/lesson/progress) | `services/coursesApi.ts` (learner, `04`) |
-| `create_module`, `list_modules`, `get_module`, `update_module`, `delete_module`, `fork_module`, `attach_challenge`, `update_challenge_link`, `detach_challenge`, `reorder_module_challenges` | `/api/teacher/modules/*` | `services/coursesApi.ts` + `hooks/courseAuthoring/*` (`03`) |
-| `create_lesson`, `get_lesson`, `update_lesson`, `delete_lesson`, `reorder_lessons`, `list_lesson_media`, `upload_lesson_media`, `download_lesson_media`, `delete_lesson_media`, `preview_lesson` | `/api/teacher/lessons/*`, `/api/teacher/modules/{id}/lessons/*` | `services/coursesApi.ts` + `hooks/courseAuthoring/*` (`03`) |
-| `update_course`, `set_course_cover`, `list_course_modules`, `link_module`, `unlink_module`, `reorder_modules`, `course_progress` | `/api/teacher/course/{id}/*` | `services/coursesApi.ts` + `hooks/courseAuthoring/*` (`03`) |
-| `author_course_from_dir`, `export_course_to_dir` | *(client-side compositions — no endpoint)* | *(SDK-only ergonomic, like `submit()`)* |
+When this table drifts from `client.py`, fix the code, not the table.
 
-When the table above drifts from `client.py`, fix `client.py` — the table is a parity contract.
+### Parity gaps (frontend-only routes, no SDK method)
 
-Payload keys are the backend's exactly (its request schemas are `extra="forbid"`): `submission_name`, `copy_from_submission_id`, `copy_from_challenge_id`, `max_active_submissions_per_participant`, `challenge_id` (module attach body and `list_courses` query). `submit()` returns `{"submission_id", "deploy"}`.
+- The public overview markdown / miniature reads (`GET /api/challenge_asset/*`) have no participant method; creators read them through `challenge_markdown` / `challenge_image`. Every other participant, creator and teacher route has its method (table above).
+- By design console-only: admin cluster-ops (engines, maintenance, data-quality, admin runs, tag CRUD), and **API-key management**. `GET /api/auth/api_keys` and `POST /api/auth/api_keys/{scope}/rotate` are `session_auth_required`: they answer 403 to a bearer caller, so that a leaked `mlk_user_…` key cannot mint a `mlk_creator_…` one for the same account. An SDK method would only ever raise 403, so there is none — `me()` covers "who am I", and keys are rotated from the console's Profile page. This is the auth axis of the parity rule, not a gap.
 
-**Submission status is one block on the wire.** Every reply carrying a submission's `status` carries the same flat fields (`status`, `phase`, `last_status_message`, `status_update_ts`, `is_uploadable`, `is_deployable`, `is_settled`) — the backend's `SubmissionStatusFields`, the same block the console reads. The SDK **gates on those served fields and keeps no status set of its own**: `tail_logs()` stops on `is_settled`, `submit()` deploys only when `is_deployable`. `submission_status()` returns `submission_name` (not `name`); `/submissions/mine` rows send `phase` / `last_status_message` (not `lifecycle` / `error_info`) and no `is_started` — "is it live" is `status == "active"`. `is_started` on a *challenge* is a different field and is unchanged. The `course.yaml` manifest read by `author_course_from_dir` accepts the pre-2.0 keys `competitions:` / `competition_id:` permanently (files on teachers' disks); `export_course_to_dir` writes `challenges:` / `challenge_id:`.
+## Contracts
 
-**Chat challenges** (kernel `chat_v1`, plan `docs/plan_chat_kernel.md` §11) take conversations, not files: there is no upload and no deploy, the group's submission is created by the server on the first `open_chat_session` (born `active`), and `POST /api/submissions/challenge/<cid>` refuses such a challenge with 409. `open_chat_session` sends `{"charter_accepted": true}` — calling it is accepting the charter (`chat_challenge(cid)["manifest"]["charter_md"]`). `send_chat_message(wait=True)` is a composition of the message route and `chat_session` polling (700 ms, the console's cadence) until *that* `turn_id` is `completed` or `failed`; a failed turn raises `MLArenaError` with the turn's `error_message`. Money rides as two-decimal strings (`"300.00"`); the SDK returns them as served, and only `ChatConversation.total_eur` parses one into a `Decimal`. A 404 is `ChallengeNotFoundError` on a challenge-scoped route and `ChatSessionNotFoundError` on a session-scoped one. `update_chat_settings` sends only the keywords passed (sentinel default), so an explicit `None` clears `max_turns_per_session` / `max_sessions_per_participant`; `llm_api_key=""` clears the key, which is never read back (`llm_api_key_set`). Payload keys are the backend's exactly: `charter_accepted`, `content`, `reason`, `llm_base_url`, `llm_model`, `llm_api_key`, `turn_timeout_sec`, `max_turns_per_session`, `max_sessions_per_participant`.
+- **Data feed** — `update_settings` carries the admin-only `data_source_*` + `batch_cron` keywords (sentinel `_UNSET` = not sent, `None` = null; `data_source_filter` is `dict[str, str]`); the backend answers 403 to a non-admin. `data_source_weather_series(city_name, country_code)` sends the response's own keys.
+- **Payload keys are the backend's exactly** (request schemas are `extra="forbid"`): e.g. `submission_name`, `copy_from_submission_id`, `copy_from_challenge_id`, `max_active_submissions_per_participant`, `challenge_id`; chat `charter_accepted`, `content`, `reason`, `llm_base_url`, `llm_model`, `llm_api_key`, `turn_timeout_sec`, `max_turns_per_session`, `max_sessions_per_participant`.
+- **Submission status block** — every reply carrying a submission's `status` carries `SubmissionStatusFields` (`backend/app/views/submissions/_schemas.py`): `status`, `phase`, `last_status_message`, `status_update_ts`, `is_uploadable`, `is_deployable`, `is_settled`. `status` ∈ `SubmissionStatus` (`modelmanager/modelmanager/submissions.py`): `created`, `upload_failed`, `upload_validated`, `deploy_queue`, `deploy_run`, `deploy_failed`, `active`, `deleted`. The SDK gates on the served flags: `tail_logs` stops on `is_settled`; `submit` deploys only when `is_deployable` and returns `{"submission_id", "deploy"}`; `submit(wait=True)` returns an `active` submission or raises `SubmissionError`. `/submissions/mine` serves no `deleted` rows.
+- **Run model** — `submission_status()["run_info"]["results"]` and `submission_games()["games"]` rows are the backend's `RunResult` (`backend/app/views/run_serializers.py`): run columns (`job_status`, `env_nb_steps`, `env_error_type`, `env_error_message`, env metrics) + `submission_results` (one `RunSubmissionResult` per agent: `submission_id`, `submission_reward`, `agent_nb_steps`, `game_outcome`, `agent_error_type`, `agent_error_message`, `agent_stdout_logs`). The caller finds its own row by `submission_id`; `env_*` diagnostics are null on participant routes. Games rows add `signed_url`, `render_delay_second`. `run_benchmark` / `benchmark_status` return the creator's latest benchmark run in the same shape (with the env diagnostics), `benchmark_status` `None` before the first run; the backend scores the benchmark submission when the run completes.
+- **Kinds** — `available_kinds()` rows carry `kernel_version` (the name every payload uses, `creator_challenge()["configuration"]` and `creator_challenges()` rows included) and closed `capabilities`: `agent_template`, `benchmark`, `dataset`, `env_structural_check`, `runs`, `chat`.
+- **Errors** — every refusal goes through `_handle_response` (401/403/404) or `_failed` (other codes) and carries `status_code` + `body`; no API call ends on `requests.raise_for_status()` (the signed-GCS fetch in `download_dataset` is the one exception, pinned by `test_no_api_call_ends_on_raise_for_status`). A deploy 409 body carries `deployment_limits` and `active_submission_limits`.
+- **Leaderboard** — `leaderboard(challenge_id, top=None, *, aggregate=None, course_id=None, me=False, q=None, window=None)` sends only the passed keys (`limit`, `aggregate`, `course_id`, `me`, `q`, `window`). The backend serves one `LeaderboardEnvelope` (`backend/app/views/_schemas.py`); the method returns its `leaders` as a DataFrame of `LeaderboardRow` with every other key (`challenge`, `total`, `me`, `matches`, `course_context`) on `df.attrs`, or the envelope dict as served without pandas.
+- **Chat challenges** (`chat_v1`) — no upload/deploy; the team's submission is created by the first `open_chat_session` (born `active`; `create_submission` answers 409). `send_chat_message(wait=True)` sends (202 `{"turn", "message"}`) and polls `chat_session` every 0.7 s until that turn is `completed` or `failed`. Money is served as two-decimal strings; only `ChatConversation.total_amount_eur` parses a `Decimal`. The group's cumulative euros and per-rule scoreboard are `participant.total_amount_eur` / `participant.scoreboard` on both the challenge view and the session view. `update_chat_settings` sends only the keywords passed (`None` clears a limit, `llm_api_key=""` clears the key; the key is never read back, only `llm_api_key_set`).
+- **Course manifest** — `author_course_from_dir` / `export_course_to_dir` compose the authoring/consumption methods. `course.yaml` is written with `challenges:` / `challenge_id:`; the old `competitions:` / `competition_id:` keys are read forever (permanent input aliases — CLAUDE.md, "Vocabulary"). A module block's `is_published` defaults to true. The consumption payload names the attached challenge `challenge: {id, name}`, so the export reads `c["challenge"]["id"]` to write the manifest's `challenge_id`.
+- **Course payload names** — a course object carries `has_cover` (never the stored `cover_image_path`: the catalog and the landing are public reads and an NFS path would publish the share's layout) and the client builds the image URL from the course id (`course_cover` / `courseCoverUrl`); a module object is keyed `id` and a link object carries `module_id`/`challenge`; an enrollment row is keyed `user_id` and dated `enrolled_at_ts`; the enroll-info payload nests the course under `course`. A course's module row carries `layout` (`simple` | `advanced`) — the platform's own rule, not a client guess.
 
-`create_module(..., is_published=False)` / `update_module(id, is_published=…)` toggle the student-facing draft gate (distinct from `visibility`, which is teacher reuse); a manifest module block takes the same `is_published` key, defaulting to true so existing course dirs publish unchanged.
+## Deprecated aliases (frozen — CLAUDE.md, "Vocabulary")
 
-The course-content methods mirror the routes in `02-BACKEND-API.md` (`backend/app/views/teacher/{modules,lessons,course_content}.py` and `backend/app/views/academic_courses/{consumption,legacy,course_assets}.py`). `author_course_from_dir` / `export_course_to_dir` are pure compositions of the public authoring/consumption methods — they add no endpoint (the `submit()` idiom).
+- `_RENAMED_METHODS`: old method names (`competitions`, `create_competition`, `deploy_agent`, `agent_status`, `agent_games`, …) warn (`DeprecationWarning`) and call the new method. The module raises at import if a target method is missing.
+- `_LEGACY_KWARGS`: old keyword names (`competition_id`, `agent_id`, `agent_name`, …) are accepted on every public method; passing both spellings raises `TypeError`.
+- `CompetitionNotFoundError` is `ChallengeNotFoundError`. `PermissionDeniedError` subclasses `AuthenticationError`, so `except AuthenticationError` still catches a 403.
 
 ## Auth scopes
 
-Token scope is encoded in the second segment (`mlk_<scope>_<lookup>_<secret>`). The backend's `auth_required` decorator enforces it:
+Enforced by `auth_required` / `user_satisfies_scope` in `backend/app/auth/decorators.py`; the scope set is `API_KEY_SCOPES` in `modelmanager/modelmanager/api_keys.py`.
+- `user` — own submissions, chat as participant, enroll, course reading and own lesson progress.
+- `creator` — `/api/creator_challenge/*` and the chat creator routes, on challenges the user owns or assists.
+- `teacher` — `/api/teacher/*` and `create_course`.
+- Admins may mint every scope. `@login_required` routes accept any bearer token (Flask-Login `request_loader` → `load_user_from_request`). Public reads still send the token, because `challenges`, `challenge` and `leaderboard` answer differently to an identified caller.
 
-- `user` — make and manage own submissions, chat with a chat challenge's agent (`open_chat_session`, `send_chat_message`, …), enroll in courses, read course content + write own lesson progress (`mark_lesson_*`, `my_progress`).
-- `creator` — create / update / start challenges you own (also requires ownership or admin), including a chat challenge's LLM settings and session review (`chat_admin`, `update_chat_settings`, `void_chat_session`, …).
-- `teacher` — author course content (`create_module`, `create_lesson`, `link_module`, …) and create academic courses. The `/api/teacher/*` routes require a `teacher`-scope token specifically.
-
-Every read sends the bearer token, public routes included: `challenges`, `challenge` and `leaderboard` answer differently to a caller they can identify (enrolled-course and hidden challenges, `IsMySubmission`), so an anonymous read is not the same read. Course **consumption reads** (`course_catalog`, `course`, `module_overview`, `lesson`) are public for public/unlisted courses; gated lessons and progress writes require any authenticated token (they use `@login_required`, so a `user` token is enough — the bearer token authenticates via the backend's `request_loader`). A scope mismatch returns 403; the SDK surfaces this as `AuthenticationError`.
-
-## Local dev
+## Commands
 
 ```bash
-cd mlarena-sdk
-pip install -e .
-python -c "import mlarena; c = mlarena.connect(api_key='mlk_…', base_url='http://localhost:5000'); print(c.challenges())"
+pip install -e mlarena-sdk                                  # Python >= 3.10; pandas optional ([pandas] extra)
+backend/.venv/bin/python -m pytest mlarena-sdk/tests -q     # offline unit tests (pytest, requests, pandas)
+python -c "import mlarena; c = mlarena.connect('mlk_…', base_url='http://localhost:4999'); print(c.challenges())"
 ```
 
-Point `base_url` at the local backend (`http://localhost:5000`) for end-to-end tests against minikube; the SDK has no local-mode shortcuts.
+The local backend is `http://localhost:4999` (`kubectl port-forward svc/backend 4999:4999`); seeded deterministic keys are in `tests-dummy/.dummy-keys.json` ([`../tests-dummy/README.md`](../tests-dummy/README.md)). `mlarena-sdk/` is its own repository (gitignored here); its `README.md` is the user-facing reference.

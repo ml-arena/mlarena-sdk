@@ -25,6 +25,7 @@ from mlarena.exceptions import (
     AuthenticationError,
     ChallengeNotFoundError,
     ChatSessionNotFoundError,
+    MaintenanceError,
     MLArenaError,
     NotFoundError,
     PermissionDeniedError,
@@ -87,13 +88,20 @@ class MLArenaClient:
         client never read.
         """
         if resp.status_code == 401:
-            raise AuthenticationError(
-                _safe_error(resp, "Invalid or missing API credentials.")
-            )
+            raise _error(AuthenticationError, resp,
+                         _safe_error(resp, "Invalid or missing API credentials."))
         if resp.status_code == 403:
-            raise PermissionDeniedError(_safe_error(resp, "Access denied"))
+            raise _error(PermissionDeniedError, resp,
+                         _safe_error(resp, "Access denied"))
         if resp.status_code == 404:
-            raise not_found(_safe_error(resp, "Not found"))
+            raise _error(not_found, resp, _safe_error(resp, "Not found"))
+        if resp.status_code == 503:
+            body = _json_body(resp)
+            # Only the backend's maintenance gate sets the flag; any other 503
+            # (a data source proxy, an ingress) is left to the caller.
+            if body is not None and body.get("maintenance_mode") is True:
+                raise _error(MaintenanceError, resp,
+                             _safe_error(resp, "Platform under maintenance"))
         return resp
 
     def _request(self, method: str, url: str, **kwargs) -> requests.Response:
@@ -113,13 +121,14 @@ class MLArenaClient:
 
         Mirrors ``GET /api/profile/`` — the same data the console's Profile
         page loads (username, email, bio, links, student identity, avatar_key,
-        enrollments). Works with any valid token scope since the token itself
-        identifies the user.
+        enrollments). Each enrollment is ``{"course": {"id", "name"},
+        "project_url", "enrolled_at_ts"}``. Works with any valid token scope
+        since the token itself identifies the user.
         """
         resp = self._request("GET", self._url("/profile/"), headers=self._headers())
         self._handle_response(resp)
         if resp.status_code != 200:
-            raise MLArenaError(f"profile failed: {_safe_error(resp)}")
+            raise _failed(MLArenaError, "profile", resp)
         return resp.json()
 
     def update_profile(self, *,
@@ -165,7 +174,217 @@ class MLArenaClient:
         )
         self._handle_response(resp)
         if resp.status_code != 200:
-            raise MLArenaError(f"update_profile failed: {_safe_error(resp)}")
+            raise _failed(MLArenaError, "update_profile", resp)
+        return resp.json()
+
+    def me(self) -> dict:
+        """Who this token belongs to, and what it may reach.
+
+        Mirrors ``GET /api/auth/current_user`` — the same payload the console
+        loads on every page. Keys: ``is_authenticated``, ``id``, ``username``,
+        ``email``, ``avatar_key``, ``is_admin``, ``is_teacher``, ``is_creator``,
+        ``is_human_verified``, ``has_teacher_access``, ``has_creator_access``
+        (the real creator rule — the flag *or* admin *or* a creator-assistant
+        row) and ``can_create_course``. Every key is always present.
+
+        Note the route answers to any scope, but the *flags* describe the
+        account, not the token: a ``mlk_user_…`` token on an admin account
+        still reports ``is_admin: true`` while being refused admin routes.
+
+        Listing or rotating API keys is deliberately **not** offered here:
+        ``/api/auth/api_keys`` and ``/api/auth/api_keys/<scope>/rotate``
+        answer 403 to a bearer caller, so that a leaked ``user`` key cannot
+        mint a ``creator`` one. Rotate keys from the console's Profile page.
+        """
+        resp = self._request("GET", self._url("/auth/current_user"),
+                             headers=self._headers())
+        self._handle_response(resp)
+        if resp.status_code != 200:
+            raise _failed(MLArenaError, "me", resp)
+        return resp.json()
+
+    # ---- Teams (per-challenge; any token scope) ----
+    #
+    # A team is a participant action, so every route below is `user`-scoped:
+    # any valid token reaches it. One team per challenge per user; the team a
+    # submission is attributed to is the one these methods manage.
+    #
+    # Shapes mirror the response models in backend/app/views/_schemas.py. A
+    # team carries `id`, `challenge_id`, `name`, `looking_for_members`,
+    # `created_at_ts`, `members` (each: `id` — the membership row id —,
+    # `user_id`, `username`, `avatar_key`, `role`) and `my_role`, your own
+    # role on it ("leader", "member" or None). An invitation carries `id`,
+    # `team_id`, `team_name`, `user_id`, `username`, `sender_id`,
+    # `sender_username`, `status` and `created_at_ts`.
+
+    def challenge_team(self, challenge_id: int) -> dict:
+        """Your team for a challenge.
+
+        Mirrors ``GET /api/teams/challenge/{id}/team``. Raises
+        ``ChallengeNotFoundError`` when you are not on a team for it (the
+        route's 404), so ``my_role`` is never None on a returned team.
+        """
+        resp = self._request("GET", self._url(f"/teams/challenge/{challenge_id}/team"),
+                             headers=self._headers())
+        self._handle_response(resp)
+        if resp.status_code != 200:
+            raise _failed(MLArenaError, "challenge_team", resp)
+        return resp.json()
+
+    def create_team(self, challenge_id: int, name: str) -> dict:
+        """Create a team for a challenge; you become its leader.
+
+        Mirrors ``POST /api/teams/challenge/{id}/team``. 400 if you are
+        already on a team for that challenge.
+        """
+        resp = self._request("POST", self._url(f"/teams/challenge/{challenge_id}/team"),
+                             headers=self._headers(json_body=True),
+                             json={"name": name})
+        self._handle_response(resp)
+        if resp.status_code != 201:
+            raise _failed(MLArenaError, "create_team", resp)
+        return resp.json()
+
+    def update_team(self, team_id: int, name: str,
+                    looking_for_members: bool | None) -> dict:
+        """Rename a team / flip its "looking for members" flag (leader only).
+
+        Mirrors ``PUT /api/teams/{team_id}``: the route takes both keys, so
+        both are required here — pass the team's current value for the one you
+        are not changing.
+        """
+        resp = self._request("PUT", self._url(f"/teams/{team_id}"),
+                             headers=self._headers(json_body=True),
+                             json={"name": name,
+                                   "looking_for_members": looking_for_members})
+        self._handle_response(resp)
+        if resp.status_code != 200:
+            raise _failed(MLArenaError, "update_team", resp)
+        return resp.json()
+
+    def delete_team(self, team_id: int) -> dict:
+        """Delete a team, its members and its invitations (leader only).
+
+        Mirrors ``DELETE /api/teams/{team_id}``.
+        """
+        resp = self._request("DELETE", self._url(f"/teams/{team_id}"),
+                             headers=self._headers())
+        self._handle_response(resp)
+        if resp.status_code != 200:
+            raise _failed(MLArenaError, "delete_team", resp)
+        return resp.json()
+
+    def leave_team(self, team_id: int) -> dict:
+        """Leave a team you are a plain member of.
+
+        Mirrors ``POST /api/teams/{team_id}/leave``. A leader cannot leave
+        (400) — they delete the team instead.
+        """
+        resp = self._request("POST", self._url(f"/teams/{team_id}/leave"),
+                             headers=self._headers())
+        self._handle_response(resp)
+        if resp.status_code != 200:
+            raise _failed(MLArenaError, "leave_team", resp)
+        return resp.json()
+
+    def remove_team_member(self, team_id: int, member_id: int) -> dict:
+        """Remove a member from your team (leader only).
+
+        Mirrors ``DELETE /api/teams/{team_id}/members/{member_id}``.
+        ``member_id`` is the membership row id — ``member["id"]`` of a team's
+        ``members``, not ``member["user_id"]``.
+        """
+        resp = self._request("DELETE", self._url(f"/teams/{team_id}/members/{member_id}"),
+                             headers=self._headers())
+        self._handle_response(resp)
+        if resp.status_code != 200:
+            raise _failed(MLArenaError, "remove_team_member", resp)
+        return resp.json()
+
+    def search_teams(self, challenge_id: int, q: str) -> dict:
+        """Users you could invite: up to 5 whose username contains ``q``.
+
+        Mirrors ``GET /api/teams/search``. Scoped to one challenge on purpose
+        — only users who already have a submission on it are listed, so this
+        is not an open username-enumeration oracle. Returns
+        ``{"users": [{"id", "username", "avatar_key"}, ...]}``.
+        """
+        resp = self._request("GET", self._url("/teams/search"),
+                             params={"q": q, "challenge_id": challenge_id},
+                             headers=self._headers())
+        self._handle_response(resp)
+        if resp.status_code != 200:
+            raise _failed(MLArenaError, "search_teams", resp)
+        return resp.json()
+
+    def invite_to_team(self, team_id: int, user_id: int) -> dict:
+        """Invite a user onto your team (leader only).
+
+        Mirrors ``POST /api/teams/{team_id}/invitations`` and returns the
+        created invitation. 409 if the recipient is already on a team for the
+        challenge, 400 if an invitation is already pending for them.
+        """
+        resp = self._request("POST", self._url(f"/teams/{team_id}/invitations"),
+                             headers=self._headers(json_body=True),
+                             json={"user_id": user_id})
+        self._handle_response(resp)
+        if resp.status_code != 201:
+            raise _failed(MLArenaError, "invite_to_team", resp)
+        return resp.json()
+
+    def pending_invitations(self, team_id: int) -> list:
+        """The invitations your team has out (leader only).
+
+        Mirrors ``GET /api/teams/{team_id}/invitations/pending``.
+        """
+        resp = self._request("GET", self._url(f"/teams/{team_id}/invitations/pending"),
+                             headers=self._headers())
+        self._handle_response(resp)
+        if resp.status_code != 200:
+            raise _failed(MLArenaError, "pending_invitations", resp)
+        return resp.json()
+
+    def received_invitations(self) -> list:
+        """The pending team invitations addressed to you.
+
+        Mirrors ``GET /api/teams/invitations/received``.
+        """
+        resp = self._request("GET", self._url("/teams/invitations/received"),
+                             headers=self._headers())
+        self._handle_response(resp)
+        if resp.status_code != 200:
+            raise _failed(MLArenaError, "received_invitations", resp)
+        return resp.json()
+
+    def respond_to_invitation(self, invitation_id: int, accept: bool) -> dict:
+        """Accept or decline an invitation addressed to you.
+
+        Mirrors ``POST /api/teams/invitations/{id}/respond`` and returns the
+        settled invitation (its ``status`` is now "accepted" or "declined").
+
+        Accepting is refused with 409 when the team would go over the
+        challenge's active-submission limit; that body carries
+        ``combined_active``, ``max_active_submissions`` and ``excess`` — read
+        them off ``err.body``.
+        """
+        resp = self._request("POST", self._url(f"/teams/invitations/{invitation_id}/respond"),
+                             headers=self._headers(json_body=True),
+                             json={"accept": accept})
+        self._handle_response(resp)
+        if resp.status_code != 200:
+            raise _failed(MLArenaError, "respond_to_invitation", resp)
+        return resp.json()
+
+    def cancel_invitation(self, invitation_id: int) -> dict:
+        """Cancel a pending invitation your team sent (leader only).
+
+        Mirrors ``DELETE /api/teams/invitations/{id}``.
+        """
+        resp = self._request("DELETE", self._url(f"/teams/invitations/{invitation_id}"),
+                             headers=self._headers())
+        self._handle_response(resp)
+        if resp.status_code != 200:
+            raise _failed(MLArenaError, "cancel_invitation", resp)
         return resp.json()
 
     # ---- Challenges (public read; create/update via creator scope) ----
@@ -184,6 +403,14 @@ class MLArenaClient:
         With no args, returns all matching challenges as a DataFrame
         (auto-paginates internally). Pass ``page``/``per_page`` to fetch a
         single page; pass ``q``/``tags``/``status`` to filter server-side.
+        ``status`` is ``"active"`` (only started challenges, the default) or
+        ``"all"`` — the route knows no other value and answers 400.
+
+        Each row carries ``id``, ``name``, ``description``, ``miniature``,
+        ``is_started``, ``is_award_points``, ``number_of_agents``, ``tags``,
+        ``statistics`` and ``course`` — ``{"id", "name", "code"}`` on the
+        enrolled-course rows, null elsewhere. Call ``challenge(id)`` for the
+        engine, the kernel and the limits.
         """
         base_params: dict = {}
         if q:
@@ -200,7 +427,9 @@ class MLArenaClient:
             params = {**base_params, "page": page or 1, "per_page": per_page or 24}
             resp = self._request("GET", self._url("/challenges/"), params=params,
                                  headers=self._headers(), timeout=30)
-            resp.raise_for_status()
+            self._handle_response(resp)
+            if resp.status_code != 200:
+                raise _failed(MLArenaError, "challenges", resp)
             return _to_dataframe(resp.json().get("items", []))
 
         items: list = []
@@ -210,7 +439,9 @@ class MLArenaClient:
             params = {**base_params, "page": page_n, "per_page": per_page_n}
             resp = self._request("GET", self._url("/challenges/"), params=params,
                                  headers=self._headers(), timeout=30)
-            resp.raise_for_status()
+            self._handle_response(resp)
+            if resp.status_code != 200:
+                raise _failed(MLArenaError, "challenges", resp)
             body = resp.json()
             items.extend(body.get("items", []))
             if not body.get("metadata", {}).get("has_next"):
@@ -226,7 +457,7 @@ class MLArenaClient:
         Mirrors `GET /api/challenges/{id}` (`challenges.py`, `get_challenge`).
 
         Includes an `engine` sub-object with the engine's
-        `k8s_workload_value` plus `vm_health_ok` / `vm_health_checked_at`
+        `k8s_workload_value` plus `vm_health_ok` / `vm_health_checked_at_ts`
         (only populated for `local_vm` engines, polled every minute by
         simulationmanager). `vm_health_ok=False` means the GPU VM is
         currently unreachable and submissions will queue rather than run.
@@ -236,15 +467,14 @@ class MLArenaClient:
         resp = self._request("GET", self._url(f"/challenges/{challenge_id}"),
                              headers=self._headers(), timeout=30)
         self._handle_response(resp)
-        resp.raise_for_status()
+        if resp.status_code != 200:
+            raise _failed(MLArenaError, "challenge", resp)
         return resp.json()
 
     # The infrastructure fields the console's admin panel edits
     # (`frontend/src/hooks/creatorChallenge/useAdmin.ts`, `emptyConfigFields`).
     _ADMIN_CONFIGURATION_FIELDS = frozenset({
-        "engine_id", "docker_image_env_runtime_id",
-        "agent_max_time_per_step_second", "env_max_time_per_step_second",
-        "simulation_max_steps", "render_delay_second",
+        "engine_id", "docker_image_env_runtime_id", "render_delay_second",
     })
 
     def update_challenge_configuration(self, challenge_id: int, **fields) -> dict:
@@ -252,10 +482,15 @@ class MLArenaClient:
 
         Mirrors `PUT /api/challenges/{id}/configuration` — the call the
         console's admin panel makes to repoint a challenge at another engine.
-        Accepts `engine_id`, `docker_image_env_runtime_id`,
-        `agent_max_time_per_step_second`, `env_max_time_per_step_second`,
-        `simulation_max_steps`, `render_delay_second`; an unknown field raises
-        before any request. Only the fields you pass are changed.
+        Accepts `engine_id`, `docker_image_env_runtime_id` and
+        `render_delay_second`; an unknown field raises before any request.
+        Only the fields you pass are changed.
+
+        The step deadlines and the step budget (`agent_max_time_per_step_second`,
+        `env_max_time_per_step_second`, `simulation_max_steps`, admin only),
+        the simulation timeout and the upload / submission limits are
+        `update_settings()`, which owns their bounds and their
+        frozen-after-start rules.
 
         A new challenge gets the default engine of its kind; pinning one with
         more memory (e.g. `engine_id=...` for a scorer that needs 3Gi) is this
@@ -281,8 +516,7 @@ class MLArenaClient:
             raise AuthenticationError(
                 "update_challenge_configuration requires an admin account")
         if resp.status_code != 200:
-            raise MLArenaError(
-                f"update_challenge_configuration failed: {_safe_error(resp)}")
+            raise _failed(MLArenaError, "update_challenge_configuration", resp)
         return resp.json()
 
     def creator_challenges(self) -> list:
@@ -304,7 +538,70 @@ class MLArenaClient:
         )
         self._handle_response(resp)
         if resp.status_code != 200:
-            raise MLArenaError(f"creator_challenges failed: {_safe_error(resp)}")
+            raise _failed(MLArenaError, "creator_challenges", resp)
+        return resp.json()
+
+    def creator_challenge(self, challenge_id: int) -> dict:
+        """The challenge as its editor sees it (creator scope).
+
+        Mirrors `GET /api/creator_challenge/challenge/{id}`
+        (`lifecycle.py`, `get_creator_challenge`). Returns the challenge plus
+        its three sibling rows as three objects, each under its own column
+        names: `configuration` (engine, runtime image, step deadlines, upload
+        limits, `submission_filename`, the GitHub sync), `evaluation`
+        (`metric`, `metric_order`, `is_elo_score`, the ELO parameters, the
+        episode budget brackets, `metrics_schema`) and `environment` (the
+        latest benchmark run's `benchmark_simulation_result_id` and
+        `attach_path_files`). The configuration's `kernel_version` is the
+        env runtime's kernel. Also `engine_name`, the
+        engine health subset, and `role` — `"owner"` or `"assistant"`.
+
+        Unlike `challenge()` this works on your own hidden challenges and
+        shows the authoring state; `challenge()` is the participant view.
+
+        Requires a `creator`-scope token and ownership (or admin) of the
+        challenge.
+        """
+        return self._creator_get(challenge_id, "", "creator_challenge")
+
+    def available_kinds(self) -> list:
+        """The challenge kinds `create_challenge` accepts (creator scope).
+
+        Mirrors `GET /api/creator_challenge/available_kinds` (`kinds.py`).
+        Each entry carries `kernel_version` (what `create_challenge` takes),
+        `label`, `description`, `protocol`, `isolation`, `has_engine`,
+        `capabilities` (`agent_template`, `benchmark`, `dataset`,
+        `env_structural_check`, `runs`, `chat`) and
+        `minimal_loop_snippet`. `has_engine` is False when
+        the deployment has no engine for that kernel, and creating one then
+        answers 503.
+        """
+        resp = self._request("GET",
+            self._url("/creator_challenge/available_kinds"),
+            headers=self._headers(),
+            timeout=30,
+        )
+        self._handle_response(resp)
+        if resp.status_code != 200:
+            raise _failed(MLArenaError, "available_kinds", resp)
+        return resp.json()
+
+    def copyable_challenges(self) -> dict:
+        """The challenges `create_challenge(copy_from_challenge_id=…)` accepts.
+
+        Mirrors `GET /api/creator_challenge/copyable_challenges`
+        (`lifecycle.py`). Returns `{"challenges": [{"id", "name",
+        "is_started", "engine_name"}]}` — the ones you own (a challenge you
+        only assist on is not a copy source).
+        """
+        resp = self._request("GET",
+            self._url("/creator_challenge/copyable_challenges"),
+            headers=self._headers(),
+            timeout=30,
+        )
+        self._handle_response(resp)
+        if resp.status_code != 200:
+            raise _failed(MLArenaError, "copyable_challenges", resp)
         return resp.json()
 
     def datasets(self, challenge_id: int) -> dict:
@@ -326,7 +623,7 @@ class MLArenaClient:
         )
         self._handle_response(resp)
         if resp.status_code != 200:
-            raise MLArenaError(f"datasets failed: {_safe_error(resp)}")
+            raise _failed(MLArenaError, "datasets", resp)
         return resp.json()
 
     def download_dataset(self, challenge_id: int, dest_dir: str = ".") -> list[str]:
@@ -407,13 +704,19 @@ class MLArenaClient:
         )
         self._handle_response(resp)
         if resp.status_code not in (200, 201):
-            raise MLArenaError(f"create_challenge failed: {_safe_error(resp)}")
+            raise _failed(MLArenaError, "create_challenge", resp)
         return resp.json()
 
     def list_tags(self):
-        """Return the public tag catalog. No auth required."""
-        resp = self._request("GET",self._url("/challenge_tags/tags"), timeout=30)
-        resp.raise_for_status()
+        """Return the tag catalog (`GET /api/challenge_tags/tags`).
+
+        A public route; the bearer token travels anyway, as on every read.
+        """
+        resp = self._request("GET", self._url("/challenge_tags/tags"),
+                             headers=self._headers(), timeout=30)
+        self._handle_response(resp)
+        if resp.status_code != 200:
+            raise _failed(MLArenaError, "list_tags", resp)
         return _to_dataframe(resp.json())
 
     def set_challenge_tags(self, challenge_id: int,
@@ -439,7 +742,47 @@ class MLArenaClient:
         )
         self._handle_response(resp)
         if resp.status_code != 200:
-            raise MLArenaError(f"set_challenge_tags failed: {_safe_error(resp)}")
+            raise _failed(MLArenaError, "set_challenge_tags", resp)
+        return resp.json()
+
+    def challenge_tags(self, challenge_id: int) -> list:
+        """The tags currently on a challenge (creator scope).
+
+        Mirrors `GET /api/creator_challenge/challenge/{id}/tags`
+        (`tags.py`). Returns the tag rows (`id`, `name`, `description`);
+        `set_challenge_tags()` replaces the set.
+        """
+        return self._creator_get(challenge_id, "/tags", "challenge_tags")
+
+    def _creator_get(self, challenge_id: int, suffix: str, label: str,
+                     params: dict | None = None):
+        """GET one creator_challenge sub-resource of a challenge.
+
+        Every creator read answers the same way — 404 for a challenge you
+        cannot edit, the handler's own `error` otherwise — so they share one
+        call site instead of fifteen copies of it.
+        """
+        resp = self._request("GET",
+            self._url(f"/creator_challenge/challenge/{challenge_id}{suffix}"),
+            headers=self._headers(),
+            params=params,
+            timeout=30,
+        )
+        self._handle_response(resp)
+        if resp.status_code != 200:
+            raise _failed(MLArenaError, label, resp)
+        return resp.json()
+
+    def _creator_delete(self, challenge_id: int, suffix: str, label: str):
+        """DELETE one creator_challenge sub-resource of a challenge."""
+        resp = self._request("DELETE",
+            self._url(f"/creator_challenge/challenge/{challenge_id}{suffix}"),
+            headers=self._headers(),
+            timeout=30,
+        )
+        self._handle_response(resp)
+        if resp.status_code != 200:
+            raise _failed(MLArenaError, label, resp)
         return resp.json()
 
     def _resolve_tag_names(self, tag_names: list[str]) -> list[int]:
@@ -449,8 +792,11 @@ class MLArenaClient:
         local seeds them as "gymnasium", and callers shouldn't have to know
         which environment they hit.
         """
-        catalog_resp = self._request("GET",self._url("/challenge_tags/tags"), timeout=30)
-        catalog_resp.raise_for_status()
+        catalog_resp = self._request("GET", self._url("/challenge_tags/tags"),
+                                     headers=self._headers(), timeout=30)
+        self._handle_response(catalog_resp)
+        if catalog_resp.status_code != 200:
+            raise _failed(MLArenaError, "list_tags", catalog_resp)
         catalog = catalog_resp.json()
         by_name_ci = {t["name"].casefold(): t["id"] for t in catalog}
         unknown = [n for n in tag_names if n.casefold() not in by_name_ci]
@@ -494,7 +840,7 @@ class MLArenaClient:
         )
         self._handle_response(resp)
         if resp.status_code != 200:
-            raise MLArenaError(f"update_challenge failed: {_safe_error(resp)}")
+            raise _failed(MLArenaError, "update_challenge", resp)
         return resp.json()
 
     def update_settings(self, challenge_id: int, *,
@@ -503,28 +849,41 @@ class MLArenaClient:
                         max_upload_files: int | None = None,
                         max_active_submissions_per_participant: int | None = None,
                         submission_filename: str | None = None,
-                        evaluation_metric: str | None = None,
-                        evaluation_metric2: str | None = None,
-                        evaluation_is_elo_score: bool | None = None,
-                        evaluation_metric_order: str | None = None,
-                        evaluation_is_stop_after_deployment: bool | None = None,
-                        evaluation_deployment_nb_constraint_run: int | None = None,
-                        evaluation_deployment_nb_initial_score_run: int | None = None,
-                        evaluation_episode_budget_brackets: list | None = None,
-                        evaluation_frontend_precision: int | None = None,
-                        evaluation_metrics_schema: list | None = None,
+                        agent_max_time_per_step_second: float | None = None,
+                        env_max_time_per_step_second: float | None = None,
+                        simulation_max_steps: int | None = None,
+                        metric: str | None = None,
+                        metric2: str | None = None,
+                        is_elo_score: bool | None = None,
+                        metric_order: str | None = None,
+                        is_stop_after_deployment: bool | None = None,
+                        deployment_nb_constraint_run: int | None = None,
+                        deployment_nb_initial_score_run: int | None = None,
+                        episode_budget_brackets: list | None = None,
+                        frontend_precision: int | None = None,
+                        metrics_schema: list | None = None,
+                        data_source_enabled: bool | _Unset = _UNSET,
+                        data_source_url: str | None | _Unset = _UNSET,
+                        data_source_asset: str | None | _Unset = _UNSET,
+                        data_source_filter: dict[str, str] | None | _Unset = _UNSET,
+                        data_source_history_hours: int | _Unset = _UNSET,
+                        batch_cron: str | _Unset = _UNSET,
                         ) -> dict:
         """Update challenge settings + evaluation parameters.
 
         Mirrors `PUT /api/creator_challenge/challenge/{id}/settings` —
         the same call the console's Settings tab makes via `saveSettings()`.
         Only fields explicitly passed are sent; everything else is left
-        untouched. Once the challenge has started only the fields that cannot
-        rescore an existing run still apply — the leaderboard labels
-        (`evaluation_metric`, `evaluation_metric2`,
-        `evaluation_frontend_precision`) and
-        `evaluation_is_stop_after_deployment`; everything else is rejected
-        with 400 until the challenge is stopped.
+        untouched. Every keyword is the column's own name: the first eight
+        and the data-feed ones are ChallengeConfiguration columns, the rest
+        are Evaluation columns. Once
+        the challenge has started only the fields that cannot rescore an
+        existing run still apply — the leaderboard labels (`metric`,
+        `metric2`, `frontend_precision`) and `is_stop_after_deployment`;
+        everything else is rejected with 400 until the challenge is stopped.
+
+        Returns `{"configuration": {...}, "evaluation": {...}}` — the two rows
+        as the update left them, each under its own column names.
 
         Notable parameters:
             submission_filename: file_v1 only — the one file a participant
@@ -535,38 +894,38 @@ class MLArenaClient:
                 column check at upload and the y_test.csv start requirement,
                 so env.py must validate the file itself. Frozen once the
                 challenge has started.
-            evaluation_metric: free-text label for the primary metric (e.g.
-                "reward", "accuracy", "bleu"). The DB column is String(20).
-            evaluation_is_elo_score: when True, the leaderboard ranks by
-                ELO rather than mean metric (multi-agent kernels).
-            evaluation_metric_order: "desc" (the default: a higher score is
-                better) or "asc" (a lower score is better, e.g. RMSE). Decides
-                who wins each run, the episode budget tiers and, unless the
-                challenge is ELO-ranked (ELO is always higher-is-better), the
+            metric: free-text label for the primary metric (e.g. "reward",
+                "accuracy", "bleu"). The DB column is String(20).
+            is_elo_score: when True, the leaderboard ranks by ELO rather than
+                mean metric (multi-agent kernels).
+            metric_order: "desc" (the default: a higher score is better) or
+                "asc" (a lower score is better, e.g. RMSE). Decides who wins
+                each run, the episode budget tiers and, unless the challenge
+                is ELO-ranked (ELO is always higher-is-better), the
                 leaderboard order and course pass verdicts. Frozen once the
                 challenge has started; refused on an ELO challenge whose
                 submissions already have ratings. Checked against the stored
                 brackets and metrics schema, so a flip may need new brackets
                 in the same call.
-            evaluation_is_stop_after_deployment: True (the creation default)
-                means an agent runs only its deployment runs and is never
-                matched again, which pins an ELO leaderboard to its bootstrap
-                ratings forever. Set False to let the matchmaker keep pairing
-                agents (~10 matches per challenge every 2h). Editable on a
-                running challenge.
-            evaluation_episode_budget_brackets: episode budget tiers, a list
-                of `[threshold, n_episodes]` pairs from the worst threshold to
+            is_stop_after_deployment: True (the creation default) means an
+                agent runs only its deployment runs and is never matched
+                again, which pins an ELO leaderboard to its bootstrap ratings
+                forever. Set False to let the matchmaker keep pairing agents
+                (~10 matches per challenge every 2h). Editable on a running
+                challenge.
+            episode_budget_brackets: episode budget tiers, a list of
+                `[threshold, n_episodes]` pairs from the worst threshold to
                 the best. A submission whose running mean is worse than a
                 tier's threshold gets that tier's episodes; one that beats
                 every threshold gets the last tier's. Thresholds strictly
                 ascending under metric_order "desc", strictly descending
                 under "asc"; n_episodes non-decreasing; max 100 episodes per
                 bracket. A single pair is a fixed budget.
-            evaluation_frontend_precision: decimal places for numeric
-                leaderboard metrics (default 2). Per-metric `precision` in
-                the schema overrides it.
-            evaluation_metrics_schema: the canonical leaderboard metric
-                declaration — an ordered list of descriptors, e.g.
+            frontend_precision: decimal places for numeric leaderboard
+                metrics (default 2). Per-metric `precision` in the schema
+                overrides it.
+            metrics_schema: the canonical leaderboard metric declaration —
+                an ordered list of descriptors, e.g.
                 `[{"key": "accuracy", "label": "Accuracy", "source": "env",
                    "agg": "mean", "format": "percent"},
                   {"key": "ram_max", "label": "RAM Max", "source": "platform",
@@ -574,43 +933,65 @@ class MLArenaClient:
                 `source:"env"` keys are exactly what `env.evaluate` must
                 return in each `agent_results[i]["metrics_detail"]`
                 (equal-mapping, enforced at run time). See the leaderboard
-                envelope's per-row `MetricsSchema` field. A `higher_is_better`
+                row's `metrics_schema` column. A `higher_is_better`
                 on the `reward` descriptor must match metric_order.
+
+        Run limits (admin only — anyone else gets `PermissionDeniedError`,
+        403; strictly positive; frozen while the challenge runs):
+            agent_max_time_per_step_second: deadline of one agent call
+                (`AgentProxy.call`), in seconds.
+            env_max_time_per_step_second: deadline of one env step, in
+                seconds.
+            simulation_max_steps: the step budget of one simulation.
+
+        Data feed (admin only — anyone else gets `PermissionDeniedError`,
+        403; frozen while the challenge runs). Each is sent only when passed,
+        and `None` is sent as null where the column allows it:
+            data_source_enabled: stage `{data_source_url}/{data_source_asset}`
+                for env.py on every `batch_cron` tick (a continuous
+                challenge). Enabling needs a URL and an asset.
+            data_source_url / data_source_asset: the DC API base URL and
+                the asset path under it (e.g. ".../api-dc", "weather");
+                None clears one on a disabled feed.
+            data_source_filter: extra query parameters, string values only,
+                e.g. `{"cities": "Paris:FR,Berlin:DE"}`; None clears it.
+            data_source_history_hours: hours of history per batch (1..9600).
+            batch_cron: the UTC cron schedule of fetches and runs.
 
         Requires a `creator`-scope token and ownership (or admin) of the
         target challenge.
         """
-        body: dict = {}
-        if simulation_timeout_sec is not None:
-            body["simulation_timeout_sec"] = simulation_timeout_sec
-        if max_upload_size_bytes is not None:
-            body["max_upload_size_bytes"] = max_upload_size_bytes
-        if max_upload_files is not None:
-            body["max_upload_files"] = max_upload_files
-        if max_active_submissions_per_participant is not None:
-            body["max_active_submissions_per_participant"] = max_active_submissions_per_participant
-        if submission_filename is not None:
-            body["submission_filename"] = submission_filename
-        if evaluation_metric is not None:
-            body["evaluation_metric"] = evaluation_metric
-        if evaluation_metric2 is not None:
-            body["evaluation_metric2"] = evaluation_metric2
-        if evaluation_is_elo_score is not None:
-            body["evaluation_is_elo_score"] = evaluation_is_elo_score
-        if evaluation_metric_order is not None:
-            body["evaluation_metric_order"] = evaluation_metric_order
-        if evaluation_is_stop_after_deployment is not None:
-            body["evaluation_is_stop_after_deployment"] = evaluation_is_stop_after_deployment
-        if evaluation_deployment_nb_constraint_run is not None:
-            body["evaluation_deployment_nb_constraint_run"] = evaluation_deployment_nb_constraint_run
-        if evaluation_deployment_nb_initial_score_run is not None:
-            body["evaluation_deployment_nb_initial_score_run"] = evaluation_deployment_nb_initial_score_run
-        if evaluation_episode_budget_brackets is not None:
-            body["evaluation_episode_budget_brackets"] = evaluation_episode_budget_brackets
-        if evaluation_frontend_precision is not None:
-            body["evaluation_frontend_precision"] = evaluation_frontend_precision
-        if evaluation_metrics_schema is not None:
-            body["evaluation_metrics_schema"] = evaluation_metrics_schema
+        sent = {
+            "simulation_timeout_sec": simulation_timeout_sec,
+            "max_upload_size_bytes": max_upload_size_bytes,
+            "max_upload_files": max_upload_files,
+            "max_active_submissions_per_participant":
+                max_active_submissions_per_participant,
+            "submission_filename": submission_filename,
+            "agent_max_time_per_step_second": agent_max_time_per_step_second,
+            "env_max_time_per_step_second": env_max_time_per_step_second,
+            "simulation_max_steps": simulation_max_steps,
+            "metric": metric,
+            "metric2": metric2,
+            "is_elo_score": is_elo_score,
+            "metric_order": metric_order,
+            "is_stop_after_deployment": is_stop_after_deployment,
+            "deployment_nb_constraint_run": deployment_nb_constraint_run,
+            "deployment_nb_initial_score_run": deployment_nb_initial_score_run,
+            "episode_budget_brackets": episode_budget_brackets,
+            "frontend_precision": frontend_precision,
+            "metrics_schema": metrics_schema,
+        }
+        body = {key: value for key, value in sent.items() if value is not None}
+        feed = {
+            "data_source_enabled": data_source_enabled,
+            "data_source_url": data_source_url,
+            "data_source_asset": data_source_asset,
+            "data_source_filter": data_source_filter,
+            "data_source_history_hours": data_source_history_hours,
+            "batch_cron": batch_cron,
+        }
+        body.update({key: value for key, value in feed.items() if value is not _UNSET})
         if not body:
             raise MLArenaError("update_settings requires at least one field")
         resp = self._request("PUT",
@@ -621,7 +1002,49 @@ class MLArenaClient:
         )
         self._handle_response(resp)
         if resp.status_code != 200:
-            raise MLArenaError(f"update_settings failed: {_safe_error(resp)}")
+            raise _failed(MLArenaError, "update_settings", resp)
+        return resp.json()
+
+    def list_env_files(self, challenge_id: int) -> dict:
+        """The challenge's env folder, as the editor lists it (creator scope).
+
+        Mirrors `GET /api/creator_challenge/challenge/{id}/env/files`
+        (`env_files.py`). Returns `{"files": {"<name>": {"content",
+        "language", "is_binary", "size"}}}`; a binary file has `content: null`
+        and is reachable only through the console's download.
+        """
+        return self._creator_get(challenge_id, "/env/files", "list_env_files")
+
+    def delete_env_file(self, challenge_id: int, filename: str) -> dict:
+        """Delete one file from the challenge's env folder (creator scope).
+
+        Mirrors `DELETE /api/creator_challenge/challenge/{id}/env/files/{name}`
+        (`env_files.py`). Refused once the challenge has started, and `env.py`
+        itself cannot be deleted — the challenge would have nothing to run.
+        """
+        return self._creator_delete(
+            challenge_id, f"/env/files/{filename}", "delete_env_file"
+        )
+
+    def check_env(self, challenge_id: int, content: str = "") -> dict:
+        """Validate an `env.py` buffer without saving it (creator scope).
+
+        Mirrors `POST /api/creator_challenge/challenge/{id}/env/check`
+        (`env_files.py`) — the structural check the console runs as you type:
+        `class Env`, its `evaluate` signature, the returned `agent_results`
+        keys. Pass the buffer you are about to save; the empty default reports
+        the missing-source case. Returns the validator's findings, not a
+        pass/fail HTTP status.
+        """
+        resp = self._request("POST",
+            self._url(f"/creator_challenge/challenge/{challenge_id}/env/check"),
+            headers=self._headers(json_body=True),
+            json={"content": content},
+            timeout=30,
+        )
+        self._handle_response(resp)
+        if resp.status_code != 200:
+            raise _failed(MLArenaError, "check_env", resp)
         return resp.json()
 
     def upload_env_file(self, challenge_id: int, file_path: str) -> dict:
@@ -644,7 +1067,7 @@ class MLArenaClient:
             )
         self._handle_response(resp)
         if resp.status_code not in (200, 201):
-            raise MLArenaError(f"upload_env_file failed: {_safe_error(resp)}")
+            raise _failed(MLArenaError, "upload_env_file", resp)
         return resp.json()
 
     def sync_env_from_github(
@@ -675,7 +1098,7 @@ class MLArenaClient:
         )
         self._handle_response(resp)
         if resp.status_code != 200:
-            raise MLArenaError(f"sync_env_from_github failed: {_safe_error(resp)}")
+            raise _failed(MLArenaError, "sync_env_from_github", resp)
         return resp.json()
 
     def update_env_file_content(self, challenge_id: int, filename: str,
@@ -696,7 +1119,7 @@ class MLArenaClient:
         )
         self._handle_response(resp)
         if resp.status_code != 200:
-            raise MLArenaError(f"update_env_file_content failed: {_safe_error(resp)}")
+            raise _failed(MLArenaError, "update_env_file_content", resp)
         return resp.json()
 
     def set_challenge_image(self, challenge_id: int, image_path: str) -> dict:
@@ -717,8 +1140,50 @@ class MLArenaClient:
             )
         self._handle_response(resp)
         if resp.status_code not in (200, 201):
-            raise MLArenaError(f"set_challenge_image failed: {_safe_error(resp)}")
+            raise _failed(MLArenaError, "set_challenge_image", resp)
         return resp.json()
+
+    def challenge_image(self, challenge_id: int, dest_dir: str = ".") -> str:
+        """Download the challenge thumbnail (`miniature.png`); returns the path.
+
+        Mirrors `GET /api/creator_challenge/challenge/{id}/image`
+        (`assets.py`), the creator-scoped read of the same file the public
+        `/api/challenge_asset/{id}/image/miniature` serves. Raises
+        `ChallengeNotFoundError` when the challenge has no image yet.
+        """
+        os.makedirs(dest_dir, exist_ok=True)
+        resp = self._request("GET",
+            self._url(f"/creator_challenge/challenge/{challenge_id}/image"),
+            headers=self._headers(),
+            timeout=120,
+            stream=True,
+        )
+        self._handle_response(resp)
+        if resp.status_code != 200:
+            raise _failed(MLArenaError, "challenge_image", resp)
+        out_path = os.path.join(dest_dir, "miniature.png")
+        with open(out_path, "wb") as fh:
+            for chunk in resp.iter_content(chunk_size=1 << 20):
+                if chunk:
+                    fh.write(chunk)
+        return out_path
+
+    def delete_challenge_image(self, challenge_id: int) -> dict:
+        """Remove the challenge thumbnail (`miniature.png`).
+
+        Mirrors `DELETE /api/creator_challenge/challenge/{id}/image`
+        (`assets.py`). The challenge card then renders without one.
+        """
+        return self._creator_delete(challenge_id, "/image", "delete_challenge_image")
+
+    def challenge_markdown(self, challenge_id: int) -> dict:
+        """The challenge overview markdown (`overview.md`), creator scope.
+
+        Mirrors `GET /api/creator_challenge/challenge/{id}/markdown`
+        (`assets.py`). Returns `{"content": "..."}` — the empty string when
+        the creator has never written one.
+        """
+        return self._creator_get(challenge_id, "/markdown", "challenge_markdown")
 
     def set_challenge_markdown(self, challenge_id: int, content: str) -> dict:
         """Replace the challenge overview markdown (`overview.md`)."""
@@ -732,7 +1197,7 @@ class MLArenaClient:
         )
         self._handle_response(resp)
         if resp.status_code != 200:
-            raise MLArenaError(f"set_challenge_markdown failed: {_safe_error(resp)}")
+            raise _failed(MLArenaError, "set_challenge_markdown", resp)
         return resp.json()
 
     def upload_benchmark_file(self, challenge_id: int, file_path: str,
@@ -764,7 +1229,7 @@ class MLArenaClient:
             )
         self._handle_response(resp)
         if resp.status_code not in (200, 201):
-            raise MLArenaError(f"upload_benchmark_file failed: {_safe_error(resp)}")
+            raise _failed(MLArenaError, "upload_benchmark_file", resp)
         return resp.json()
 
     def update_benchmark_file_content(self, challenge_id: int, filename: str,
@@ -780,13 +1245,35 @@ class MLArenaClient:
         )
         self._handle_response(resp)
         if resp.status_code != 200:
-            raise MLArenaError(
-                f"update_benchmark_file_content failed: {_safe_error(resp)}"
-            )
+            raise _failed(MLArenaError, "update_benchmark_file_content", resp)
         return resp.json()
 
+    def list_benchmark_files(self, challenge_id: int) -> dict:
+        """The challenge's benchmark folder (creator scope).
+
+        Mirrors `GET /api/creator_challenge/challenge/{id}/benchmark/files`
+        (`benchmark.py`). Same shape as `list_env_files()`: the benchmark
+        `agent.py` on a code challenge, the benchmark submission file on a
+        file challenge.
+        """
+        return self._creator_get(
+            challenge_id, "/benchmark/files", "list_benchmark_files"
+        )
+
+    def delete_benchmark_file(self, challenge_id: int, filename: str) -> dict:
+        """Delete one benchmark file (creator scope).
+
+        Mirrors `DELETE
+        /api/creator_challenge/challenge/{id}/benchmark/files/{name}`
+        (`benchmark.py`). Refused once the challenge has started.
+        """
+        return self._creator_delete(
+            challenge_id, f"/benchmark/files/{filename}", "delete_benchmark_file"
+        )
+
     def run_benchmark(self, challenge_id: int) -> dict:
-        """Kick off the benchmark simulation. Returns `{simulation_id, status}`.
+        """Kick off the benchmark simulation. Returns the new run, in the
+        shape `benchmark_status` serves it (`job_status` `pending`).
 
         Requires that env.py has been uploaded and a benchmark `agent.py`
         (or the challenge's submission file for file_v1, e.g. submission.csv /
@@ -802,12 +1289,21 @@ class MLArenaClient:
         )
         self._handle_response(resp)
         if resp.status_code != 200:
-            raise MLArenaError(f"run_benchmark failed: {_safe_error(resp)}")
+            raise _failed(MLArenaError, "run_benchmark", resp)
         return resp.json()
 
-    def benchmark_status(self, challenge_id: int) -> dict:
-        """Read the latest benchmark run status. Status is one of
-        `none | running | completed | failed`.
+    def benchmark_status(self, challenge_id: int) -> dict | None:
+        """The latest benchmark run, or None before the first one.
+
+        Mirrors `GET /api/creator_challenge/challenge/{id}/benchmark/status`
+        (`benchmark.py`). The run is the same dict `creator_runs()` lists
+        (`RunResult`): `job_status` (`pending`, `running`, then `completed`,
+        `failed`, `reaped` or `cancelled`), `env_error_type` /
+        `env_error_message` / `env_stdout_logs`, the timestamps, and
+        `submission_results` — the benchmark submission's row, its score
+        under `submission_reward`. When the run completes cleanly the backend
+        scores the benchmark submission (`active`, `mean_reward`), which is
+        what `start_challenge` requires.
         """
         resp = self._request("GET",
             self._url(
@@ -817,7 +1313,8 @@ class MLArenaClient:
             timeout=30,
         )
         self._handle_response(resp)
-        resp.raise_for_status()
+        if resp.status_code != 200:
+            raise _failed(MLArenaError, "benchmark_status", resp)
         return resp.json()
 
     def start_challenge(self, challenge_id: int) -> dict:
@@ -836,7 +1333,7 @@ class MLArenaClient:
         )
         self._handle_response(resp)
         if resp.status_code != 200:
-            raise MLArenaError(f"start_challenge failed: {_safe_error(resp)}")
+            raise _failed(MLArenaError, "start_challenge", resp)
         return resp.json()
 
     def stop_challenge(self, challenge_id: int) -> dict:
@@ -856,7 +1353,7 @@ class MLArenaClient:
         )
         self._handle_response(resp)
         if resp.status_code != 200:
-            raise MLArenaError(f"stop_challenge failed: {_safe_error(resp)}")
+            raise _failed(MLArenaError, "stop_challenge", resp)
         return resp.json()
 
     def update_agent_template(self, challenge_id: int,
@@ -877,8 +1374,21 @@ class MLArenaClient:
         )
         self._handle_response(resp)
         if resp.status_code != 200:
-            raise MLArenaError(f"update_agent_template failed: {_safe_error(resp)}")
+            raise _failed(MLArenaError, "update_agent_template", resp)
         return resp.json()
+
+    def csv_ground_truth(self, challenge_id: int) -> dict:
+        """The parsed CSV ground-truth metadata of a file challenge.
+
+        Mirrors `GET /api/creator_challenge/challenge/{id}/csv-ground-truth`
+        (`agent_template.py`): the columns and separator the challenge's
+        `agent_template` declares, as the console shows them beside the
+        benchmark upload. Returns `{"ground_truth": {...}}`, or
+        `{"ground_truth": null}` when the template declares none.
+        """
+        return self._creator_get(
+            challenge_id, "/csv-ground-truth", "csv_ground_truth"
+        )
 
     def create_dataset(self, challenge_id: int, label: str,
                        description: str | None = None) -> dict:
@@ -904,7 +1414,7 @@ class MLArenaClient:
         )
         self._handle_response(resp)
         if resp.status_code not in (200, 201):
-            raise MLArenaError(f"create_dataset failed: {_safe_error(resp)}")
+            raise _failed(MLArenaError, "create_dataset", resp)
         return resp.json()
 
     def creator_datasets(self, challenge_id: int) -> dict:
@@ -924,7 +1434,7 @@ class MLArenaClient:
         )
         self._handle_response(resp)
         if resp.status_code != 200:
-            raise MLArenaError(f"creator_datasets failed: {_safe_error(resp)}")
+            raise _failed(MLArenaError, "creator_datasets", resp)
         return resp.json()
 
     def upload_dataset_file(self, challenge_id: int, dataset_id: int,
@@ -953,7 +1463,7 @@ class MLArenaClient:
             )
         self._handle_response(resp)
         if resp.status_code not in (200, 201):
-            raise MLArenaError(f"upload_dataset_file failed: {_safe_error(resp)}")
+            raise _failed(MLArenaError, "upload_dataset_file", resp)
         return resp.json()
 
     def update_dataset(self, challenge_id: int, dataset_id: int, *,
@@ -984,8 +1494,20 @@ class MLArenaClient:
         )
         self._handle_response(resp)
         if resp.status_code != 200:
-            raise MLArenaError(f"update_dataset failed: {_safe_error(resp)}")
+            raise _failed(MLArenaError, "update_dataset", resp)
         return resp.json()
+
+    def delete_dataset(self, challenge_id: int, dataset_id: int) -> dict:
+        """Delete a dataset and every file in it (creator scope).
+
+        Mirrors `DELETE
+        /api/creator_challenge/challenge/{id}/datasets/{dataset_id}`
+        (`datasets.py`). Refused once the challenge has started: participants
+        may already have trained on it.
+        """
+        return self._creator_delete(
+            challenge_id, f"/datasets/{dataset_id}", "delete_dataset"
+        )
 
     def delete_dataset_file(self, challenge_id: int, dataset_id: int,
                             file_id: int) -> dict:
@@ -1009,8 +1531,144 @@ class MLArenaClient:
         )
         self._handle_response(resp)
         if resp.status_code != 200:
-            raise MLArenaError(f"delete_dataset_file failed: {_safe_error(resp)}")
+            raise _failed(MLArenaError, "delete_dataset_file", resp)
         return resp.json()
+
+    # ---- Creator: runs, submissions and assistants (creator scope) ---------
+
+    def creator_runs(self, challenge_id: int) -> dict:
+        """The challenge's last 30 runs, with the env side's diagnostics.
+
+        Mirrors `GET /api/creator_challenge/challenge/{id}/runs` (`runs.py`).
+        Returns `{"runs": [...]}` — the same `RunResult` rows the submission
+        status and the admin runs page serve, but served to the creator with
+        the environment's error, its stdout and every agent's row inline.
+        Includes benchmark tests, deployment games and participant runs.
+        """
+        return self._creator_get(challenge_id, "/runs", "creator_runs")
+
+    def creator_submissions(self, challenge_id: int) -> dict:
+        """Every non-deleted submission on a challenge you own.
+
+        Mirrors `GET /api/creator_challenge/challenge/{id}/submissions`
+        (`submissions.py`). Returns `{"submissions": [...], "is_elo_score":
+        bool, "ranked_order": "asc"|"desc"}`; each row carries
+        `submission_id`, `submission_name`, `user_id`, `username`,
+        `created_at_ts`, `last_end_run_ts`, `elo_score`, `mean_reward`,
+        `number_of_runs`, `rank`, `restart_allowed` and the status block.
+        `rank` is over the active submissions only — the public leaderboard's
+        scope — and null otherwise.
+        """
+        return self._creator_get(
+            challenge_id, "/submissions", "creator_submissions"
+        )
+
+    def clean_redeploy_submission(self, challenge_id: int,
+                                  submission_id: int) -> dict:
+        """Wipe one submission's results and queue a fresh deployment.
+
+        Mirrors `POST
+        /api/creator_challenge/challenge/{cid}/submissions/{sid}/clean_redeploy`
+        (`submissions.py`) — the Restart button of the creator's submissions
+        tab. Allowed for an `active` or `deploy_failed` submission; anything
+        else is a 400 naming the status. Returns `submission_id`,
+        `deleted_results`, `deployment_id` and the submission's status block.
+
+        Use it after changing how a run is scored: the old results were
+        produced under the old rules, and this is what makes the leaderboard
+        comparable again.
+        """
+        resp = self._request("POST",
+            self._url(
+                f"/creator_challenge/challenge/{challenge_id}"
+                f"/submissions/{submission_id}/clean_redeploy"
+            ),
+            headers=self._headers(),
+            timeout=60,
+        )
+        self._handle_response(resp)
+        if resp.status_code != 200:
+            raise _failed(MLArenaError, "clean_redeploy_submission", resp)
+        return resp.json()
+
+    def clean_redeploy_all(self, challenge_id: int) -> dict:
+        """Clean and redeploy every eligible submission of a challenge.
+
+        Mirrors `POST
+        /api/creator_challenge/challenge/{id}/submissions/clean_redeploy_all`
+        (`submissions.py`). Returns `{"total", "redeployed": [...],
+        "failed": [{"submission_id", "error"}]}` — a per-submission failure
+        does not stop the others, so retry only what `failed` names.
+        """
+        resp = self._request("POST",
+            self._url(
+                f"/creator_challenge/challenge/{challenge_id}"
+                "/submissions/clean_redeploy_all"
+            ),
+            headers=self._headers(),
+            timeout=300,
+        )
+        self._handle_response(resp)
+        if resp.status_code != 200:
+            raise _failed(MLArenaError, "clean_redeploy_all", resp)
+        return resp.json()
+
+    def soft_delete_submission(self, challenge_id: int,
+                               submission_id: int) -> dict:
+        """Delete a participant's submission from a challenge you own.
+
+        Mirrors `DELETE
+        /api/creator_challenge/challenge/{cid}/submissions/{sid}`
+        (`submissions.py`). Removes the submitter's files, cancels any deploy
+        attempt still open and flips the row to `deleted` — the same effect as
+        the participant's own `delete_submission()`, from the creator's side.
+        Returns `submission_id` and the status block.
+        """
+        return self._creator_delete(
+            challenge_id, f"/submissions/{submission_id}",
+            "soft_delete_submission",
+        )
+
+    def challenge_assistants(self, challenge_id: int) -> list:
+        """The creator-assistants of a challenge.
+
+        Mirrors `GET /api/creator_challenge/challenge/{id}/assistants`
+        (`assistants.py`). Each entry carries `user_id`, `username` and
+        `created_at_ts`. An assistant has the creator's editing rights on this
+        challenge; only the owner may change the list.
+        """
+        return self._creator_get(
+            challenge_id, "/assistants", "challenge_assistants"
+        )
+
+    def add_challenge_assistant(self, challenge_id: int, username: str) -> dict:
+        """Grant a user the creator's rights on this challenge — owner only.
+
+        Mirrors `POST /api/creator_challenge/challenge/{id}/assistants`
+        (`assistants.py`). Returns `message`, `user_id` and `username`.
+        """
+        resp = self._request("POST",
+            self._url(f"/creator_challenge/challenge/{challenge_id}/assistants"),
+            headers=self._headers(json_body=True),
+            json={"username": username},
+            timeout=30,
+        )
+        self._handle_response(resp)
+        if resp.status_code not in (200, 201):
+            raise _failed(MLArenaError, "add_challenge_assistant", resp)
+        return resp.json()
+
+    def remove_challenge_assistant(self, challenge_id: int,
+                                   user_id: int) -> dict:
+        """Revoke a creator-assistant — owner only.
+
+        Mirrors `DELETE
+        /api/creator_challenge/challenge/{id}/assistants/{user_id}`
+        (`assistants.py`).
+        """
+        return self._creator_delete(
+            challenge_id, f"/assistants/{user_id}", "remove_challenge_assistant"
+        )
 
     # ---- Submissions (user scope) ----
 
@@ -1024,7 +1682,10 @@ class MLArenaClient:
         `{"message", "submission_id", "status", "validation_message",
         "template_source", ...}`.
 
-        Requires a `user`-scope token.
+        A 404 is `ChallengeNotFoundError`, or `SubmissionNotFoundError` when
+        `copy_from_submission_id` is given: the source ("Source submission not
+        found", also for a submission that is not yours) is the id most
+        likely to be wrong on that call. Requires a `user`-scope token.
         """
         body: dict = {"submission_name": submission_name}
         if copy_from_submission_id is not None:
@@ -1035,9 +1696,13 @@ class MLArenaClient:
             json=body,
             timeout=60,
         )
-        self._handle_response(resp)
+        self._handle_response(
+            resp,
+            not_found=(SubmissionNotFoundError if copy_from_submission_id is not None
+                       else ChallengeNotFoundError),
+        )
         if resp.status_code not in (200, 201):
-            raise SubmissionError(f"create_submission failed: {_safe_error(resp)}")
+            raise _failed(SubmissionError, "create_submission", resp)
         return resp.json()
 
     def upload_submission_file(self, challenge_id: int, submission_id: int,
@@ -1073,11 +1738,26 @@ class MLArenaClient:
             )
         self._handle_response(resp, not_found=SubmissionNotFoundError)
         if resp.status_code not in (200, 201):
-            raise SubmissionError(f"upload_submission_file failed: {_safe_error(resp)}")
+            raise _failed(SubmissionError, "upload_submission_file", resp)
         return resp.json()
 
     def deploy_submission(self, challenge_id: int, submission_id: int) -> dict:
-        """Trigger deployment of an uploaded submission."""
+        """Trigger deployment of an uploaded submission.
+
+        Mirrors `PUT /api/submissions/challenge/{cid}/{sid}/deploy`
+        (`deploy.py`). The backend answers 202 with `message`,
+        `deployment_id` and the status block as the transaction left it
+        (`status == "deploy_queue"`), so no second read is needed.
+
+        A refusal is a 409 raised as `SubmissionError`: the submission is not
+        in a deployable state, the daily deploy quota is used up, or the
+        participant already holds `max_active_submissions` slots. Its body,
+        on the error's `.body`, is `{"error", "deployment_limits",
+        "active_submission_limits"}` — the same two blocks
+        `submission_deploy_status()` returns, so the caller can read
+        `next_deploy_available_at` or `active_submissions_remaining` off the
+        exception without another call.
+        """
         resp = self._request("PUT",
             self._url(
                 f"/submissions/challenge/{challenge_id}/{submission_id}/deploy"
@@ -1087,7 +1767,7 @@ class MLArenaClient:
         )
         self._handle_response(resp, not_found=SubmissionNotFoundError)
         if resp.status_code not in (200, 201, 202):
-            raise SubmissionError(f"deploy_submission failed: {_safe_error(resp)}")
+            raise _failed(SubmissionError, "deploy_submission", resp)
         return resp.json()
 
     def submission_deploy_status(self, challenge_id: int, submission_id: int) -> dict:
@@ -1102,6 +1782,10 @@ class MLArenaClient:
           The same block `my_submissions()` returns.
         - `active_submission_limits` — `max_active_submissions`,
           `active_submissions_count`, `active_submissions_remaining`.
+          `active_submissions_count` counts the participant's (or their
+          team's) submissions on this challenge that are active *or*
+          deploying (`deploy_queue` / `deploy_run`): a deploy in flight
+          already holds one of the slots.
         - `latest_deploy` — the attempt's own outcome: `id`, `created_at_ts`,
           `status` (`queued` | `running` | `succeeded` | `failed` |
           `cancelled`), `finished_at_ts` and `failure_message`. All-null when
@@ -1118,9 +1802,7 @@ class MLArenaClient:
         if resp.status_code != 200:
             # `raise_for_status()` used to end this call, which threw away the
             # server's reason with the body.
-            raise SubmissionError(
-                f"submission_deploy_status failed: {_safe_error(resp)}"
-            )
+            raise _failed(SubmissionError, "submission_deploy_status", resp)
         return resp.json()
 
     def delete_submission(self, challenge_id: int, submission_id: int) -> dict:
@@ -1140,7 +1822,7 @@ class MLArenaClient:
         )
         self._handle_response(resp, not_found=SubmissionNotFoundError)
         if resp.status_code != 200:
-            raise SubmissionError(f"delete_submission failed: {_safe_error(resp)}")
+            raise _failed(SubmissionError, "delete_submission", resp)
         return resp.json()
 
     # ---- Runner / runtime selection (DockerImageAgentRuntime) ----
@@ -1159,11 +1841,12 @@ class MLArenaClient:
         )
         self._handle_response(resp)
         if resp.status_code != 200:
-            raise MLArenaError(f"runtime_options failed: {_safe_error(resp)}")
+            raise _failed(SubmissionError, "runtime_options", resp)
         return _to_dataframe(resp.json())
 
-    def agent_runtime(self, submission_id: int) -> dict:
-        """Agent runtime currently pinned to a submission.
+    def agent_runtime(self, submission_id: int) -> dict | None:
+        """Agent runtime currently pinned to a submission, or None when it pins
+        none: a file or chat challenge's submission runs no agent container.
 
         Mirrors `GET /api/submissions/agent_runtime/{sid}` (`runtime.py`,
         `get_agent_runtime`).
@@ -1175,7 +1858,7 @@ class MLArenaClient:
         )
         self._handle_response(resp, not_found=SubmissionNotFoundError)
         if resp.status_code != 200:
-            raise MLArenaError(f"agent_runtime failed: {_safe_error(resp)}")
+            raise _failed(SubmissionError, "agent_runtime", resp)
         return resp.json()
 
     def set_agent_runtime(self, submission_id: int, runtime_id: int) -> dict:
@@ -1193,7 +1876,7 @@ class MLArenaClient:
         )
         self._handle_response(resp, not_found=SubmissionNotFoundError)
         if resp.status_code != 200:
-            raise MLArenaError(f"set_agent_runtime failed: {_safe_error(resp)}")
+            raise _failed(SubmissionError, "set_agent_runtime", resp)
         return resp.json()
 
     def resolve_runtime(self, challenge_id: int, *,
@@ -1242,7 +1925,7 @@ class MLArenaClient:
         )
         self._handle_response(resp, not_found=SubmissionNotFoundError)
         if resp.status_code != 200:
-            raise SubmissionError(f"list_submission_files failed: {_safe_error(resp)}")
+            raise _failed(SubmissionError, "list_submission_files", resp)
         return resp.json()
 
     def get_submission_file_content(self, challenge_id: int, submission_id: int,
@@ -1261,7 +1944,7 @@ class MLArenaClient:
         )
         self._handle_response(resp, not_found=SubmissionNotFoundError)
         if resp.status_code != 200:
-            raise SubmissionError(f"get_submission_file_content failed: {_safe_error(resp)}")
+            raise _failed(SubmissionError, "get_submission_file_content", resp)
         return resp.json()["content"]
 
     def update_submission_file_content(self, challenge_id: int, submission_id: int,
@@ -1283,7 +1966,7 @@ class MLArenaClient:
         )
         self._handle_response(resp, not_found=SubmissionNotFoundError)
         if resp.status_code not in (200, 201):
-            raise SubmissionError(f"update_submission_file_content failed: {_safe_error(resp)}")
+            raise _failed(SubmissionError, "update_submission_file_content", resp)
         return resp.json()
 
     def delete_submission_file(self, challenge_id: int, submission_id: int,
@@ -1304,7 +1987,7 @@ class MLArenaClient:
         )
         self._handle_response(resp, not_found=SubmissionNotFoundError)
         if resp.status_code != 200:
-            raise SubmissionError(f"delete_submission_file failed: {_safe_error(resp)}")
+            raise _failed(SubmissionError, "delete_submission_file", resp)
         return resp.json()
 
     def download_submission_file(self, challenge_id: int, submission_id: int,
@@ -1331,8 +2014,7 @@ class MLArenaClient:
         )
         self._handle_response(resp, not_found=SubmissionNotFoundError)
         if resp.status_code != 200:
-            raise SubmissionError(
-                f"download_submission_file failed: {_safe_error(resp)}")
+            raise _failed(SubmissionError, "download_submission_file", resp)
         out_path = os.path.join(dest_dir, os.path.basename(filename))
         with open(out_path, "wb") as fh:
             for chunk in resp.iter_content(chunk_size=1 << 20):
@@ -1365,7 +2047,7 @@ class MLArenaClient:
             )
         self._handle_response(resp, not_found=SubmissionNotFoundError)
         if resp.status_code != 200:
-            raise SubmissionError(f"upload_submission_docs failed: {_safe_error(resp)}")
+            raise _failed(SubmissionError, "upload_submission_docs", resp)
         return resp.json()
 
     def delete_submission_docs(self, challenge_id: int, submission_id: int,
@@ -1385,7 +2067,7 @@ class MLArenaClient:
         )
         self._handle_response(resp, not_found=SubmissionNotFoundError)
         if resp.status_code != 200:
-            raise SubmissionError(f"delete_submission_docs failed: {_safe_error(resp)}")
+            raise _failed(SubmissionError, "delete_submission_docs", resp)
         return resp.json()
 
     def copyable_submissions(self) -> dict:
@@ -1405,7 +2087,7 @@ class MLArenaClient:
         )
         self._handle_response(resp)
         if resp.status_code != 200:
-            raise SubmissionError(f"copyable_submissions failed: {_safe_error(resp)}")
+            raise _failed(SubmissionError, "copyable_submissions", resp)
         return resp.json()
 
     # ---- Status / logs ----
@@ -1421,9 +2103,10 @@ class MLArenaClient:
         `created_at_ts`, `is_public`, `is_owner`, the three blocks below, and
         the status block every submission payload carries:
 
-        - `status` — one of `created`, `uploading`, `upload_failed`,
-          `upload_validated`, `deploy_queue`, `deploy_run`, `deploy_failed`,
-          `active`, `deleted`.
+        - `status` — one of `created`, `upload_failed`, `upload_validated`,
+          `deploy_queue`, `deploy_run`, `deploy_failed`, `active`, `deleted`.
+          (A file upload is one request that ends validated or failed, so
+          there is no `uploading` state on the wire.)
         - `phase` — `upload` | `deployment` | `active` | `terminal`.
         - `last_status_message` — the row's latest message, or None.
         - `status_update_ts` — ISO-8601 UTC, or None.
@@ -1438,22 +2121,38 @@ class MLArenaClient:
         - `latest_deploy` — the most recent attempt: `id`, `created_at_ts`,
           `status`, `finished_at_ts`, `failure_message`. All-null before the
           first deploy.
-        - `run_info` — `submission_deploy_id`, `number_agent`, `has_gpu`,
-          `evaluation_metric`, `evaluation_frontend_precision` and `results`,
-          that attempt's runs. Each run carries the job's own `job_status`
+        - `run_info` — `submission_deploy_id`, `number_of_agents`, `has_gpu`,
+          `metric`, `is_elo_score`, `frontend_precision` and `results`, that
+          attempt's runs.
+          Each run is a `RunResult`, the one run model every run list on the
+          API serves (`submission_games` too): the job's own `job_status`
           (`pending` | `running` | `completed` | `failed` | `cancelled` |
-          `reaped`) and, when the agent is why it ended, `error_type`
-          (`code_error` | `pod_crash` | `simulation_error` | `unknown`) with
-          `error_message`. The other fields are the result columns:
-          `submission_reward`, `agent_nb_steps`, `game_outcome`, `final_rank`,
-          `score_elo_delta`, `created_at_ts`, `simulate_end_time`,
-          `metrics_detail`, `opponents`, `metrics`.
+          `reaped`), `job_started_at_ts`, `job_completed_at_ts`,
+          `job_error_message`, `job_retry_count`, `created_at_ts`,
+          `simulate_end_time_ts`, `is_test`, `is_deployment`, `env_nb_steps`,
+          the env's `step_time_*_sec` / `env_metric_*` columns and, when the
+          challenge's own code is why the run ended, `env_error_type`
+          (`code_error` | `simulation_error` | `pod_crash` | `unknown`).
+          `submission_results` lists one `RunSubmissionResult` per agent in
+          the run — **yours is the row whose `submission_id` is this
+          submission's**, the others are the opponents. A row carries
+          `submission_id`, `submission_name`, `user_name`,
+          `agent_attached_player_id`, `env_player_name`, `submission_reward`,
+          `submission_reward2`, `submission_reward_variance`,
+          `submission_reward_n_episodes`, `reward_ci95`, `agent_nb_steps`,
+          `game_outcome`, `final_rank`, `score_elo_before`, `score_elo_delta`,
+          `metrics_detail`, `info_message`, the agent's `action_time_*_sec` /
+          `agent_metric_*` columns and, when that agent is why the run ended,
+          `agent_error_type` (the same four values) with
+          `agent_error_message`. Timestamps are ISO-8601 UTC with a `Z`.
         - `queue_info` — `queue_position`, `queue_total` (numbers, not the
           `"116/127"` string this used to send), `created_at_ts` and
           `in_queue_for_second`. All-null when nothing is queued.
 
-        `error_message` and `failure_message` are None for a submission you do
-        not own: they quote the owner's own traceback.
+        `agent_error_message`, `agent_stdout_logs` and `failure_message` are
+        None on a row that is not yours: they quote the owner's own traceback
+        and stdout. `env_error_message` and `env_stdout_logs` belong to the
+        challenge's creator and are None here.
         """
         resp = self._request("GET",
             self._url(
@@ -1464,19 +2163,23 @@ class MLArenaClient:
         )
         self._handle_response(resp, not_found=SubmissionNotFoundError)
         if resp.status_code != 200:
-            raise SubmissionError(f"submission_status failed: {_safe_error(resp)}")
+            raise _failed(SubmissionError, "submission_status", resp)
         return resp.json()
 
     def submission_games(self, submission_id: int) -> dict:
         """Recent games for a submission with signed log URLs.
 
         Mirrors `GET /api/submissions/submission/{sid}/games`
-        (`monitor.py`, `get_submission_games`). Each row carries a
-        `signed_url` to the GCS render log (60-day retention), `env_nb_steps`,
-        `render_delay_second`, `env_metrics` — and `run`, the same run model
-        `submission_status` serves, so a crashed run reads as a crash here too
-        (`job_status`, `error_type`, `error_message`). It used to be listed as
-        an ordinary lost game, `outcome: "loser"` with a reward of 0.0 and no
+        (`monitor.py`, `get_submission_games`). Returns `{"games",
+        "challenge_context"}`. Each game is a `SubmissionGame`: the same
+        `RunResult` that `submission_status` serves under `run_info.results`
+        (`job_status`, `env_error_type`, `env_nb_steps`, and the
+        `submission_results` rows — yours is the one whose `submission_id`
+        is this submission's, with `agent_error_type` /
+        `agent_error_message`) plus `signed_url`, the GCS render log (60-day
+        retention; None when the run wrote none), and `render_delay_second`.
+        A crashed run reads as a crash here too; it used to be listed as an
+        ordinary lost game, `outcome: "loser"` with a reward of 0.0 and no
         error field at all.
         """
         resp = self._request("GET",
@@ -1486,7 +2189,7 @@ class MLArenaClient:
         )
         self._handle_response(resp, not_found=SubmissionNotFoundError)
         if resp.status_code != 200:
-            raise SubmissionError(f"submission_games failed: {_safe_error(resp)}")
+            raise _failed(SubmissionError, "submission_games", resp)
         return resp.json()
 
     def submission_overview(self, challenge_id: int, submission_id: int) -> dict:
@@ -1508,9 +2211,10 @@ class MLArenaClient:
         they were always null. A backend still serving them is simply older —
         this method returns the body verbatim either way.
 
-        `last_error_type` / `last_error_message` are the newest run's failure,
-        named as everywhere else. The message is None unless the submission is
-        yours: it is your agent's traceback.
+        `agent_error_type` / `agent_error_message` are the newest run's
+        failure, under the run's own column names (the keys every run payload
+        uses). The message is None unless the submission is yours: it is your
+        agent's traceback.
         """
         resp = self._request("GET",
             self._url(f"/submission_result/{challenge_id}/{submission_id}/overview"),
@@ -1519,7 +2223,7 @@ class MLArenaClient:
         )
         self._handle_response(resp, not_found=SubmissionNotFoundError)
         if resp.status_code != 200:
-            raise SubmissionError(f"submission_overview failed: {_safe_error(resp)}")
+            raise _failed(SubmissionError, "submission_overview", resp)
         return resp.json()
 
     def my_submissions(self) -> dict:
@@ -1531,8 +2235,10 @@ class MLArenaClient:
         Returns `submissions`, `started_submissions_count` and
         `deployment_limits` (the same quota block `submission_deploy_status`
         serves). Each row carries `id`, `submission_name`, `challenge_id`,
-        `challenge_name`, `rank`, `created_at_ts`, `challenge_start_date`,
-        `last_end_run_ts` and the status block.
+        `challenge_name`, `rank`, `created_at_ts`, `challenge_start_date_ts`
+        (the challenge's own `start_date_ts` column), `last_end_run_ts` and the
+        status block. Deleted submissions are not
+        listed: a row you deleted is gone from here, as from the console.
         """
         resp = self._request("GET",
             self._url("/submissions/mine"),
@@ -1541,7 +2247,7 @@ class MLArenaClient:
         )
         self._handle_response(resp)
         if resp.status_code != 200:
-            raise SubmissionError(f"my_submissions failed: {_safe_error(resp)}")
+            raise _failed(SubmissionError, "my_submissions", resp)
         return resp.json()
 
     def set_submission_visibility(self, submission_id: int, is_public: bool) -> dict:
@@ -1560,19 +2266,20 @@ class MLArenaClient:
         )
         self._handle_response(resp, not_found=SubmissionNotFoundError)
         if resp.status_code != 200:
-            raise SubmissionError(
-                f"set_submission_visibility failed: {_safe_error(resp)}"
-            )
+            raise _failed(SubmissionError, "set_submission_visibility", resp)
         return resp.json()
 
     def recent_replays(self, challenge_id: int, limit: int = 10) -> dict:
         """List recent completed replays for a challenge.
 
         Mirrors `GET /api/challenges/{id}/recent-replays`. Each replay
-        carries `simulation_id`, `created_at`, `render_delay_second`,
-        `signed_url` (GCS render file) and `participants`. Only runs from
-        the last 59 days are listed: the render bucket deletes blobs after
-        60 days, so an older `signed_url` would 404.
+        carries `simulation_id`, `created_at_ts`, `render_delay_second`,
+        `signed_url` (GCS render file) and `participants`; each participant
+        carries `submission_name`, `user_name`, `submission_reward`,
+        `game_outcome` and `final_rank` — the SubmissionResult columns under
+        their own names. Only runs from the last 59 days are listed: the
+        render bucket deletes blobs after 60 days, so an older `signed_url`
+        would 404.
         """
         resp = self._request("GET",
             self._url(f"/challenges/{challenge_id}/recent-replays"),
@@ -1582,7 +2289,7 @@ class MLArenaClient:
         )
         self._handle_response(resp)
         if resp.status_code != 200:
-            raise SubmissionError(f"recent_replays failed: {_safe_error(resp)}")
+            raise _failed(MLArenaError, "recent_replays", resp)
         return resp.json()
 
     def tail_logs(self, challenge_id: int, submission_id: int, *,
@@ -1591,10 +2298,16 @@ class MLArenaClient:
         """Yield human-readable status / log lines for a submission.
 
         Polls `submission_status` and emits one line per status transition,
-        including queue position for `deploy_queue` and per-run rewards /
-        errors for `deploy_run`. A line is emitted only when what it says
-        changed: a deploy that takes twenty polls prints each run once per
-        state, not twenty times.
+        including queue position for `deploy_queue` and, for each run of the
+        attempt, the job's `job_status` with the steps / reward / outcome of
+        **your own row** of that run (the `submission_results` entry whose
+        `submission_id` is this submission's), then an
+        `agent error[<agent_error_type>]: <agent_error_message>` line when
+        your agent is why the run ended and an `env error[<env_error_type>]`
+        line when the challenge's code is (its message is the creator's, so
+        it is not printed). A line is emitted only when what it says changed:
+        a deploy that takes twenty polls prints each run once per state, not
+        twenty times.
 
         With `follow=False` (default), returns as soon as the server reports
         the submission as settled (`is_settled`: nothing is running on it, so
@@ -1644,21 +2357,28 @@ class MLArenaClient:
             # `run_info` is served in every post-deploy state now, so the runs
             # of a failed attempt are still here to print.
             ri = status.get("run_info") or {}
-            for index, r in enumerate(ri.get("results") or []):
-                run_line = (f"  run: job_status={r.get('job_status')} "
-                            f"steps={r.get('agent_nb_steps')} "
-                            f"reward={r.get('submission_reward')} "
-                            f"outcome={r.get('game_outcome')}")
-                error_line = (
-                    f"    error[{r.get('error_type')}]: {r.get('error_message')}"
-                    if r.get("error_type") else None
-                )
-                if last_run_lines.get(index) == (run_line, error_line):
+            for index, run in enumerate(ri.get("results") or []):
+                # A run lists every agent's row under `submission_results`;
+                # ours is the row whose `submission_id` is this submission's.
+                # Direct key access on the shape: a backend serving another
+                # run model fails here instead of printing `None` forever.
+                mine = next((row for row in run["submission_results"]
+                             if row["submission_id"] == submission_id), {})
+                run_line = (f"  run: job_status={run.get('job_status')} "
+                            f"steps={mine.get('agent_nb_steps')} "
+                            f"reward={mine.get('submission_reward')} "
+                            f"outcome={mine.get('game_outcome')}")
+                error_lines = tuple(line for line in (
+                    _error_line("agent", mine.get("agent_error_type"),
+                                mine.get("agent_error_message")),
+                    _error_line("env", run.get("env_error_type"),
+                                run.get("env_error_message")),
+                ) if line is not None)
+                if last_run_lines.get(index) == (run_line, error_lines):
                     continue
-                last_run_lines[index] = (run_line, error_line)
+                last_run_lines[index] = (run_line, error_lines)
                 yield run_line
-                if error_line is not None:
-                    yield error_line
+                yield from error_lines
 
             # The server decides what "done" means; direct key access so a
             # backend that does not send the block fails loudly here.
@@ -1701,16 +2421,26 @@ class MLArenaClient:
 
         After the uploads, the submission's `is_deployable` is checked (one
         `submission_status` call) and a `SubmissionError` carrying the
-        server's `last_status_message` is raised rather than deploying files
-        the backend already rejected.
+        server's `last_status_message` (and, on `.body`, that status payload)
+        is raised rather than deploying files the backend already rejected.
 
         With `wait=True`, the call returns only once the deploy has settled:
         it drains `tail_logs()` (a client-side composition of the same public
         routes — there is no wait endpoint) and adds the final status block
-        under `"status"`. `timeout_sec` caps that wait and raises
-        `SubmissionError` when it runs out; `poll_sec` is the polling
-        interval. The default `wait=False` returns as soon as the deploy is
-        accepted, exactly as before.
+        under `"status"`. An attempt that ends `deploy_failed` raises
+        `SubmissionError` whose message is `latest_deploy.failure_message`
+        (or `last_status_message`) and whose `.body` is that final status
+        payload — the same contract as a rejected upload, so a `wait=True`
+        call that returns is a submission that is `active`. `timeout_sec`
+        caps the wait and raises `SubmissionError` when it runs out;
+        `poll_sec` is the polling interval. The default `wait=False` returns
+        as soon as the deploy is accepted (202), exactly as before.
+
+        The submission is remembered for `status()` as soon as it is created,
+        so after any of those errors `status()` reads the submission that was
+        left behind; a refused deploy (409 — quota, active-submission limit,
+        state) propagates as the `SubmissionError` `deploy_submission()`
+        raises, with the server's limits on `.body`.
 
         Returns `{"submission_id": <id>, "deploy": <deploy response>}`, plus
         `"status"` when `wait=True`.
@@ -1724,6 +2454,10 @@ class MLArenaClient:
             challenge_id, submission_name or _default_submission_name(agent, files)
         )
         submission_id = created["submission_id"]
+        # Remembered now, not after the deploy: `status()` must find the
+        # submission that a rejected upload or a refused deploy leaves behind.
+        self._last_submission_id = submission_id
+        self._last_challenge = challenge_id
 
         # Pin runner before deploy so the JobPod uses the right image.
         if runtime is not None:
@@ -1758,12 +2492,11 @@ class MLArenaClient:
                     f"Submission {submission_id} did not pass upload validation: "
                     f"{status['last_status_message'] or 'files rejected'} "
                     f"(fix the files and re-upload, or delete the submission with "
-                    f"delete_submission({challenge_id}, {submission_id}))."
+                    f"delete_submission({challenge_id}, {submission_id})).",
+                    body=status,
                 )
 
             deploy = self.deploy_submission(challenge_id, submission_id)
-            self._last_submission_id = submission_id
-            self._last_challenge = challenge_id
             result = {
                 "submission_id": submission_id,
                 "deploy": deploy,
@@ -1775,8 +2508,19 @@ class MLArenaClient:
                                         poll_sec=poll_sec,
                                         timeout_sec=timeout_sec):
                     pass
-                result["status"] = self.submission_status(
-                    challenge_id, submission_id)
+                final = self.submission_status(challenge_id, submission_id)
+                if final["status"] == "deploy_failed":
+                    # Same contract as the rejected upload above: the server's
+                    # reason is the message, the payload rides on `.body`.
+                    latest = final.get("latest_deploy") or {}
+                    reason = (latest.get("failure_message")
+                              or final.get("last_status_message"))
+                    raise SubmissionError(
+                        reason or f"Submission {submission_id} ended in "
+                                  f"deploy_failed without a message",
+                        body=final,
+                    )
+                result["status"] = final
             return result
         finally:
             if tmp_dir:
@@ -1804,26 +2548,77 @@ class MLArenaClient:
 
     # ---- Leaderboard (public read) ----
 
-    def leaderboard(self, challenge_id: int | None = None, top: int | None = None):
+    def leaderboard(self, challenge_id: int | None = None, top: int | None = None, *,
+                    aggregate: str | None = None, course_id: int | None = None,
+                    me: bool = False, q: str | None = None,
+                    window: int | None = None):
         """Get the leaderboard for a challenge.
 
-        Mirrors `GET /api/leaderboard/challenge/{id}` (`leaderboard.py`).
+        Mirrors `GET /api/leaderboard/challenge/{id}` (`leaderboard.py`) with
+        the query keys the console sends — `limit` (here `top`), `aggregate`,
+        `course_id`, `me`, `q`, `window` — each sent only when passed.
 
-        By default returns the full ranked list. Pass ``top=N`` to fetch only
-        the top N rows (the backend then returns a sliced envelope; this method
-        unwraps its ``leaders`` into the same DataFrame shape).
+        - ``aggregate="user"``: one row per participant (their best
+          submission; a team's best for a team), **the console's default**.
+          The backend also accepts ``"submission"``, its own default: every
+          ranked submission is a row, which is what omitting it gives here.
+        - ``course_id``: read the board through a course. Only that course's
+          students are listed, rows gain ``passed`` when the course sets a bar
+          (tri-state: None while the row has no ranked value), and the
+          envelope carries a ``course_context`` block (`course_id`,
+          `pass_threshold`).
+        - ``top=N``: the first N rows (every ranked row without it).
+          ``me=True`` adds your own row with `rank`, `percentile` and its
+          ``window`` neighbours (default 3, at most 25) under `me`; ``q``
+          adds the rows whose username contains it under `matches` (at most
+          50).
 
-        Rows come in server rank order. ``RankedOrder`` says which way the
-        board ranks (``"desc"``: higher is better, ``"asc"``: lower is better;
-        always ``"desc"`` when ``IsEloRanked``), and ``MetricOrder`` is the
+        **Shape.** The backend serves one envelope: `challenge`, `total`,
+        `leaders`, `me`, `matches` and, with ``course_id``,
+        `course_context`. With pandas, the call returns `leaders` as a
+        DataFrame and every other envelope key on ``df.attrs``
+        (``df.attrs["challenge"]["metric"]``, ``df.attrs["me"]``, …);
+        without pandas it returns the envelope dict as served.
+
+        **The `challenge` block** — what every row shares, served once:
+        `challenge_id`, `is_elo_score`, `metric_order`, `ranked_order`,
+        `metric`, `metric2`, `frontend_precision`, `metrics_schema`,
+        `has_gpu`, `is_continuous`. ``ranked_order`` says which way the board
+        ranks (``"desc"``: higher is better, ``"asc"``: lower is better;
+        always ``"desc"`` when ``is_elo_score``), and ``metric_order`` is the
         direction of the metric itself.
+
+        **Columns** — the backend's own names, one set with the console:
+        `rank`, `username`, `avatar_key`, `submission_id`,
+        `submission_name`, `mean_reward`, `mean_reward2`, `reward_ci95`,
+        `n_episodes_total`, `elo_score`, `elo_variance`, `number_of_runs`,
+        `created_at_ts` and `last_end_run_ts` (ISO-8601 UTC with a `Z`),
+        `is_my_submission`, `team_id`, `team_name`, `team_members`,
+        `action_time_max_sec`, `agent_metric_total_ram_max_bytes`,
+        `agent_metric_vram_max_bytes`, `mean_metrics_detail`,
+        `mean_reward_30d`, `mean_metrics_detail_30d`, `is_public` (None when
+        the row is not yours to know) and, through a course with a bar,
+        `passed`. Rows come in server rank order.
         """
         challenge_id = challenge_id or self._last_challenge
         if challenge_id is None:
             raise SubmissionError("No challenge specified and no previous submission found")
-        params = {"limit": top} if top is not None else None
+        params: dict = {}
+        if top is not None:
+            params["limit"] = top
+        if aggregate is not None:
+            params["aggregate"] = aggregate
+        if course_id is not None:
+            params["course_id"] = course_id
+        if window is not None:
+            params["window"] = window
+        if me:
+            params["me"] = "true"
+        if q:
+            params["q"] = q
+        params = params or None
         # The route is public, but it answers differently to the caller it
-        # can identify: `IsMySubmission`, and non-public course challenges the
+        # can identify: `is_my_submission`, and non-public course challenges the
         # caller is enrolled in. Without the bearer token every row came back
         # as somebody else's.
         resp = self._request("GET",
@@ -1836,55 +2631,85 @@ class MLArenaClient:
         if resp.status_code != 200:
             # `raise_for_status()` used to end this call, which threw away the
             # server's reason with the body.
-            raise MLArenaError(f"leaderboard failed: {_safe_error(resp)}")
-        data = resp.json()
-        # Sliced envelope when `top` was requested; full array otherwise.
-        if isinstance(data, dict):
-            return _to_dataframe(data.get("leaders", []))
-        return _to_dataframe(data)
+            raise _failed(MLArenaError, "leaderboard", resp)
+        envelope = resp.json()
+        try:
+            import pandas as pd
+        except ImportError:
+            return envelope
+        rows = pd.DataFrame(envelope["leaders"])
+        rows.attrs.update({k: v for k, v in envelope.items() if k != "leaders"})
+        return rows
 
     def global_ranking(self, search: str | None = None, page: int = 1, per_page: int = 100):
         """Global user ranking across all challenges (points + medals).
 
         Mirrors `GET /api/ranking/` (`ranking.py`). Returns a DataFrame of the
-        requested page (default: top 100). Pass ``search`` to filter by
-        username; matched rows carry their true global rank.
+        requested page (default: top 100) with the server's own column names:
+        `user_id`, `username`, `avatar_key`, `rank`, `current_points`,
+        `medals_gold`, `medals_silver`, `medals_bronze`. Pass ``search`` to
+        filter by username; matched rows carry their true global rank.
+
+        The envelope's pagination block rides along as
+        ``df.attrs["metadata"]`` — `total_pages`, `current_page`,
+        `total_users`, `has_next`, `has_prev` — the same way `leaderboard()`
+        carries its envelope blocks (a plain list, without pandas, cannot).
+        It used to be dropped, so a caller could not tell a full page from
+        the last one.
         """
         params: dict = {"page": page, "per_page": per_page}
         if search:
             params["search"] = search
-        resp = self._request("GET", self._url("/ranking/"), params=params, timeout=30)
+        resp = self._request("GET", self._url("/ranking/"), params=params,
+                             headers=self._headers(), timeout=30)
         self._handle_response(resp)
-        resp.raise_for_status()
-        return _to_dataframe(resp.json().get("rankings", []))
+        if resp.status_code != 200:
+            raise _failed(MLArenaError, "global_ranking", resp)
+        data = resp.json()
+        rows = _to_dataframe(data["rankings"])
+        if hasattr(rows, "attrs"):
+            rows.attrs["metadata"] = data["metadata"]
+        return rows
 
     def user_global_rank(self, user_id: int) -> dict:
         """A user's global rank, percentile and medal counts.
 
-        Mirrors `GET /api/ranking/user/{id}` (`ranking.py`, auth required).
+        Mirrors `GET /api/ranking/user/{id}` (`ranking.py`, login required:
+        the bearer token is what identifies you).
+
+        Flat, under the same names a `global_ranking()` row uses: `user_id`,
+        `username`, `rank`, `current_points`, `percentile`, `medals_gold`,
+        `medals_silver`, `medals_bronze`. The route used to nest all but the
+        first two under a `stats` key that this method silently unwrapped;
+        both the wrapper and the unwrap are gone.
         """
-        resp = self._request("GET", self._url(f"/ranking/user/{user_id}"), timeout=30)
+        resp = self._request("GET", self._url(f"/ranking/user/{user_id}"),
+                             headers=self._headers(), timeout=30)
         self._handle_response(resp)
-        resp.raise_for_status()
-        return resp.json().get("stats", {})
+        if resp.status_code != 200:
+            raise _failed(MLArenaError, "user_global_rank", resp)
+        return resp.json()
 
     # ---- Live data sources (public read proxy over the collection sidecar) --
     #
     # The `data_source_enabled` challenges are scored on data the platform
     # collects (hourly weather for a city registry, a news feed). These
     # methods mirror `GET /api/data_sources/*` (`views/data_sources.py`): no
-    # token scope is needed, the routes are public. A challenge names its
+    # token scope is needed, the routes are public (the bearer token is sent
+    # anyway, as on every read). A challenge names its
     # slice in `challenge(id)["data_source_asset"]`. Timestamps are naive UTC
     # ISO-8601 strings (no offset suffix). When the sidecar is down the server
     # answers 503 `{"error", "upstream": "data_collection"}`, raised here as
-    # `MLArenaError` with that reason.
+    # `MLArenaError` with that reason — and so does a payload that no longer
+    # matches the contract, a key the sidecar *added* included: the keys below
+    # are the whole payload, not a subset of it.
 
     def _data_source_get(self, path: str, params: dict | None = None):
         resp = self._request("GET", self._url(f"/data_sources{path}"),
-                             params=params, timeout=30)
+                             params=params, headers=self._headers(), timeout=30)
         self._handle_response(resp, not_found=NotFoundError)
         if resp.status_code != 200:
-            raise MLArenaError(f"data source {path} failed: {_safe_error(resp)}")
+            raise _failed(MLArenaError, f"data source {path}", resp)
         return resp.json()
 
     def data_source_weather_coverage(self, days: int = 60) -> dict:
@@ -1896,15 +2721,18 @@ class MLArenaClient:
         "hours_present", "hours_complete", "rows", "rows_by_source"}]}`` —
         one entry per calendar day that has any row, oldest first;
         ``hours_complete`` counts the hours with a row for every city.
+        ``rows_by_source`` always carries both source keys
+        (``openweathermap``, ``open_meteo_archive``), zero included.
         """
         return self._data_source_get("/weather/coverage", {"days": days})
 
-    def data_source_weather_series(self, city: str, country: str,
+    def data_source_weather_series(self, city_name: str, country_code: str,
                                    hours: int = 168) -> dict:
         """One city's hourly weather rows over the last ``hours`` (1..9600).
 
-        Mirrors `GET /api/data_sources/weather/series`. ``city`` / ``country``
-        are a pair from :meth:`data_source_weather_cities`; any other raises
+        Mirrors `GET /api/data_sources/weather/series`. ``city_name`` /
+        ``country_code`` are a pair from :meth:`data_source_weather_cities`
+        (the same keys every weather row carries); any other raises
         ``NotFoundError``. Returns ``{"city_name", "country_code", "latitude",
         "longitude", "points": [{"timestamp", "temperature", "rain",
         "wind_speed", "wind_direction", "humidity", "clouds", "visibility",
@@ -1913,13 +2741,16 @@ class MLArenaClient:
         ``apparent_temperature`` / ``wind_gust`` are null on older rows.
         """
         return self._data_source_get(
-            "/weather/series", {"city": city, "country": country, "hours": hours})
+            "/weather/series",
+            {"city_name": city_name, "country_code": country_code, "hours": hours})
 
     def data_source_weather_snapshot(self, hour: str | None = None) -> dict:
         """Every city's weather at one hour (default: the latest hour present).
 
-        Mirrors `GET /api/data_sources/weather/snapshot`. ``hour`` is a naive
-        UTC ISO-8601 timestamp (``"2026-09-18T06:00:00"``). Returns
+        Mirrors `GET /api/data_sources/weather/snapshot`. ``hour`` is an
+        ISO-8601 timestamp on the hour (``"2026-09-18T06:00:00"``); an offset
+        is accepted and converted to UTC, a value off the hour is a 400
+        (the weather table is keyed by hour slot). Returns
         ``{"timestamp", "cities": [{"city_name", "country_code", "latitude",
         "longitude", "temperature", "rain", "wind_speed", "wind_direction",
         "humidity", "clouds", "pressure", "source"}]}``.
@@ -1940,8 +2771,13 @@ class MLArenaClient:
 
         Mirrors `GET /api/data_sources/news/volume`. Returns ``{"days":
         [{"date", "total", "by_family"}], "sources": [{"source_key",
-        "source_label", "source_family", "total", "avg_chars", "latest"}]}``
-        — days oldest first, sources by total descending.
+        "source_label", "source_family", "total", "avg_chars", "latest"}],
+        "total"}`` — days oldest first, sources by total descending, and
+        ``total`` the articles collected over the whole window (served, so it
+        is not summed from ``days`` by every caller). A source is listed only
+        because it has articles in the window, so its ``avg_chars`` and
+        ``latest`` are never null; ``/news/sources`` is the route where they
+        can be.
         """
         return self._data_source_get("/news/volume", {"days": days})
 
@@ -1969,7 +2805,7 @@ class MLArenaClient:
         sibling). `not_found` names the class a 404 raises:
         `ChallengeNotFoundError` on a challenge-scoped route,
         `ChatSessionNotFoundError` on a session-scoped one. Any other
-        non-`ok` status — the 409s of §5.1, a 400 — raises `MLArenaError`
+        non-`ok` status — the 409s of the chat rules (challenge not started, agent offline, closed or busy session), a 400 — raises `MLArenaError`
         with the server's reason. Returns the response: `export_chat_session`
         reads `text`, everything else `.json()`."""
         resp = self._request(
@@ -1979,7 +2815,7 @@ class MLArenaClient:
         )
         self._handle_response(resp, not_found=not_found)
         if resp.status_code not in ok:
-            raise MLArenaError(f"{error_label} failed: {_safe_error(resp)}")
+            raise _failed(MLArenaError, error_label, resp)
         return resp
 
     # ---- Chat challenges: participant routes (user scope) --------------------
@@ -1987,19 +2823,19 @@ class MLArenaClient:
     def chat_challenge(self, challenge_id: int) -> dict:
         """The participant view of a chat challenge — `ChatChallengeView`.
 
-        Mirrors `GET /api/chat/challenge/{cid}` (`backend/app/views/chat/`,
-        plan §5.1). Returns `challenge_id`, `challenge_name`, `is_started`,
+        Mirrors `GET /api/chat/challenge/{cid}` (`backend/app/views/chat/`). Returns `challenge_id`, `challenge_name`, `is_started`,
         `manifest` (what the agent registered: `bot_name`, `tagline`,
         `welcome_message`, `charter_md`, `rules_public_md`, the public
         `scoring_rules`, its `tools`; None until the ChatPod is up),
         `env_status` (the error text behind an `"error"` is creator-only:
         `chat_admin()`), `agent_online`, the limits
-        (`turn_timeout_sec`, `max_turns_per_session`,
-        `max_sessions_per_participant`; a None limit is unlimited),
-        `participant` (your group on this challenge: `submission_id`,
-        `team_name`, `members`, `total_amount_eur`, `session_count`, `rank`),
-        `sessions` (yours and your teammates', newest first) and
-        `open_session_id` (your open session, or None).
+        (`max_turns_per_session`, `max_sessions_per_participant`; a None limit
+        is unlimited), `participant` (your group on this challenge:
+        `submission_id`, `team_name`, `members`, `total_amount_eur` — the
+        group's cumulative euros —, `scoreboard` (one
+        `{"rule_key", "count", "total_amount_eur"}` per rule you have fired),
+        `session_count`, `rank`), `sessions` (yours and your teammates',
+        newest first) and `open_session_id` (your open session, or None).
 
         Raises `ChallengeNotFoundError` when the challenge is not a chat
         challenge or is hidden from you.
@@ -2022,7 +2858,7 @@ class MLArenaClient:
 
         The reply is the same shape `chat_session()` returns: `session`,
         `messages` (empty), `tool_calls`, `scoring_events`, `turn` (None),
-        `participant_total_amount_eur`, `can_send`.
+        `participant`, `can_send`, `can_send_reason`.
 
         Raises `ChallengeNotFoundError` on a non-chat or hidden challenge, and
         `MLArenaError` with the server's reason when it refuses (409: the
@@ -2038,17 +2874,21 @@ class MLArenaClient:
     def chat_session(self, session_id: int) -> dict:
         """One conversation with its evidence — `ChatSessionView`.
 
-        Mirrors `GET /api/chat/sessions/{sid}` (plan §5.1). Returns `session`
+        Mirrors `GET /api/chat/sessions/{sid}`. Returns `session`
         (`ChatSessionSummary`: `status` `open` | `closed` | `voided`, `title`,
         `total_amount_eur`, counts, timestamps), `messages` (ordered),
         `tool_calls` (what the agent called, with arguments and results),
-        `scoring_events` (each breach: `rule_key`, `label`, `amount_eur`,
-        `evidence`), `turn` (the in-flight or latest turn: `status`
-        `pending` | `running` | `completed` | `failed`, `progress` while
-        running, `error_message` when failed; None before the first message),
-        `participant_total_amount_eur` (your group's cumulative euros) and
-        `can_send`. Readable by the session's user, their teammates, the
-        challenge's creator / assistants and admins.
+        `scoring_events` (each breach: `rule_key`, `label`, `amount_eur`; the
+        `evidence` blob behind it is in the export), `turn` (the in-flight or
+        latest turn: `status` `pending` | `running` | `completed` | `failed`,
+        `progress` while running, `error_message` when failed; None before the
+        first message), `participant` (your group's `total_amount_eur` and
+        `scoreboard`, the same keys `chat_challenge()` serves) and `can_send`
+        with `can_send_reason` (`session_voided` | `session_closed` |
+        `turn_in_flight` | `challenge_not_started` | `agent_offline` |
+        `turn_limit_reached`, None exactly when `can_send` is true). Readable
+        by the session's user, their teammates, the challenge's creator /
+        assistants and admins.
 
         Cheap enough to poll — `send_chat_message(wait=True)` does.
 
@@ -2066,8 +2906,9 @@ class MLArenaClient:
         """Send a message and, by default, wait for the agent's answer.
 
         Mirrors `POST /api/chat/sessions/{sid}/messages` `{"content": ...}`
-        (plan §5.1), which answers 202 `{"turn_id", "message"}` as soon as the
-        turn is queued for the agent. `content` is 1..4000 characters.
+       , which answers 202 `{"turn", "message"}` as soon as the
+        turn is queued for the agent — `turn` is the `ChatTurnView` the session
+        poll will serve. `content` is 1..4000 characters.
 
         With `wait=True` (default) the call then polls `chat_session()` every
         `poll_interval` seconds — a client-side composition of the two public
@@ -2097,7 +2938,7 @@ class MLArenaClient:
         if not wait:
             return accepted
         return self._wait_for_chat_turn(
-            session_id, accepted["turn_id"],
+            session_id, accepted["turn"]["id"],
             timeout=timeout, poll_interval=poll_interval,
         )
 
@@ -2131,7 +2972,7 @@ class MLArenaClient:
     def close_chat_session(self, session_id: int) -> dict:
         """End a conversation: `open` → `closed`. Idempotent.
 
-        Mirrors `POST /api/chat/sessions/{sid}/close` (plan §5.1). What the
+        Mirrors `POST /api/chat/sessions/{sid}/close`. What the
         session earned stays banked; open a new one with
         `open_chat_session()`.
 
@@ -2146,9 +2987,14 @@ class MLArenaClient:
                             format: str = "json") -> dict | str:
         """The evidence file of one session — « la pièce à conviction ».
 
-        Mirrors `GET /api/chat/sessions/{sid}/export?format=json|md` (plan
-        §5.1): transcript, tool log, scoring events, totals and session
-        metadata. `format="json"` (default) returns the parsed document;
+        Mirrors `GET /api/chat/sessions/{sid}/export?format=json|md`:
+        transcript, tool log, scoring events, totals and session
+        metadata — including what the session view leaves out, because the
+        export is the record: each event's `evidence` blob and
+        `created_at_ts`, each tool call's `created_at_ts`, each turn's
+        `claimed_at_ts` / `completed_at_ts` / `tool_round_count`, and, on a
+        voided session, `voided_by_username` / `voided_at_ts` next to the
+        `void_reason`. `format="json"` (default) returns the parsed document;
         `format="md"` returns the Markdown text. Same readers as
         `chat_session()`.
 
@@ -2175,8 +3021,8 @@ class MLArenaClient:
 
             chat = client.chat(42)
             reply = chat.say("Bonjour, j'ai perdu ma réservation")
-            chat.total_eur      # Decimal, this session's euros
-            chat.reset()        # close it, start over
+            chat.total_amount_eur   # Decimal, this session's euros
+            chat.reset()            # close it, start over
 
         `say()` opens the session on its first call (which accepts the
         charter), waits for the answer, prints the scoring events it earned
@@ -2192,11 +3038,11 @@ class MLArenaClient:
     def chat_admin(self, challenge_id: int) -> dict:
         """The creator view of a chat challenge — `ChatChallengeAdminView`.
 
-        Mirrors `GET /api/chat/challenge/{cid}/admin` (plan §5.2). Returns the
+        Mirrors `GET /api/chat/challenge/{cid}/admin`. Returns the
         LLM connection (`llm_base_url`, `llm_model`, `llm_api_key_set` — a
         boolean, the key itself is never served), the limits, the agent's
-        health (`env_status`, `env_status_message`, `env_status_at`,
-        `worker_ref`, `last_seen_at`, `agent_online`), the registered
+        health (`env_status`, `env_status_message`, `env_status_at_ts`,
+        `worker_ref`, `last_seen_at_ts`, `agent_online`), the registered
         `manifest` and `counts` (`sessions`, `open_sessions`, `turns`,
         `scoring_events`, `total_amount_eur`, `participants`).
 
@@ -2218,7 +3064,7 @@ class MLArenaClient:
         """Point the challenge at its LLM and set its limits.
 
         Mirrors `PUT /api/chat/challenge/{cid}/settings`
-        (`UpdateChatSettingsRequest`, plan §5.2) — the console's Chat tab.
+        (`UpdateChatSettingsRequest`) — the console's Chat tab.
         Only the keywords you pass are sent; the rest is left untouched.
         Allowed while the challenge is started (the agent reads the LLM
         config on every turn).
@@ -2258,10 +3104,12 @@ class MLArenaClient:
                       status: str | None = None) -> dict:
         """Every session of the challenge, for the creator.
 
-        Mirrors `GET /api/chat/challenge/{cid}/sessions` (plan §5.2). Returns
+        Mirrors `GET /api/chat/challenge/{cid}/sessions`. Returns
         `{"sessions": [...]}` — each a `ChatSessionSummary` (user, team's
-        submission, `status`, counts, `total_amount_eur`) plus
-        `submission_name`. `status` filters on `open` | `closed` | `voided`.
+        submission, `status`, counts, `total_amount_eur`, and on a voided one
+        `void_reason` / `voided_by_username` / `voided_at_ts`) plus
+        `submission_name`. `status` filters on `open` | `closed` | `voided`;
+        any other value is a 400.
         """
         params = {"status": status} if status is not None else None
         return self._chat_call(
@@ -2272,8 +3120,8 @@ class MLArenaClient:
     def void_chat_session(self, session_id: int, reason: str) -> dict:
         """Annul a session — « l'annulation de la manche ».
 
-        Mirrors `POST /api/chat/sessions/{sid}/void` `{"reason": ...}` (plan
-        §5.2): the session becomes `voided` and its scoring events leave the
+        Mirrors `POST /api/chat/sessions/{sid}/void` `{"reason": ...}`:
+        the session becomes `voided` and its scoring events leave the
         group's total (recomputed in the same transaction). Undo with
         `unvoid_chat_session()`.
 
@@ -2289,7 +3137,7 @@ class MLArenaClient:
     def unvoid_chat_session(self, session_id: int) -> dict:
         """Reinstate a voided session; its events count again.
 
-        Mirrors `POST /api/chat/sessions/{sid}/unvoid` (plan §5.2).
+        Mirrors `POST /api/chat/sessions/{sid}/unvoid`.
 
         Raises `ChatSessionNotFoundError` when the session is not on a
         challenge you may manage.
@@ -2302,7 +3150,7 @@ class MLArenaClient:
     def export_chat_evidence(self, challenge_id: int) -> dict:
         """Every session's evidence in one document — the review dossier.
 
-        Mirrors `GET /api/chat/challenge/{cid}/export` (plan §5.2): the
+        Mirrors `GET /api/chat/challenge/{cid}/export`: the
         per-session export of `export_chat_session(format="json")` for every
         session of the challenge, in one JSON.
         """
@@ -2337,7 +3185,7 @@ class MLArenaClient:
         )
         self._handle_response(resp)
         if resp.status_code not in ok:
-            raise MLArenaError(f"{error_label} failed: {_safe_error(resp)}")
+            raise _failed(MLArenaError, error_label, resp)
         return resp.json()
 
     def _upload_course_file(self, method: str, path: str, file_path: str, *,
@@ -2357,7 +3205,7 @@ class MLArenaClient:
             )
         self._handle_response(resp)
         if resp.status_code not in ok:
-            raise MLArenaError(f"{error_label} failed: {_safe_error(resp)}")
+            raise _failed(MLArenaError, error_label, resp)
         return resp.json()
 
     # ---- Academic courses: create / enroll / list (teacher + user scope) ----
@@ -2395,7 +3243,8 @@ class MLArenaClient:
                          `public` courses appear in `course_catalog()`.
             teacher_user_id: an admin may name the owning teacher; otherwise the
                          caller owns the course.
-        Challenges are attached afterwards via the modules you link (see
+        Challenges are attached afterwards: one step per challenge with
+        `add_course_challenge`, or through modules you build and link (see
         `create_module` / `attach_challenge` / `link_module`).
         """
         body: dict = {"name": name}
@@ -2424,8 +3273,11 @@ class MLArenaClient:
         """Preview a course from its join code (without enrolling).
 
         Mirrors `GET /api/academic_courses/enroll/<join_code>` — the same public
-        lookup the console's EnrollPage makes. Returns course meta plus
-        `already_enrolled` / `has_student_info` when authenticated.
+        lookup the console's EnrollPage makes. Returns
+        `{course, challenge_names, lesson_count, already_enrolled,
+        has_student_info}`; the course sits under `course` with its own field
+        names (`id`, `name`, `code`, `slug`, ...), and the two flags stay false
+        for an anonymous caller.
         """
         return self._course_call(
             "GET", f"/academic_courses/enroll/{join_code}",
@@ -2491,7 +3343,8 @@ class MLArenaClient:
 
         Mirrors `GET /api/academic_courses/catalog`. Returns
         `{courses, total, limit, offset}` — only `visibility=public` courses
-        appear. `search` matches name + description.
+        appear. `search` matches name + description. A card carries `has_cover`;
+        fetch the image with `course_cover(card["id"])`.
         """
         params: dict = {}
         if search is not None:
@@ -2512,6 +3365,8 @@ class MLArenaClient:
         here (use `lesson(...)`). When authenticated, the response includes
         `is_enrolled`, `can_manage`, and a `progress` summary; managers
         (teacher/TA/admin) additionally see unpublished draft lessons.
+        `has_cover` says whether there is a cover image — fetch it with
+        `course_cover(landing["id"])`.
         """
         return self._course_call(
             "GET", f"/academic_courses/{slug}", error_label="course",
@@ -2571,7 +3426,7 @@ class MLArenaClient:
 
     def mark_lesson_incomplete(self, lesson_id: int,
                                course_id: int | None = None) -> dict:
-        """Undo a completion — back to in-progress, `completed_at` cleared.
+        """Undo a completion — back to in-progress, `completed_at_ts` cleared.
 
         Mirrors `POST /api/academic_courses/lessons/{id}/uncomplete`. The tick
         is student-self-reported, so it is reversible. See `mark_lesson_viewed`
@@ -2847,7 +3702,7 @@ class MLArenaClient:
         )
 
     def list_lesson_media(self, lesson_id: int) -> list:
-        """The files attached to a lesson: `[{filename, url, size_bytes, modified_at}]`.
+        """The files attached to a lesson: `[{filename, url, size_bytes}]`.
 
         Mirrors `GET /api/teacher/lessons/{id}/media` (owner scope). Use it to
         find a file whose link is no longer in the body — the upload response is
@@ -2874,9 +3729,7 @@ class MLArenaClient:
         )
         self._handle_response(resp)
         if resp.status_code != 200:
-            raise MLArenaError(
-                f"download_lesson_media failed: {_safe_error(resp)}"
-            )
+            raise _failed(MLArenaError, "download_lesson_media", resp)
         out_path = os.path.join(dest_dir, os.path.basename(filename))
         with open(out_path, "wb") as fh:
             for chunk in resp.iter_content(chunk_size=1 << 20):
@@ -2928,8 +3781,9 @@ class MLArenaClient:
     def set_course_cover(self, course_id: int, image_path: str) -> dict:
         """Upload (or replace) a course cover image.
 
-        Mirrors `POST /api/teacher/course/{id}/cover`. Returns
-        `{cover_image_path, url}`.
+        Mirrors `POST /api/teacher/course/{id}/cover`. Returns `{has_cover}` —
+        the same flag every course payload carries. The image itself comes back
+        from `course_cover(course_id)`; the stored path stays server-side.
         """
         return self._upload_course_file(
             "POST", f"/teacher/course/{course_id}/cover", image_path,
@@ -2948,7 +3802,7 @@ class MLArenaClient:
 
     def link_module(self, course_id: int, module_id: int,
                     position: int | None = None) -> dict:
-        """Link a module into a course as a live reference (D2).
+        """Link a module into a course as a live reference.
 
         Mirrors `POST /api/teacher/course/{id}/modules`. Only owned or public
         modules are linkable. `position` defaults to the end.
@@ -2959,6 +3813,51 @@ class MLArenaClient:
         return self._course_call(
             "POST", f"/teacher/course/{course_id}/modules", json_body=body,
             ok=(200, 201), error_label="link_module",
+        )
+
+    def add_course_challenge(self, course_id: int, challenge_id: int, *,
+                             title: str | None = None,
+                             summary: str | None = None,
+                             pass_threshold: float | None = None,
+                             is_published: bool = True) -> dict:
+        """Add a challenge to a course as one entry, in one transaction.
+
+        Mirrors `POST /api/teacher/course/{id}/challenges` — the console's
+        Challenges-tab "Add challenge". The server creates a private module
+        (`title`, default the challenge's name; `summary` = the markdown page
+        students see), links it at the end of the course and attaches the
+        challenge with `pass_threshold` (see `attach_challenge`); either all
+        three happen or none does. `is_published=False` stages it as a draft.
+        Returns the course's new module row (the shape `list_course_modules`
+        returns). Requires teacher/TA/admin on the course.
+        """
+        body: dict = {"challenge_id": challenge_id, "is_published": is_published}
+        if title is not None:
+            body["title"] = title
+        if summary is not None:
+            body["summary"] = summary
+        if pass_threshold is not None:
+            body["pass_threshold"] = pass_threshold
+        return self._course_call(
+            "POST", f"/teacher/course/{course_id}/challenges", json_body=body,
+            ok=(200, 201), error_label="add_course_challenge",
+        )
+
+    def remove_course_challenge(self, course_id: int, module_id: int) -> dict:
+        """Remove a challenge entry from a course, in one transaction.
+
+        Mirrors `DELETE /api/teacher/course/{id}/challenges/{module_id}` — the
+        console's Challenges-tab "Remove". The entry's module is always
+        unlinked from the course; it is also deleted when it is a simple
+        module (no lessons, at most one challenge) you may edit and no other
+        course links it — the wrapper `add_course_challenge` created. An
+        advanced or borrowed module is only unlinked. Returns
+        `{"message", "module_deleted"}`. Requires teacher/TA/admin on the
+        course; a module not linked to it raises `NotFoundError` (404).
+        """
+        return self._course_call(
+            "DELETE", f"/teacher/course/{course_id}/challenges/{module_id}",
+            error_label="remove_course_challenge",
         )
 
     def unlink_module(self, course_id: int, module_id: int) -> dict:
@@ -2996,6 +3895,159 @@ class MLArenaClient:
             "GET", f"/teacher/course/{course_id}/progress",
             error_label="course_progress",
         )
+
+    # ---- Course administration: roster, assistants, exports ----------------
+
+    def teacher_courses(self):
+        """The courses you teach or assist on (admins see them all).
+
+        Mirrors `GET /api/teacher/courses` — the console's course-authoring
+        list. Each row is a course plus `role` (`teacher` | `assistant`) and
+        `has_cover` (the image itself comes from `course_cover(id)`).
+        Returns a DataFrame if pandas is installed, else a list of dicts.
+        """
+        return _to_dataframe(self._course_call(
+            "GET", "/teacher/courses", error_label="teacher_courses",
+        ))
+
+    def challenges_for_course(self):
+        """The challenges you may attach to a module.
+
+        Mirrors `GET /api/teacher/challenges-for-course`: public challenges plus
+        your own, each with `ranked_by` (the metric a threshold is on),
+        `ranked_order` (the direction it is compared in) and `precision`.
+        A challenge with no evaluation is not listed, because `attach_challenge`
+        refuses it.
+        """
+        return _to_dataframe(self._course_call(
+            "GET", "/teacher/challenges-for-course",
+            error_label="challenges_for_course",
+        ))
+
+    def course_students(self, course_id: int,
+                        challenge_id: int | None = None) -> dict:
+        """The course roster, with team membership for one attached challenge.
+
+        Mirrors `GET /api/teacher/students/{course_id}`. Enrollment is
+        course-level, so the student list is the same whichever challenge you
+        pass; only `team_id`/`team_name` change. Without `challenge_id` no
+        challenge is picked: `selected_challenge_id` and every `team_*` are
+        None (the route no longer defaults to the course's first challenge).
+        A challenge not attached to the course is a 400. Returns
+        `{challenges, selected_challenge_id, students}`, where each student
+        carries `user_id`, `student_number`, `student_email`, `project_url` and
+        `enrolled_at_ts`.
+        """
+        params = {"challenge_id": challenge_id} if challenge_id is not None else None
+        return self._course_call(
+            "GET", f"/teacher/students/{course_id}", params=params,
+            error_label="course_students",
+        )
+
+    def remove_student(self, course_id: int, user_id: int) -> dict:
+        """Remove a student's enrollment from a course.
+
+        Mirrors `DELETE /api/teacher/student/{course_id}/{user_id}`. Their
+        submissions are untouched — only the enrollment row goes.
+        """
+        return self._course_call(
+            "DELETE", f"/teacher/student/{course_id}/{user_id}",
+            error_label="remove_student",
+        )
+
+    def course_assistants(self, course_id: int):
+        """The teaching assistants on a course (course owner only).
+
+        Mirrors `GET /api/teacher/course/{id}/assistants`. Each row carries
+        `user_id`, `username` and `created_at_ts`. Returns a DataFrame if
+        pandas is installed, else a list of dicts.
+        """
+        return _to_dataframe(self._course_call(
+            "GET", f"/teacher/course/{course_id}/assistants",
+            error_label="course_assistants",
+        ))
+
+    def add_course_assistant(self, course_id: int, username: str) -> dict:
+        """Add a teaching assistant by username (course owner only).
+
+        Mirrors `POST /api/teacher/course/{id}/assistants`. A TA gets the same
+        teacher view of the course, but cannot manage the assistant list.
+        """
+        return self._course_call(
+            "POST", f"/teacher/course/{course_id}/assistants",
+            json_body={"username": username}, ok=(200, 201),
+            error_label="add_course_assistant",
+        )
+
+    def remove_course_assistant(self, course_id: int, user_id: int) -> dict:
+        """Remove a teaching assistant (course owner only).
+
+        Mirrors `DELETE /api/teacher/course/{id}/assistants/{user_id}`.
+        """
+        return self._course_call(
+            "DELETE", f"/teacher/course/{course_id}/assistants/{user_id}",
+            error_label="remove_course_assistant",
+        )
+
+    def export_course_csv(self, course_id: int, challenge_id: int, *,
+                          by_participant: bool = False,
+                          dest_dir: str = ".") -> str:
+        """Download one attached challenge's course leaderboard as CSV;
+        returns the written path.
+
+        Mirrors `GET /api/teacher/export-csv/{course_id}` — the console's
+        Students-tab export. `challenge_id` (required) is one of the course's
+        attached challenges; the server answers 400 for any other.
+        `by_participant=True` writes one row per enrolled student (their team's
+        best submission) instead of one row per submission.
+        """
+        params: dict = {
+            "by_participant": str(bool(by_participant)).lower(),
+            "challenge_id": challenge_id,
+        }
+        return self._download_course_file(
+            f"/teacher/export-csv/{course_id}",
+            os.path.join(
+                dest_dir,
+                f"leaderboard_course_{course_id}_challenge_{challenge_id}.csv",
+            ),
+            params=params, error_label="export_course_csv",
+        )
+
+    def course_cover(self, course_id: int, dest_dir: str = ".") -> str:
+        """Download a course's cover image; returns the written path.
+
+        Mirrors `GET /api/academic_courses/assets/courses/{id}/cover` — the same
+        URL the console builds from the course id. Course payloads say only
+        whether there is one (`has_cover`), never where it is stored. 404s when
+        the course has no cover.
+        """
+        return self._download_course_file(
+            f"/academic_courses/assets/courses/{course_id}/cover",
+            os.path.join(dest_dir, f"course_{course_id}_cover"),
+            error_label="course_cover",
+        )
+
+    def _download_course_file(self, path: str, out_path: str, *,
+                              params: dict | None = None,
+                              error_label: str = "download") -> str:
+        """Stream a course route's file body to ``out_path`` (sibling of
+        ``download_lesson_media``); returns the written path."""
+        directory = os.path.dirname(out_path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        resp = self._request(
+            "GET", self._url(path), headers=self._headers(),
+            params=params, timeout=300, stream=True,
+        )
+        self._handle_response(resp)
+        if resp.status_code != 200:
+            raise _failed(MLArenaError, error_label, resp)
+        with open(out_path, "wb") as fh:
+            for chunk in resp.iter_content(chunk_size=1 << 20):
+                if chunk:
+                    fh.write(chunk)
+        return out_path
 
     # ---- High-level course helpers (client-side compositions) ---------------
 
@@ -3210,7 +4262,9 @@ class MLArenaClient:
                 "is_published": module.get("is_published", True),
                 "challenges": [
                     {
-                        "challenge_id": c["challenge_id"],
+                        # The manifest key stays `challenge_id`; the landing
+                        # payload names the challenge itself.
+                        "challenge_id": c["challenge"]["id"],
                         "label": c.get("label"),
                         "pass_threshold": c.get("pass_threshold"),
                     }
@@ -3364,14 +4418,38 @@ def _safe_error(resp: requests.Response, fallback: str = "request failed") -> st
     return reason or fallback
 
 
+def _json_body(resp: requests.Response) -> dict | None:
+    """The reply's JSON object, or None when it has none (a proxy's HTML 502).
+
+    What `MLArenaError.body` carries: a deploy 409's `deployment_limits` /
+    `active_submission_limits`, a 400's `error` — the server's own keys,
+    unchanged.
+    """
+    try:
+        body = resp.json()
+    except Exception:
+        return None
+    return body if isinstance(body, dict) else None
+
+
+def _error(cls, resp: requests.Response, message: str):
+    """Build `cls(message)` carrying the reply it was raised for."""
+    return cls(message, status_code=resp.status_code, body=_json_body(resp))
+
+
+def _failed(cls, label: str, resp: requests.Response):
+    """`<label> failed: <server reason>` — the message every method has
+    always raised on an unexpected status, now carrying the reply
+    (`.status_code`, `.body`)."""
+    return _error(cls, resp, f"{label} failed: {_safe_error(resp)}")
+
+
 def _to_dataframe(data):
-    """Return a pandas DataFrame if pandas is installed, otherwise a list/dict."""
-    if isinstance(data, dict) and "columns" in data and "data" in data:
-        rows = [dict(zip(data["columns"], row)) for row in data["data"]]
-    elif isinstance(data, list):
-        rows = data
-    else:
+    """A list of rows as a pandas DataFrame if pandas is installed, else as
+    is. Anything that is not a list (an envelope dict) is returned untouched."""
+    if not isinstance(data, list):
         return data
+    rows = data
     try:
         import pandas as pd
         return pd.DataFrame(rows)
@@ -3387,6 +4465,19 @@ def _to_dataframe(data):
 # DeprecationWarning and forward to the new spelling. This covers the Python
 # API only — the client speaks only the current REST routes and payload keys,
 # so the values these methods return carry the new keys (`submission_id`, ...).
+
+def _error_line(side: str, error_type, message) -> str | None:
+    """One `tail_logs` error line: `    agent error[code_error]: boom`.
+
+    `side` is `agent` (the caller's own `RunSubmissionResult`) or `env` (the
+    run). The message is appended only when served — it is None on a row
+    that is not the caller's and on the env side of a participant read.
+    """
+    if not error_type:
+        return None
+    line = f"    {side} error[{error_type}]"
+    return f"{line}: {message}" if message else line
+
 
 _LEGACY_KWARGS = {
     "competition_id": "challenge_id",

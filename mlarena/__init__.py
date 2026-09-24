@@ -7,6 +7,7 @@ from mlarena.exceptions import (
     ChallengeNotFoundError,
     ChatSessionNotFoundError,
     CompetitionNotFoundError,  # deprecated alias of ChallengeNotFoundError
+    MaintenanceError,
     MLArenaError,
     NotFoundError,
     PermissionDeniedError,
@@ -14,7 +15,7 @@ from mlarena.exceptions import (
     SubmissionNotFoundError,
 )
 
-__version__ = "2.2.0"
+__version__ = "3.0.0"
 
 _LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 

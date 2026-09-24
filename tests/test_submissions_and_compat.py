@@ -168,6 +168,15 @@ def test_runtime_routes_keep_agent_runtime_segment():
     assert rec.last["json"] == {"docker_image_agent_runtime_id": 3}
 
 
+def test_agent_runtime_is_none_for_a_submission_without_agent_container():
+    # A file_v1 / chat_v1 submission pins no runtime: the route answers null.
+    c, _rec = make_client()
+    null_body = FakeResponse(200)
+    null_body._json = None  # FakeResponse turns a None body into {}
+    c._request = lambda method, url, **kwargs: null_body
+    assert c.agent_runtime(11) is None
+
+
 def test_submission_file_download_and_docs_routes():
     """Parity with the console: the download button, the Documentation panel
     and the "copy an existing submission" picker."""
@@ -280,9 +289,12 @@ def test_tail_logs_does_not_repeat_unchanged_run_lines():
                 "last_status_message": "running",
                 "is_settled": False,
                 "run_info": {"results": [
-                    {"job_status": "running", "agent_nb_steps": 5,
-                     "submission_reward": 1.0, "game_outcome": None,
-                     "error_type": None},
+                    {"job_status": "running", "env_error_type": None,
+                     "submission_results": [
+                         {"submission_id": 11, "agent_nb_steps": 5,
+                          "submission_reward": 1.0, "game_outcome": None,
+                          "agent_error_type": None},
+                     ]},
                 ]},
             })
         return (200, {"status": "active", "last_status_message": "done",
@@ -299,16 +311,22 @@ def test_tail_logs_does_not_repeat_unchanged_run_lines():
 
 
 def test_tail_logs_emits_a_run_line_again_when_it_changes():
+    """A run is the one `RunResult` model: `job_status` and `env_error_type`
+    are the run's, the caller's steps / reward / errors are on *their own*
+    `submission_results` row — the one whose `submission_id` is theirs, not
+    the first one (here an opponent's, whose failure must not be printed).
+    The env's message is the creator's (null on a participant read), so the
+    env line has no message."""
     state = {"polls": 0}
 
     def router(method, path, kwargs):
         state["polls"] += 1
-        # A run is failed when it carries an `error_type`, not when a derived
-        # status string says "error": `job_status` is the job's own column.
         if state["polls"] == 1:
-            steps, job_status, error_type = 5, "running", None
+            steps, job_status, agent_error, env_error = 5, "running", None, None
         elif state["polls"] == 2:
-            steps, job_status, error_type = 9, "failed", "code_error"
+            steps, job_status, agent_error, env_error = 9, "failed", "code_error", None
+        elif state["polls"] == 3:
+            steps, job_status, agent_error, env_error = 9, "failed", "code_error", "simulation_error"
         else:
             return (200, {"status": "deploy_failed", "last_status_message": "crash",
                           "is_settled": True, "run_info": {"results": []}})
@@ -317,9 +335,18 @@ def test_tail_logs_emits_a_run_line_again_when_it_changes():
             "last_status_message": "running",
             "is_settled": False,
             "run_info": {"results": [
-                {"job_status": job_status, "agent_nb_steps": steps,
-                 "submission_reward": 1.0, "game_outcome": None,
-                 "error_type": error_type, "error_message": "boom"},
+                {"job_status": job_status, "env_error_type": env_error,
+                 "env_error_message": None,
+                 "submission_results": [
+                     {"submission_id": 12, "agent_nb_steps": 3,
+                      "submission_reward": 0.0, "game_outcome": "loser",
+                      "agent_error_type": "pod_crash",
+                      "agent_error_message": None},
+                     {"submission_id": 11, "agent_nb_steps": steps,
+                      "submission_reward": 1.0, "game_outcome": None,
+                      "agent_error_type": agent_error,
+                      "agent_error_message": "boom" if agent_error else None},
+                 ]},
             ]},
         })
 
@@ -330,9 +357,29 @@ def test_tail_logs_emits_a_run_line_again_when_it_changes():
         "[deploy_run] running",
         "  run: job_status=running steps=5 reward=1.0 outcome=None",
         "  run: job_status=failed steps=9 reward=1.0 outcome=None",
-        "    error[code_error]: boom",
+        "    agent error[code_error]: boom",
+        "  run: job_status=failed steps=9 reward=1.0 outcome=None",
+        "    agent error[code_error]: boom",
+        "    env error[simulation_error]",
         "[deploy_failed] crash",
     ], lines
+
+
+def test_tail_logs_fails_loudly_on_another_run_shape():
+    """The 2.x flat run (`error_type` next to `agent_nb_steps`) is gone from
+    the server. A backend still serving it — or any run without
+    `submission_results` — must raise here, not print `steps=None` forever."""
+    c, _ = make_client(lambda *_: (200, {
+        "status": "deploy_run", "last_status_message": "running",
+        "is_settled": False,
+        "run_info": {"results": [{"job_status": "running", "agent_nb_steps": 5,
+                                  "error_type": None}]},
+    }))
+    try:
+        with_fake_clock(lambda: list(c.tail_logs(4, 11)))
+        raise AssertionError("expected KeyError")
+    except KeyError as exc:
+        assert exc.args == ("submission_results",)
 
 
 def test_tail_logs_raises_on_timeout_instead_of_returning_silently():
@@ -375,8 +422,40 @@ def _submit_router(is_deployable=True):
                 "is_settled": True,
             })
         if path.endswith("/deploy"):
-            return (200, {"message": "queued"})
+            # 202, as the backend answers an accepted deploy.
+            return (202, {"message": "queued"})
         return (200, {"status": "deploy_queue"})
+    return router
+
+
+_DEPLOY_409 = {
+    "error": "Daily deployment limit (5) reached",
+    "deployment_limits": {
+        "daily_deploy_limit": 5, "daily_deploys_used": 5,
+        "daily_deploys_remaining": 0,
+        "next_deploy_available_at": "2026-09-23T00:00:00+00:00",
+        "can_deploy": False,
+    },
+    "active_submission_limits": {
+        "max_active_submissions": 3, "active_submissions_count": 1,
+        "active_submissions_remaining": 2,
+    },
+}
+
+
+def _submit_router_with(deploy=None, after_deploy=None):
+    """`_submit_router` whose deploy route answers `deploy` and whose status
+    route, once the deploy was called, answers `after_deploy`."""
+    base = _submit_router()
+    state = {"deployed": False}
+
+    def router(method, path, kwargs):
+        if path.endswith("/deploy"):
+            state["deployed"] = True
+            return deploy if deploy is not None else base(method, path, kwargs)
+        if path.endswith("/status") and state["deployed"] and after_deploy is not None:
+            return (200, after_deploy)
+        return base(method, path, kwargs)
     return router
 
 
@@ -427,7 +506,72 @@ def test_submit_not_deployable_raises_before_deploy():
     except SubmissionError as exc:
         assert "Submission 11 did not pass upload validation: bad name" in str(exc)
         assert "delete_submission(4, 11)" in str(exc)
+        # Not an HTTP refusal: the status payload rides on `.body` instead.
+        assert exc.status_code is None
+        assert exc.body["is_deployable"] is False
     assert not any(call["path"].endswith("/deploy") for call in rec.calls)
+
+    # The submission exists on the server: `status()` must find it. It used
+    # to be remembered only after the deploy, so this raised "no previous
+    # submission found" right after telling the caller which id to delete.
+    assert (c._last_submission_id, c._last_challenge) == (11, 4)
+    c.status()
+    assert rec.last["path"] == "/submissions/challenge/4/11/status"
+
+
+def test_submit_propagates_a_refused_deploy_with_the_servers_limits():
+    """A 409 on the deploy is the `SubmissionError` `deploy_submission()`
+    raises; the quota blocks the server sent are on `.body`."""
+    c, rec = make_client(_submit_router_with(deploy=(409, _DEPLOY_409)))
+    try:
+        c.submit(4, agent=MyAgent)
+        raise AssertionError("expected SubmissionError")
+    except SubmissionError as exc:
+        assert str(exc) == "deploy_submission failed: Daily deployment limit (5) reached"
+        assert exc.status_code == 409
+        assert exc.body == _DEPLOY_409
+        assert exc.body["deployment_limits"]["daily_deploys_remaining"] == 0
+        assert exc.body["active_submission_limits"]["active_submissions_remaining"] == 2
+    assert (c._last_submission_id, c._last_challenge) == (11, 4)
+
+
+def _deploy_failed_status(failure_message, last_status_message="deploy failed"):
+    return {
+        "status": "deploy_failed", "phase": "deployment",
+        "last_status_message": last_status_message, "status_update_ts": None,
+        "is_uploadable": True, "is_deployable": True, "is_settled": True,
+        "latest_deploy": {"id": 9, "created_at_ts": None, "status": "failed",
+                          "finished_at_ts": None,
+                          "failure_message": failure_message},
+        "run_info": {"results": []}, "queue_info": {},
+    }
+
+
+def test_submit_wait_raises_when_the_deploy_fails():
+    """`wait=True` used to return `{"status": <deploy_failed block>}` as if
+    the deploy had succeeded, while the upload half of the same call raised.
+    The attempt's own reason is the message; the final payload is `.body`."""
+    final = _deploy_failed_status("Traceback: ModuleNotFoundError: torch")
+    c, rec = make_client(_submit_router_with(after_deploy=final))
+    try:
+        with_fake_clock(lambda: c.submit(4, agent=MyAgent, wait=True))
+        raise AssertionError("expected SubmissionError")
+    except SubmissionError as exc:
+        assert str(exc) == "Traceback: ModuleNotFoundError: torch"
+        assert exc.status_code is None
+        assert exc.body == final
+    assert rec.last["path"] == "/submissions/challenge/4/11/status"
+
+
+def test_submit_wait_falls_back_to_the_status_message_without_a_failure_message():
+    final = _deploy_failed_status(None, last_status_message="engine gone")
+    c, _ = make_client(_submit_router_with(after_deploy=final))
+    try:
+        with_fake_clock(lambda: c.submit(4, agent=MyAgent, wait=True))
+        raise AssertionError("expected SubmissionError")
+    except SubmissionError as exc:
+        assert str(exc) == "engine gone"
+        assert exc.body["status"] == "deploy_failed"
 
 
 def test_submit_without_wait_returns_as_soon_as_the_deploy_is_accepted():
@@ -467,8 +611,13 @@ def test_status_requires_ids():
 
 
 def test_challenge_read_routes():
-    c, rec = make_client(lambda m, p, k: (200, {"items": [], "metadata": {}})
-                         if p == "/challenges/" else (200, {"datasets": []}))
+    def router(m, p, k):
+        if p == "/challenges/":
+            return (200, {"items": [], "metadata": {}})
+        if p.startswith("/leaderboard/"):
+            return (200, {**_ENVELOPE, "leaders": []})
+        return (200, {"datasets": []})
+    c, rec = make_client(router)
     c.challenges()
     assert rec.last["path"] == "/challenges/"
     c.challenges(page=1)
@@ -487,9 +636,91 @@ def test_challenge_read_routes():
     assert rec.last["path"] == "/challenges/4/recent-replays"
     c.leaderboard(4)
     assert rec.last["path"] == "/leaderboard/challenge/4"
-    # Same: `IsMySubmission` is computed from the caller the token names. It
+    # Same: `is_my_submission` is computed from the caller the token names. It
     # was always False over the SDK because no token was sent.
     assert rec.last["headers"]["Authorization"].startswith("Bearer ")
+
+
+_CHALLENGE_BLOCK = {
+    "challenge_id": 4, "is_elo_score": False, "metric_order": "desc",
+    "ranked_order": "desc", "metric": "mean_reward", "metric2": None,
+    "frontend_precision": 2, "metrics_schema": None, "has_gpu": False,
+    "is_continuous": False,
+}
+
+_ENVELOPE = {
+    "challenge": _CHALLENGE_BLOCK,
+    "total": 12,
+    "leaders": [{"rank": 1, "username": "jo", "submission_id": 11,
+                 "mean_reward": 0.7, "is_my_submission": False,
+                 "passed": True}],
+    "me": {"rank": 4, "percentile": 66.7, "row": {}, "neighbors": []},
+    "matches": [{"rank": 1, "username": "jo"}],
+    "course_context": {"course_id": 3, "pass_threshold": 0.5},
+}
+
+
+def _has_pandas():
+    try:
+        import pandas  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def test_leaderboard_sends_the_consoles_query_keys():
+    """The console sends `aggregate`, `course_id`, `limit`, `window`, `me`, `q`;
+    the SDK sent only `limit`. Each is sent only when passed."""
+    c, rec = make_client(lambda m, p, k: (200, _ENVELOPE))
+    c.leaderboard(4, top=10, aggregate="user", course_id=3, me=True, q="jo", window=5)
+    assert rec.last["path"] == "/leaderboard/challenge/4"
+    assert rec.last["params"] == {"limit": 10, "aggregate": "user", "course_id": 3,
+                                  "window": 5, "me": "true", "q": "jo"}
+    c.leaderboard(4)
+    assert rec.last["params"] is None
+    c.leaderboard(4, aggregate="user")
+    assert rec.last["params"] == {"aggregate": "user"}
+    c.leaderboard(4, top=2)
+    assert rec.last["params"] == {"limit": 2}
+
+
+def test_leaderboard_is_one_shape_whatever_the_parameters():
+    """The backend serves one envelope, with or without `limit`. With
+    pandas the rows are `leaders` and every other block rides on `df.attrs`;
+    without pandas the envelope comes back as served. Nothing depends on
+    which parameters were passed."""
+    c, _ = make_client(lambda *_: (200, _ENVELOPE))
+    for kwargs in ({}, {"top": 10}, {"top": 10, "aggregate": "user"},
+                   {"top": 10, "course_id": 3}, {"top": 10, "me": True},
+                   {"q": "jo"}, {"window": 5}):
+        out = c.leaderboard(4, **kwargs)
+        if _has_pandas():
+            assert out.to_dict("records") == _ENVELOPE["leaders"], kwargs
+            assert out.attrs == {k: v for k, v in _ENVELOPE.items() if k != "leaders"}
+            assert out.attrs["challenge"]["ranked_order"] == "desc"
+            assert out.attrs["me"]["rank"] == 4
+        else:
+            assert out == _ENVELOPE, kwargs
+
+
+def test_leaderboard_without_course_context_attaches_none():
+    plain = {k: v for k, v in _ENVELOPE.items() if k != "course_context"}
+    c, _ = make_client(lambda *_: (200, plain))
+    out = c.leaderboard(4)
+    if _has_pandas():
+        assert "course_context" not in out.attrs
+    else:
+        assert "course_context" not in out
+
+
+def test_leaderboard_refused_query_carries_the_reply():
+    c, _ = make_client(lambda *_: (400, {"error": "Invalid aggregate value. Must be 'user' or omitted."}))
+    try:
+        c.leaderboard(4, aggregate="team")
+        raise AssertionError("expected MLArenaError")
+    except mlarena.MLArenaError as exc:
+        assert exc.status_code == 400
+        assert exc.body["error"].startswith("Invalid aggregate value")
 
 
 def test_challenge_admin_and_creator_routes():
@@ -523,13 +754,15 @@ def test_challenge_admin_and_creator_routes():
 
 
 def test_update_settings_sends_the_metric_direction():
+    """Every settings kwarg is the Evaluation column's own name — the
+    `evaluation_` prefix the payload used to carry is gone."""
     c, rec = make_client(scope="creator")
-    c.update_settings(4, evaluation_metric_order="asc",
-                      evaluation_episode_budget_brackets=[[0.5, 3], [0.1, 10]])
+    c.update_settings(4, metric_order="asc",
+                      episode_budget_brackets=[[0.5, 3], [0.1, 10]])
     assert rec.last["path"] == "/creator_challenge/challenge/4/settings"
     assert rec.last["json"] == {
-        "evaluation_metric_order": "asc",
-        "evaluation_episode_budget_brackets": [[0.5, 3], [0.1, 10]],
+        "metric_order": "asc",
+        "episode_budget_brackets": [[0.5, 3], [0.1, 10]],
     }
 
 
@@ -641,7 +874,9 @@ def test_old_settings_kwarg_sends_new_key():
 
 
 def test_challenge_rename_aliases_still_work():
-    c, rec = make_client(lambda m, p, k: (200, {"items": [], "metadata": {}}),
+    c, rec = make_client(lambda m, p, k: (200, {**_ENVELOPE, "leaders": []}
+                                          if p.startswith("/leaderboard/")
+                                          else {"items": [], "metadata": {}}),
                          scope="creator")
     _, msgs = _call_warns(c.competitions)
     assert rec.last["path"] == "/challenges/"
@@ -738,6 +973,110 @@ def test_a_failed_deploy_status_keeps_the_servers_reason():
         raise AssertionError("expected SubmissionError")
     except SubmissionError as exc:
         assert "the engine is down" in str(exc)
+        assert exc.status_code == 500
+        assert exc.body == {"error": "the engine is down"}
+
+
+def test_a_refused_deploy_carries_the_servers_limits():
+    """A deploy 409 body is `{"error", "deployment_limits",
+    "active_submission_limits"}` — the blocks `submission_deploy_status()`
+    returns. The message is unchanged; the body is new, on the exception."""
+    c, _ = make_client(lambda *_: (409, _DEPLOY_409))
+    try:
+        c.deploy_submission(4, 11)
+        raise AssertionError("expected SubmissionError")
+    except SubmissionError as exc:
+        assert str(exc) == "deploy_submission failed: Daily deployment limit (5) reached"
+        assert exc.status_code == 409
+        assert exc.body["deployment_limits"]["next_deploy_available_at"] == "2026-09-23T00:00:00+00:00"
+        assert exc.body["active_submission_limits"]["max_active_submissions"] == 3
+        assert isinstance(exc, mlarena.MLArenaError)
+
+
+def test_every_http_refusal_carries_status_code_and_body():
+    """401 / 403 / 404 / other: the same two attributes, the same messages."""
+    for code, cls, message in (
+        (401, AuthenticationError, "Invalid or missing API credentials."),
+        (403, PermissionDeniedError, "Access denied"),
+        (404, SubmissionNotFoundError, "Not found"),
+        (500, SubmissionError, "submission_status failed: request failed"),
+    ):
+        c, _ = make_client(lambda *_, code=code: (code, {}))
+        try:
+            c.submission_status(4, 11)
+            raise AssertionError(f"expected {cls.__name__}")
+        except cls as exc:
+            assert str(exc) == message, (code, str(exc))
+            assert exc.status_code == code
+            assert exc.body == {}
+
+    # A reply with no JSON object: the text is the message, `body` is None.
+    class NoJson(FakeResponse):
+        def json(self):
+            raise ValueError("no json")
+    c, _ = make_client()
+    c._request = lambda *a, **k: NoJson(502)
+    try:
+        c.submission_status(4, 11)
+        raise AssertionError("expected SubmissionError")
+    except SubmissionError as exc:
+        assert exc.status_code == 502
+        assert exc.body is None
+
+    # Not raised for a reply at all: both attributes default to None, and the
+    # positional message still works.
+    local = SubmissionError("Provide exactly one of agent= or files=")
+    assert (local.status_code, local.body) == (None, None)
+    assert str(local) == "Provide exactly one of agent= or files="
+
+
+def test_exception_classes_follow_their_section():
+    """The runtime methods raised `MLArenaError` while every other submission
+    method raises `SubmissionError`; `recent_replays` (a challenge read) raised
+    `SubmissionError`. `SubmissionError` is an `MLArenaError`, so `except
+    MLArenaError` around the runtime calls keeps working."""
+    c, _ = make_client(lambda *_: (500, {"error": "down"}))
+    for call in (lambda: c.runtime_options(4),
+                 lambda: c.agent_runtime(11),
+                 lambda: c.set_agent_runtime(11, 7)):
+        try:
+            call()
+            raise AssertionError("expected SubmissionError")
+        except SubmissionError as exc:
+            assert exc.status_code == 500
+    try:
+        c.recent_replays(4)
+        raise AssertionError("expected MLArenaError")
+    except SubmissionError:
+        raise AssertionError("recent_replays is a challenge read, not a submission error")
+    except mlarena.MLArenaError as exc:
+        assert str(exc) == "recent_replays failed: down"
+
+
+def test_create_submission_404_names_the_id_that_is_wrong():
+    """`copy_from_submission_id` pointing at a missing (or someone else's)
+    submission answers 404 "Source submission not found"; it read as a
+    missing *challenge*."""
+    c, _ = make_client(lambda *_: (404, {"error": "Source submission not found"}))
+    try:
+        c.create_submission(4, "copy", copy_from_submission_id=99)
+        raise AssertionError("expected SubmissionNotFoundError")
+    except SubmissionNotFoundError as exc:
+        assert str(exc) == "Source submission not found"
+        assert exc.status_code == 404
+    c, _ = make_client(lambda *_: (404, {"error": "Challenge not found"}))
+    try:
+        c.create_submission(4, "plain")
+        raise AssertionError("expected ChallengeNotFoundError")
+    except ChallengeNotFoundError as exc:
+        assert str(exc) == "Challenge not found"
+
+
+def test_to_dataframe_passes_a_dict_through():
+    """The `{columns, data}` branch is gone: no route ever produced it."""
+    env = {"total": 1, "leaders": [{"rank": 1}]}
+    assert client_module._to_dataframe(env) is env
+    assert "columns" not in client_module._to_dataframe.__code__.co_consts
 
 
 def test_my_submissions_route_and_shape():
@@ -766,7 +1105,7 @@ def test_set_submission_visibility_route_and_body():
 
 
 def test_submission_overview_route():
-    c, rec = make_client(lambda *_: (200, {"rank": 2, "last_error_type": None}))
+    c, rec = make_client(lambda *_: (200, {"rank": 2, "agent_error_type": None}))
 
     out = c.submission_overview(4, 11)
 
@@ -787,6 +1126,86 @@ def test_the_client_reads_no_retired_payload_key():
     for old in ("position_in_queue", "steps_completed", "current_reward",
                 "deploymentLimits", "latestDeploy", "creation_date",
                 "daily_deploys_count", "isEloRanked", "latest_error",
-                "submission_performance"):
+                "submission_performance",
+                # 3.0: the flat 2.x run and the PascalCase leaderboard row
+                "error_type", "opponents", "number_agent", "summary_status",
+                "Rank", "Username", "SubmissionName", "MeanReward",
+                "IsMySubmission", "submissionId", "RankedOrder",
+                "IsEloRanked", "PassThreshold", "Passed", "ranked_by",
+                # the overview's renamed error pair (the run's column names)
+                "last_error_type", "last_error_message"):
         for literal in (f'"{old}"', f"'{old}'"):
             assert literal not in src, literal
+
+
+# --------------------------------------------------------------------------- #
+# 3.0: every read sends the bearer token, every refusal is an SDK exception
+# --------------------------------------------------------------------------- #
+
+
+def _every_read(c):
+    """One call per method that used to skip the token or end on
+    `requests`' `raise_for_status()` (the tag resolution behind
+    `set_challenge_tags(tag_names=…)` included)."""
+    return [
+        lambda: c.challenges(),
+        lambda: c.challenges(page=1),
+        lambda: c.challenge(4),
+        lambda: c.list_tags(),
+        lambda: c.set_challenge_tags(4, tag_names=["rl"]),
+        lambda: c.benchmark_status(4),
+        lambda: c.global_ranking(),
+        lambda: c.user_global_rank(7),
+        lambda: c.data_source_weather_cities(),
+    ]
+
+
+def test_every_read_sends_the_bearer_token():
+    """`user_global_rank` is login-required and was sent without the token,
+    so it answered 401 for everyone. `list_tags`, `global_ranking` and the
+    data-source reads are public, but a public route answers differently to
+    a caller it can identify, and PROCESS.md promises the token on every
+    read."""
+    def router(method, path, kwargs):
+        if path == "/challenge_tags/tags":
+            return (200, [{"id": 1, "name": "rl"}])
+        if path == "/ranking/":
+            return (200, {"rankings": [], "metadata": {"total_users": 0}})
+        return (200, {"ok": True})
+
+    c, rec = make_client(router, scope="creator")
+    for call in _every_read(c):
+        rec.calls.clear()
+        call()
+        assert rec.calls
+        for made in rec.calls:
+            auth = (made.get("headers") or {}).get("Authorization", "")
+            assert auth.startswith("Bearer "), made["path"]
+
+
+def test_no_api_call_ends_on_raise_for_status():
+    """A 5xx used to surface as `requests.HTTPError` with the server's
+    reason thrown away, and a 401 on the routes that never called
+    `_handle_response` was an `HTTPError` too. Every API refusal is an SDK
+    exception carrying the reply. (`FakeResponse.raise_for_status` raises
+    `AssertionError`, so a leftover call fails this test on its own.)"""
+    c, _ = make_client(lambda *_: (500, {"error": "boom"}), scope="creator")
+    for call in _every_read(c):
+        try:
+            call()
+            raise AssertionError("expected MLArenaError")
+        except mlarena.MLArenaError as exc:
+            assert (exc.status_code, exc.body) == (500, {"error": "boom"})
+
+    c, _ = make_client(lambda *_: (401, {"error": "nope"}), scope="creator")
+    for call in _every_read(c):
+        try:
+            call()
+            raise AssertionError("expected AuthenticationError")
+        except mlarena.AuthenticationError as exc:
+            assert (exc.status_code, exc.body) == (401, {"error": "nope"})
+
+    # The one `.raise_for_status()` left is the signed-GCS dataset download
+    # in `download_dataset`: a GCS reply, not an API one (no `error` body).
+    with open(os.path.join(SDK_ROOT, "mlarena", "client.py"), encoding="utf-8") as fh:
+        assert fh.read().count(".raise_for_status()") == 1

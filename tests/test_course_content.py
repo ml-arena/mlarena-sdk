@@ -1,4 +1,4 @@
-"""SDK tests for the course-content methods (`05-SDK.md` §D).
+"""SDK tests for the course-content methods.
 
 These mock the REST surface by replacing the client's single HTTP chokepoint
 (``MLArenaClient._request``) with a recorder that captures every call and
@@ -91,8 +91,11 @@ def test_create_module_body_and_auth():
     c.create_module("NLP", summary="intro", visibility="public")
     _expect(rec.last["method"] == "POST", rec.last["method"])
     _expect(rec.last["path"] == "/teacher/modules", rec.last["path"])
+    # `is_published` (the student gate) rides in every create body, default
+    # True, so an existing course dir publishes unchanged.
     _expect(rec.last["json"] == {"title": "NLP", "visibility": "public",
-                                 "summary": "intro"}, rec.last["json"])
+                                 "is_published": True, "summary": "intro"},
+            rec.last["json"])
     auth = rec.last["headers"]["Authorization"]
     _expect(auth.startswith("Bearer mlk_teacher_"), auth)
 
@@ -297,13 +300,14 @@ def test_gated_lesson_403_maps_to_auth_error():
 # --------------------------------------------------------------------------- #
 
 
-def test_create_course_requires_dates_and_sends_extended_fields():
+def test_create_course_sends_only_what_was_passed():
+    """`start_date` / `end_date` are optional and left out of the body when
+    not given (it used to raise locally without them): a bare
+    `create_course("X")` is one `{"name": "X"}` POST."""
     c, rec = make_client(lambda *_: (201, {"id": 1, "slug": "x"}))
-    try:
-        c.create_course("X")
-        raise AssertionError("expected MLArenaError without dates")
-    except MLArenaError:
-        pass
+    c.create_course("X")
+    _expect(rec.last["method"] == "POST", rec.last["method"])
+    _expect(rec.last["json"] == {"name": "X"}, rec.last["json"])
 
     c.create_course("X", code="RL101", start_date="2026-01-01", end_date="2026-02-01",
                     slug="x", description="d", visibility="public")
@@ -479,10 +483,13 @@ def _export_router(method, path, kwargs):
             "instructor_name": "Prof", "start_date": "2026-01-01",
             "end_date": "2026-06-01",
             "modules": [{
-                "module_id": 1, "title": "Foundations", "slug": "foundations",
-                "summary": "s", "icon": "book",
-                "challenges": [{"challenge_id": 42, "label": "CartPole",
-                                "name": "CartPole-v1", "pass_threshold": None}],
+                "id": 1, "title": "Foundations", "slug": "foundations",
+                "summary": "s", "icon": "book", "layout": "advanced",
+                "challenges": [{
+                    "challenge": {"id": 42, "name": "CartPole-v1"},
+                    "label": "CartPole", "pass_threshold": None,
+                    "ranked_order": "desc",
+                }],
                 "lessons": [{"title": "What is RL?", "slug": "what-is-rl",
                              "kind": "lesson", "gated": False,
                              "is_published": True, "estimated_minutes": 10}],

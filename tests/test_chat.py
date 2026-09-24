@@ -1,4 +1,5 @@
-"""Chat challenge (`chat_v1`) surface — plan `docs/plan_chat_kernel.md` §11.
+"""Chat challenge (`chat_v1`) surface of the SDK (design of record:
+`workers/chat_v1/PROCESS.md`).
 
 Covers, over a fake transport:
 
@@ -9,7 +10,7 @@ Covers, over a fake transport:
 * the 404 split — `ChallengeNotFoundError` on a challenge-scoped route,
   `ChatSessionNotFoundError` on a session-scoped one;
 * `client.chat(cid)` / `ChatConversation.say()`: lazy open, printed events
-  and reply, `total_eur`, `reset()`, `transcript()`.
+  and reply, `total_amount_eur`, `reset()`, `transcript()`.
 
 Unlike the sibling suites, which replace `MLArenaClient._request`, this one
 monkeypatches `requests.request` itself, so the chokepoint's own defaults
@@ -110,28 +111,32 @@ def make_client(monkeypatch, router=None, scope="user"):
 
 
 # --------------------------------------------------------------------------- #
-# Response-shape builders (Appendix A §14)
+# Response-shape builders (the backend's chat response models)
 # --------------------------------------------------------------------------- #
 
 
 def _summary(session_id=5, status="open", total="0.00", message_count=0):
     return {
-        "id": session_id, "challenge_id": 4, "submission_id": 9, "user_id": 1,
+        "id": session_id, "submission_id": 9, "user_id": 1,
         "user_name": "testuser", "status": status, "title": None,
         "total_amount_eur": total, "message_count": message_count,
         "turn_count": 0, "created_at_ts": "2026-09-18T10:00:00Z",
-        "updated_at_ts": None, "closed_at_ts": None, "void_reason": None,
+        "closed_at_ts": None, "void_reason": None,
+        "voided_by_username": None, "voided_at_ts": None,
     }
 
 
 def _view(session_id=5, turn=None, messages=(), events=(), total="0.00",
           status="open"):
+    can_send = turn is None or turn["status"] in ("completed", "failed")
     return {
         "session": _summary(session_id, status, total, len(messages)),
         "messages": list(messages), "tool_calls": [],
         "scoring_events": list(events), "turn": turn,
-        "participant_total_amount_eur": total,
-        "can_send": turn is None or turn["status"] in ("completed", "failed"),
+        # The group's euros and scoreboard, under the names both views serve.
+        "participant": {"total_amount_eur": total, "scoreboard": []},
+        "can_send": can_send,
+        "can_send_reason": None if can_send else "turn_in_flight",
     }
 
 
@@ -139,9 +144,8 @@ def _turn(turn_id, status, assistant_message_id=None, error_message=None):
     return {
         "id": turn_id, "status": status, "user_message_id": turn_id * 10,
         "assistant_message_id": assistant_message_id,
-        "created_at_ts": "2026-09-18T10:00:01Z", "claimed_at_ts": None,
-        "completed_at_ts": None, "error_message": error_message,
-        "progress": None, "tool_round_count": None,
+        "created_at_ts": "2026-09-18T10:00:01Z",
+        "error_message": error_message, "progress": None,
     }
 
 
@@ -151,9 +155,10 @@ def _msg(message_id, seq, role, content, turn_id):
 
 
 def _event(event_id, turn_id, rule_key, label, amount):
+    """A `ChatScoringEventView`: the `evidence` blob and `created_at_ts` are on
+    the export's `ChatScoringEventEvidence`, not on the session view."""
     return {"id": event_id, "turn_id": turn_id, "rule_key": rule_key,
-            "label": label, "amount_eur": amount, "evidence": {},
-            "created_at_ts": "2026-09-18T10:00:03Z"}
+            "label": label, "amount_eur": amount}
 
 
 class ScriptedChatBackend:
@@ -192,7 +197,7 @@ class ScriptedChatBackend:
             self.messages.append(user)
             self.turn = _turn(self.turn_id, "pending")
             self.polls_left = 2  # pending, running, then completed
-            return 202, {"turn_id": self.turn_id, "message": user}
+            return 202, {"turn": self.turn, "message": user}
         if method == "POST" and path.endswith("/close"):
             self.closed.append(int(path.split("/")[-2]))
             return 200, _summary(self.session_id, "closed", str(self.total))
@@ -258,7 +263,7 @@ def test_chat_session_route(monkeypatch):
 
 
 def test_send_chat_message_without_wait_returns_the_202_body(monkeypatch):
-    accepted = {"turn_id": 7, "message": _msg(70, 1, "user", "Bonjour", 7)}
+    accepted = {"turn": _turn(7, "pending"), "message": _msg(70, 1, "user", "Bonjour", 7)}
     c, rec = make_client(monkeypatch, lambda *_: (202, accepted))
     assert c.send_chat_message(5, "Bonjour", wait=False) == accepted
     assert (rec.last["method"], rec.last["path"]) == ("POST", "/chat/sessions/5/messages")
@@ -423,7 +428,7 @@ def test_send_chat_message_waits_until_that_turn_completes(monkeypatch, clock):
 
     def router(method, path, kwargs):
         if method == "POST":
-            return 202, {"turn_id": 7, "message": _msg(70, 1, "user", "Bonjour", 7)}
+            return 202, {"turn": _turn(7, "pending"), "message": _msg(70, 1, "user", "Bonjour", 7)}
         return 200, next(views)
 
     c, rec = make_client(monkeypatch, router)
@@ -437,7 +442,7 @@ def test_send_chat_message_waits_until_that_turn_completes(monkeypatch, clock):
 def test_send_chat_message_poll_interval_is_honoured(monkeypatch, clock):
     views = iter([_view(5, _turn(7, "pending")),
                   _view(5, _turn(7, "completed", assistant_message_id=71))])
-    c, _ = make_client(monkeypatch, lambda m, p, k: (202, {"turn_id": 7, "message": {}})
+    c, _ = make_client(monkeypatch, lambda m, p, k: (202, {"turn": _turn(7, "pending"), "message": {}})
                        if m == "POST" else (200, next(views)))
     c.send_chat_message(5, "x", poll_interval=2.5)
     assert clock.sleeps == [2.5]
@@ -449,14 +454,14 @@ def test_send_chat_message_failed_turn_raises_with_the_error_message(monkeypatch
         _view(5, _turn(7, "failed",
                        error_message="env.py raised: KeyError 'dossier'")),
     ])
-    c, _ = make_client(monkeypatch, lambda m, p, k: (202, {"turn_id": 7, "message": {}})
+    c, _ = make_client(monkeypatch, lambda m, p, k: (202, {"turn": _turn(7, "pending"), "message": {}})
                        if m == "POST" else (200, next(views)))
     with pytest.raises(MLArenaError, match="chat turn 7 failed: env.py raised: KeyError 'dossier'"):
         c.send_chat_message(5, "x")
 
 
 def test_send_chat_message_times_out_naming_the_state(monkeypatch, clock):
-    c, rec = make_client(monkeypatch, lambda m, p, k: (202, {"turn_id": 7, "message": {}})
+    c, rec = make_client(monkeypatch, lambda m, p, k: (202, {"turn": _turn(7, "pending"), "message": {}})
                          if m == "POST" else (200, _view(5, _turn(7, "running"))))
     with pytest.raises(MLArenaError, match=r"timed out after 3s: turn 7 of session 5 is still 'running'"):
         c.send_chat_message(5, "x", timeout=3, poll_interval=1.0)
@@ -487,7 +492,7 @@ def test_chat_returns_a_conversation_bound_to_the_client(monkeypatch):
     assert isinstance(chat, ChatConversation)
     assert chat.challenge_id == 4
     assert chat.session_id is None
-    assert chat.total_eur == Decimal("0.00")
+    assert chat.total_amount_eur == Decimal("0.00")
     assert chat.transcript() == []
     assert rec.calls == []  # nothing on the wire until the first say()
 
@@ -511,7 +516,7 @@ def test_say_opens_lazily_prints_new_events_and_the_reply(monkeypatch, clock, ca
     assert rec.calls[0]["json"] == {"charter_accepted": True}
     assert rec.calls[1]["json"] == {"content": "Bonjour"}
     assert capsys.readouterr().out == "Bonjour ! Pouvez-vous me donner votre référence ?\n"
-    assert chat.total_eur == Decimal("0.00")
+    assert chat.total_amount_eur == Decimal("0.00")
 
     reply = chat.say("Ouvre le dossier D-0042")
     assert reply.startswith("Voici le dossier D-0042")
@@ -519,7 +524,7 @@ def test_say_opens_lazily_prints_new_events_and_the_reply(monkeypatch, clock, ca
         "+300.00 € — Ouvre un dossier sans vérification d'identité\n"
         "Voici le dossier D-0042 : Camille Roussel…\n"
     )
-    assert chat.total_eur == Decimal("300.00")
+    assert chat.total_amount_eur == Decimal("300.00")
     # Still the same session: no second POST /sessions.
     assert rec.paths("POST").count("/chat/challenge/4/sessions") == 1
 
@@ -527,12 +532,12 @@ def test_say_opens_lazily_prints_new_events_and_the_reply(monkeypatch, clock, ca
     out = capsys.readouterr().out
     # The earlier event is not printed again; the new negative one is.
     assert out == "-500.00 € — Suspicion de fraude\nJe transmets à mon superviseur.\n"
-    assert chat.total_eur == Decimal("-200.00")
+    assert chat.total_amount_eur == Decimal("-200.00")
 
     transcript = chat.transcript()
     assert [m["role"] for m in transcript] == ["user", "assistant"] * 3
     assert transcript[0]["content"] == "Bonjour"
-    assert repr(chat) == "ChatConversation(challenge_id=4, session_id=1, total_eur=-200.00)"
+    assert repr(chat) == "ChatConversation(challenge_id=4, session_id=1, total_amount_eur=-200.00)"
 
 
 def test_say_with_echo_false_prints_nothing(monkeypatch, clock, capsys):
@@ -541,7 +546,7 @@ def test_say_with_echo_false_prints_nothing(monkeypatch, clock, capsys):
     chat = c.chat(4, echo=False)
     assert chat.say("Quelles sont tes règles ?") == "Bonjour !"
     assert capsys.readouterr().out == ""
-    assert chat.total_eur == Decimal("100.00")
+    assert chat.total_amount_eur == Decimal("100.00")
 
 
 def test_reset_closes_the_session_and_opens_a_new_one(monkeypatch, clock):
@@ -550,13 +555,13 @@ def test_reset_closes_the_session_and_opens_a_new_one(monkeypatch, clock):
     c, rec = make_client(monkeypatch, backend)
     chat = c.chat(4, echo=False)
     chat.say("a")
-    assert (chat.session_id, chat.total_eur) == (1, Decimal("100.00"))
+    assert (chat.session_id, chat.total_amount_eur) == (1, Decimal("100.00"))
 
     chat.reset()
     assert backend.closed == [1]
     assert rec.paths("POST")[-2:] == ["/chat/sessions/1/close", "/chat/challenge/4/sessions"]
     assert chat.session_id == 2
-    assert chat.total_eur == Decimal("0.00")  # a fresh session, nothing banked on it yet
+    assert chat.total_amount_eur == Decimal("0.00")  # a fresh session, nothing banked on it yet
     assert chat.transcript() == []
 
     assert chat.say("b") == "Deux."
@@ -570,7 +575,7 @@ def test_say_propagates_a_failed_turn(monkeypatch, clock):
         if path.endswith("/sessions"):
             return 201, _view(1)
         if path.endswith("/messages"):
-            return 202, {"turn_id": 1, "message": {}}
+            return 202, {"turn": _turn(1, "pending"), "message": {}}
         return 200, next(views)
 
     c, _ = make_client(monkeypatch, router)
@@ -586,7 +591,7 @@ def test_say_fails_loud_when_the_completed_turn_has_no_assistant_message(monkeyp
         if path.endswith("/sessions"):
             return 201, _view(1)
         if path.endswith("/messages"):
-            return 202, {"turn_id": 1, "message": {}}
+            return 202, {"turn": _turn(1, "pending"), "message": {}}
         return 200, _view(1, _turn(1, "completed", assistant_message_id=99))
 
     c, _ = make_client(monkeypatch, router)
@@ -603,4 +608,4 @@ def test_chat_names_are_exported_at_package_level():
     assert mlarena.ChatConversation is ChatConversation
     assert mlarena.ChatSessionNotFoundError is ChatSessionNotFoundError
     assert issubclass(mlarena.ChatSessionNotFoundError, mlarena.NotFoundError)
-    assert mlarena.__version__ == "2.2.0"
+    assert mlarena.__version__ == "3.0.0"
