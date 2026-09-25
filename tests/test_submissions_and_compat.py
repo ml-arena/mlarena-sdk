@@ -1205,7 +1205,7 @@ def test_no_api_call_ends_on_raise_for_status():
         except mlarena.AuthenticationError as exc:
             assert (exc.status_code, exc.body) == (401, {"error": "nope"})
 
-    # The one `.raise_for_status()` left is the signed-GCS dataset download
-    # in `download_dataset`: a GCS reply, not an API one (no `error` body).
+    # The one `.raise_for_status()` left is the presigned-R2 dataset download
+    # in `download_dataset`: an R2 reply, not an API one (no `error` body).
     with open(os.path.join(SDK_ROOT, "mlarena", "client.py"), encoding="utf-8") as fh:
         assert fh.read().count(".raise_for_status()") == 1

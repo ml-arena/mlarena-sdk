@@ -631,7 +631,7 @@ class MLArenaClient:
 
         Convenience composition over `datasets()`: resolves the signed
         `download_url`s and streams each file to `<dest_dir>/<label>`. The
-        signed URLs are pre-authenticated GCS links, so they are fetched
+        signed URLs are pre-authenticated R2 links, so they are fetched
         WITHOUT the bearer token (and redirects are followed, unlike the API
         calls). Returns the list of written file paths. This is the call a
         starter notebook makes to get the challenge data.
@@ -644,7 +644,7 @@ class MLArenaClient:
                 url = f.get("download_url")
                 if not url:
                     continue
-                # Signed GCS URL: no auth header, follow redirects.
+                # Presigned R2 URL: no auth header, follow redirects.
                 resp = self._request("GET", url, allow_redirects=True, timeout=300, stream=True)
                 resp.raise_for_status()
                 out_path = os.path.join(dest_dir, f["label"])
@@ -1443,7 +1443,7 @@ class MLArenaClient:
 
         Multipart POST to
         `/api/creator_challenge/challenge/{id}/datasets/{dataset_id}/files`
-        (`datasets.py`, `upload_dataset_file`); the file is stored in GCS and
+        (`datasets.py`, `upload_dataset_file`); the file is stored in R2 and
         exposed to participants through `datasets()` as a signed
         `download_url`. Rejected once the challenge is started. Returns
         `{"id", "label", "file_size_bytes"}`.
@@ -1516,7 +1516,7 @@ class MLArenaClient:
         DELETE to
         `/api/creator_challenge/challenge/{id}/datasets/{dataset_id}/files/{file_id}`
         (`datasets.py`, `delete_dataset_file`); removes the DB row and its
-        GCS blob. Rejected once the challenge is started. Use this before re-uploading a file with the
+        R2 object. Rejected once the challenge is started. Use this before re-uploading a file with the
         same name — `upload_dataset_file` always adds a new row, so replacing a
         file means delete-then-upload. Get `file_id` from `creator_datasets()`.
 
@@ -2176,7 +2176,7 @@ class MLArenaClient:
         (`job_status`, `env_error_type`, `env_nb_steps`, and the
         `submission_results` rows — yours is the one whose `submission_id`
         is this submission's, with `agent_error_type` /
-        `agent_error_message`) plus `signed_url`, the GCS render log (60-day
+        `agent_error_message`) plus `signed_url`, the replay file (60-day
         retention; None when the run wrote none), and `render_delay_second`.
         A crashed run reads as a crash here too; it used to be listed as an
         ordinary lost game, `outcome: "loser"` with a reward of 0.0 and no
@@ -2274,7 +2274,7 @@ class MLArenaClient:
 
         Mirrors `GET /api/challenges/{id}/recent-replays`. Each replay
         carries `simulation_id`, `created_at_ts`, `render_delay_second`,
-        `signed_url` (GCS render file) and `participants`; each participant
+        `signed_url` (replay file) and `participants`; each participant
         carries `submission_name`, `user_name`, `submission_reward`,
         `game_outcome` and `final_rank` — the SubmissionResult columns under
         their own names. Only runs from the last 59 days are listed: the

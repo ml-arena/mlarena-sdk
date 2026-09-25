@@ -523,7 +523,7 @@ Create a client. `api_key` must be the full `mlk_<scope>_<lookup>_<secret>` toke
 - `client.submission_status(challenge_id, submission_id)` — rich status: the status block (see below) plus `submission_name`, `queue_info`, `run_info`, `latest_deploy`.
 - `client.submission_deploy_status(challenge_id, submission_id)` — deploy quotas + last deploy.
 - `client.submission_overview(challenge_id, submission_id)` — aggregate score, rank, last-24h resource use and the newest run's failure.
-- `client.submission_games(submission_id)` — recent games with signed log URLs (60-day GCS retention). Each row's `run` is the same run shape `submission_status` serves.
+- `client.submission_games(submission_id)` — recent games with signed replay file URLs (replays are kept 60 days). Each row's `run` is the same run shape `submission_status` serves.
 - `client.tail_logs(challenge_id, submission_id, follow=False, poll_sec=5.0, timeout_sec=None)` — generator of status / run lines; stops on `is_settled`, emits a line only when what it says changed, and raises `SubmissionError` if `timeout_sec` runs out.
 - `client.status(submission_id=None, challenge_id=None)` — defaults to the last submission.
 
@@ -670,7 +670,7 @@ chat.reset()                                            # close it and start a f
 ### Datasets (file challenges)
 
 For file challenges the creator publishes the participant-facing data as a
-**dataset** (stored in GCS, served as short-lived signed URLs):
+**dataset** (stored in Cloudflare R2, served as short-lived signed URLs):
 
 - `client.create_dataset(challenge_id, label, description=None)` — creator scope. Make a dataset bucket (before `start_challenge`).
 - `client.upload_dataset_file(challenge_id, dataset_id, file_path)` — creator scope. Add a file to the bucket.
