@@ -687,19 +687,24 @@ def test_challenge_read_routes():
     assert rec.last["headers"]["Authorization"].startswith("Bearer ")
 
 
+_REWARD_SPEC = {
+    "key": "reward", "label": "Reward", "source": "score", "agg": "mean",
+    "order": "desc", "format": "number", "unit": None, "precision": 2,
+    "is_ranking": True, "visible": True,
+}
+
 _CHALLENGE_BLOCK = {
-    "challenge_id": 4, "is_elo_score": False, "metric_order": "desc",
-    "ranked_order": "desc", "metric": "mean_reward", "metric2": None,
-    "frontend_precision": 2, "metrics_schema": None, "has_gpu": False,
-    "is_continuous": False,
+    "challenge_id": 4, "metrics": [_REWARD_SPEC], "window_days": None,
+    "has_gpu": False,
 }
 
 _ENVELOPE = {
     "challenge": _CHALLENGE_BLOCK,
     "total": 12,
     "leaders": [{"rank": 1, "username": "jo", "submission_id": 11,
-                 "mean_reward": 0.7, "is_my_submission": False,
-                 "passed": True}],
+                 "score": 0.7, "score_ci95": None,
+                 "metrics": {"reward": 0.7}, "metrics_window": None,
+                 "is_my_submission": False, "passed": True}],
     "me": {"rank": 4, "percentile": 66.7, "row": {}, "neighbors": []},
     "matches": [{"rank": 1, "username": "jo"}],
     "course_context": {"course_id": 3, "pass_threshold": 0.5},
@@ -741,9 +746,16 @@ def test_leaderboard_is_one_shape_whatever_the_parameters():
                    {"q": "jo"}, {"window": 5}):
         out = c.leaderboard(4, **kwargs)
         if _has_pandas():
-            assert out.to_dict("records") == _ENVELOPE["leaders"], kwargs
-            assert out.attrs == {k: v for k, v in _ENVELOPE.items() if k != "leaders"}
-            assert out.attrs["challenge"]["ranked_order"] == "desc"
+            assert out.to_dict("records") == [{
+                "rank": 1, "username": "jo", "submission_id": 11,
+                "score": 0.7, "score_ci95": None, "is_my_submission": False,
+                "passed": True, "reward": 0.7,
+            }], kwargs
+            assert out.attrs == {
+                **{k: v for k, v in _ENVELOPE.items() if k != "leaders"},
+                "metrics": [_REWARD_SPEC],
+            }
+            assert out.attrs["metrics"][0]["order"] == "desc"
             assert out.attrs["me"]["rank"] == 4
         else:
             assert out == _ENVELOPE, kwargs
@@ -800,16 +812,163 @@ def test_challenge_admin_and_creator_routes():
 
 
 def test_update_settings_sends_the_metric_direction():
-    """Every settings kwarg is the Evaluation column's own name — the
-    `evaluation_` prefix the payload used to carry is gone."""
+    """The direction is the ranking spec's `order`, sent inside `metrics` —
+    every settings kwarg is the Evaluation column's own name."""
+    asc = {**_REWARD_SPEC, "key": "rmse", "label": "RMSE", "order": "asc"}
     c, rec = make_client(scope="creator")
-    c.update_settings(4, metric_order="asc",
+    c.update_settings(4, metrics=[asc],
                       episode_budget_brackets=[[0.5, 3], [0.1, 10]])
     assert rec.last["path"] == "/creator_challenge/challenge/4/settings"
     assert rec.last["json"] == {
-        "metric_order": "asc",
+        "metrics": [asc],
         "episode_budget_brackets": [[0.5, 3], [0.1, 10]],
     }
+
+
+def test_update_settings_metric_order_is_a_type_error():
+    """4.0.0 (D5): `metric_order=` is not an alias of anything; the error
+    names `metrics`, the keyword that replaced it."""
+    c, rec = make_client(scope="creator")
+    try:
+        c.update_settings(4, metric_order="asc")
+    except TypeError as exc:
+        assert "metrics=" in str(exc)
+        assert rec.calls == []
+    else:
+        raise AssertionError("metric_order= was accepted")
+
+
+# --------------------------------------------------------------------------- #
+# 4.0.0: the leaderboard DataFrame spreads the declared metrics
+# --------------------------------------------------------------------------- #
+
+_CRPS_METRICS = [
+    {"key": "crps", "label": "Mean CRPS", "source": "score", "agg": "mean",
+     "order": "asc", "format": "number", "unit": "mm", "precision": 4,
+     "is_ranking": True, "visible": True},
+    {"key": "n_samples", "label": "Samples", "source": "env", "agg": "sum",
+     "order": None, "format": "integer", "unit": None, "precision": 0,
+     "is_ranking": False, "visible": True},
+    {"key": "action_time_max", "label": "Max step time", "source": "platform",
+     "agg": "max", "order": "asc", "format": "seconds", "unit": None,
+     "precision": 3, "is_ranking": False, "visible": False},
+]
+
+
+def _board(window_days, leaders):
+    return {
+        "challenge": {"challenge_id": 9, "metrics": _CRPS_METRICS,
+                      "window_days": window_days, "has_gpu": False},
+        "total": len(leaders), "leaders": leaders, "me": None, "matches": [],
+    }
+
+
+def _leader(rank, score, metrics, window):
+    return {"rank": rank, "username": f"u{rank}", "submission_id": 100 + rank,
+            "score": score, "score_ci95": None, "metrics": metrics,
+            "metrics_window": window, "number_of_runs": 3}
+
+
+def test_leaderboard_dataframe_has_one_column_per_declared_key():
+    if not _has_pandas():
+        return
+    board = _board(None, [
+        _leader(1, 0.21, {"crps": 0.21, "n_samples": 40.0,
+                          "action_time_max": 0.5}, None),
+        _leader(2, None, None, None),  # no scored run yet
+    ])
+    c, _ = make_client(lambda *_: (200, board))
+    df = c.leaderboard(9)
+    assert "metrics" not in df.columns and "metrics_window" not in df.columns
+    for key in ("score", "crps", "n_samples", "action_time_max"):
+        assert key in df.columns, key
+    assert not any(col.startswith("metrics_window_") for col in df.columns)
+    assert df.loc[0, "crps"] == 0.21 and df.loc[0, "score"] == 0.21
+    assert df.loc[0, "n_samples"] == 40.0
+    assert df.loc[1, "crps"] is None or df["crps"].isna()[1]
+    assert df.attrs["metrics"] == _CRPS_METRICS
+    assert df.attrs["challenge"]["metrics"] == _CRPS_METRICS
+    assert df.attrs["challenge"]["window_days"] is None
+
+
+def test_leaderboard_dataframe_windowed_columns():
+    if not _has_pandas():
+        return
+    board = _board(30, [
+        _leader(1, 0.21, {"crps": 0.21, "n_samples": 40.0,
+                          "action_time_max": 0.5},
+                {"crps": 0.19, "n_samples": 12.0, "action_time_max": 0.4}),
+        _leader(2, 0.30, {"crps": 0.30, "n_samples": 10.0,
+                          "action_time_max": 0.2}, None),  # empty window
+    ])
+    c, _ = make_client(lambda *_: (200, board))
+    df = c.leaderboard(9)
+    for key in ("crps", "n_samples", "action_time_max"):
+        assert f"metrics_window_{key}" in df.columns, key
+    assert df.loc[0, "metrics_window_crps"] == 0.19
+    assert df.loc[0, "metrics_window_n_samples"] == 12.0
+    assert df["metrics_window_crps"].isna()[1]
+    assert df.loc[1, "crps"] == 0.30
+
+
+def test_leaderboard_row_missing_a_declared_key_fails_fast():
+    """The backend serves every declared key; a row without one is drift and
+    raises, instead of showing an empty cell."""
+    if not _has_pandas():
+        return
+    board = _board(None, [_leader(1, 0.21, {"crps": 0.21}, None)])
+    c, _ = make_client(lambda *_: (200, board))
+    try:
+        c.leaderboard(9)
+    except KeyError as exc:
+        assert "n_samples" in str(exc)
+    else:
+        raise AssertionError("a row missing a declared key was accepted")
+
+
+def test_leaderboard_key_colliding_with_a_row_column_raises():
+    if not _has_pandas():
+        return
+    spec = {**_REWARD_SPEC, "key": "username"}
+    board = {
+        "challenge": {"challenge_id": 9, "metrics": [spec],
+                      "window_days": None, "has_gpu": False},
+        "total": 1, "me": None, "matches": [],
+        "leaders": [{"rank": 1, "username": "jo", "score": 1.0,
+                     "metrics": {"username": 1.0}, "metrics_window": None}],
+    }
+    c, _ = make_client(lambda *_: (200, board))
+    try:
+        c.leaderboard(9)
+    except mlarena.MLArenaError as exc:
+        assert "username" in str(exc)
+    else:
+        raise AssertionError("a colliding metric key overwrote a row column")
+
+
+def test_leaderboard_without_pandas_keeps_the_metrics_dicts():
+    """Without pandas the envelope is returned as served: `metrics` stays a
+    dict on each row."""
+    import builtins
+    real_import = builtins.__import__
+
+    def no_pandas(name, *args, **kwargs):
+        if name == "pandas":
+            raise ImportError("no pandas")
+        return real_import(name, *args, **kwargs)
+
+    board = _board(30, [_leader(1, 0.2, {"crps": 0.2, "n_samples": 1.0,
+                                         "action_time_max": 0.1},
+                                {"crps": 0.2, "n_samples": 1.0,
+                                 "action_time_max": 0.1})])
+    c, _ = make_client(lambda *_: (200, board))
+    builtins.__import__ = no_pandas
+    try:
+        out = c.leaderboard(9)
+    finally:
+        builtins.__import__ = real_import
+    assert out == board
+    assert out["leaders"][0]["metrics"]["crps"] == 0.2
 
 
 def test_update_settings_max_active_submissions_key():
@@ -1178,6 +1337,10 @@ def test_the_client_reads_no_retired_payload_key():
                 "Rank", "Username", "SubmissionName", "MeanReward",
                 "IsMySubmission", "submissionId", "RankedOrder",
                 "IsEloRanked", "PassThreshold", "Passed", "ranked_by",
+                # 4.0: the score model (the six removed update_settings
+                # keywords are quoted on purpose, to refuse them)
+                "mean_reward", "mean_reward2", "reward_ci95", "ranked_order",
+                "mean_metrics_detail", "mean_reward_30d", "is_continuous",
                 # the overview's renamed error pair (the run's column names)
                 "last_error_type", "last_error_message"):
         for literal in (f'"{old}"', f"'{old}'"):

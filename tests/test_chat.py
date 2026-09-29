@@ -608,4 +608,4 @@ def test_chat_names_are_exported_at_package_level():
     assert mlarena.ChatConversation is ChatConversation
     assert mlarena.ChatSessionNotFoundError is ChatSessionNotFoundError
     assert issubclass(mlarena.ChatSessionNotFoundError, mlarena.NotFoundError)
-    assert mlarena.__version__ == "3.0.0"
+    assert mlarena.__version__ == "4.0.0"

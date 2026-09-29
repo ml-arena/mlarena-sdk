@@ -75,6 +75,27 @@ def _expect(cond, msg):
 CREATOR = "/creator_challenge/challenge/7"
 
 
+def _spec(key, label, source, agg, order, fmt, unit, precision, is_ranking,
+          visible=True):
+    return {"key": key, "label": label, "source": source, "agg": agg,
+            "order": order, "format": fmt, "unit": unit,
+            "precision": precision, "is_ranking": is_ranking,
+            "visible": visible}
+
+
+# docs/score_model.md §4.1 declarations (U1, U2 and an asc board).
+REWARD_SPEC = _spec("reward", "Reward", "score", "mean", "desc", "number",
+                    None, 2, True)
+RMSE_SPEC = _spec("rmse", "RMSE", "score", "mean", "asc", "number", None, 3,
+                  True)
+RATED_METRICS = [
+    _spec("elo", "Rating", "platform", "rating", "desc", "integer", None, 0,
+          True),
+    _spec("reward", "Reward", "score", "mean", "desc", "number", None, 2,
+          False),
+]
+
+
 # --------------------------------------------------------------------------- #
 # Reads: every creator GET the console had
 # --------------------------------------------------------------------------- #
@@ -126,12 +147,12 @@ def test_creator_challenge_returns_the_three_sibling_rows():
     body = {
         "id": 7, "name": "Pong", "role": "owner",
         "configuration": {"submission_filename": "submission.csv"},
-        "evaluation": {"metric": "reward", "metric_order": "desc"},
+        "evaluation": {"metrics": [REWARD_SPEC], "window_days": None},
         "environment": {"benchmark_simulation_result_id": 41},
     }
     c, _rec = make_client(lambda *_: (200, body))
     got = c.creator_challenge(7)
-    _expect(got["evaluation"]["metric"] == "reward", got)
+    _expect(got["evaluation"]["metrics"] == [REWARD_SPEC], got)
     _expect(got["environment"]["benchmark_simulation_result_id"] == 41, got)
     # The evaluation is its own object, never flattened into the configuration.
     _expect("evaluation_metric" not in got["configuration"], got["configuration"])
@@ -250,23 +271,47 @@ def test_update_settings_sends_the_column_names():
     c, rec = make_client(lambda *_: (200, {"configuration": {}, "evaluation": {}}))
     c.update_settings(
         7,
-        metric="rmse",
-        metric_order="asc",
-        is_elo_score=False,
-        frontend_precision=3,
+        metrics=[RMSE_SPEC],
+        window_days=30,
         episode_budget_brackets=[[1.0, 3], [0.3, 10]],
         max_upload_files=4,
     )
     _expect(rec.last["method"] == "PUT", rec.last["method"])
     _expect(rec.last["path"] == CREATOR + "/settings", rec.last["path"])
     _expect(rec.last["json"] == {
-        "metric": "rmse",
-        "metric_order": "asc",
-        "is_elo_score": False,
-        "frontend_precision": 3,
+        "metrics": [RMSE_SPEC],
+        "window_days": 30,
         "episode_budget_brackets": [[1.0, 3], [0.3, 10]],
         "max_upload_files": 4,
     }, rec.last["json"])
+
+
+def test_update_settings_removed_score_kwargs_raise_naming_metrics():
+    """SDK 4.0.0 (D5): the six legacy score keywords are gone, no alias. Each
+    raises a TypeError that points at `metrics`, before any request."""
+    removed = {
+        "metric": "rmse", "metric2": "mae", "is_elo_score": True,
+        "metric_order": "asc", "frontend_precision": 3,
+        "metrics_schema": [{"key": "rmse"}],
+    }
+    for name, value in removed.items():
+        c, rec = make_client()
+        try:
+            c.update_settings(7, **{name: value})
+        except TypeError as exc:
+            _expect("metrics=" in str(exc), str(exc))
+            _expect(name in str(exc), str(exc))
+            _expect(rec.calls == [], "no request was sent")
+        else:
+            raise AssertionError(f"update_settings still accepts {name}=")
+    # Mixed with the new keyword, still refused: no silent drop.
+    c, rec = make_client()
+    try:
+        c.update_settings(7, metrics=[RMSE_SPEC], metric_order="asc")
+    except TypeError:
+        _expect(rec.calls == [], "no request was sent")
+    else:
+        raise AssertionError("update_settings dropped metric_order= silently")
 
 
 def test_update_settings_sends_the_elo_tunables():
@@ -277,8 +322,9 @@ def test_update_settings_sends_the_elo_tunables():
         "elo_momentum": 0.5, "elo_initial_variance": 10000.0,
         "elo_initial_score": 1000.0,
     }
-    c.update_settings(7, is_elo_score=True, **tunables)
-    _expect(rec.last["json"] == {"is_elo_score": True, **tunables}, rec.last["json"])
+    c.update_settings(7, metrics=RATED_METRICS, **tunables)
+    _expect(rec.last["json"] == {"metrics": RATED_METRICS, **tunables},
+            rec.last["json"])
 
 
 def test_create_challenge_docstring_names_only_real_kinds():

@@ -2,6 +2,39 @@
 
 Python SDK for [ML Arena](https://ml-arena.com) — make submissions, manage challenges, manage courses, and read leaderboards from any notebook or IDE.
 
+## 4.0.0 — one score declaration
+
+Not published yet. A versioned break, with no alias (the keys come straight
+from the server). See [Metrics](#metrics).
+
+- **`update_settings(metrics=…, window_days=…)`.** The six keywords
+  `metric`, `metric2`, `is_elo_score`, `metric_order`, `frontend_precision`
+  and `metrics_schema` are gone: passing one raises `TypeError` pointing at
+  `metrics`. The ranking direction is the ranking spec's `order`; an ELO
+  board is a spec with `agg: "rating"`.
+- **`leaderboard()`** — the rows' `mean_reward`, `mean_reward2`,
+  `reward_ci95`, `elo_score`, `mean_metrics_detail`, `mean_reward_30d` and
+  `mean_metrics_detail_30d` are `score`, `score_ci95`, `metrics` and
+  `metrics_window`. The DataFrame spreads `metrics` into one column per
+  declared key (and `metrics_window` into `metrics_window_<key>` columns on
+  a windowed board); `df.attrs["metrics"]` is the declaration.
+  `df.attrs["challenge"]` is `{challenge_id, metrics, window_days,
+  has_gpu}` — `is_elo_score`, `metric_order`, `ranked_order`, `metric`,
+  `metric2`, `frontend_precision`, `metrics_schema` and `is_continuous` are
+  gone.
+- **Submission reads** (`submission_overview()`, `creator_submissions()`,
+  `submission_status()["run_info"]`) serve `score` + `metrics` for the
+  values and the declaration as `metrics` (or `evaluation: {metrics,
+  window_days}` where the object also carries values) instead of
+  `mean_reward`, `elo_score`, `is_elo_score`, `ranked_order`, `metric`,
+  `frontend_precision`. Per-run rows (`submission_reward`, …) are unchanged.
+- **Course payloads** (`my_progress()`, `course_progress()`,
+  `challenges_for_course()`, module links) carry `metric`, the ranking
+  MetricSpec, instead of `ranked_by` / `ranked_order` / `precision`;
+  `value` is the best submission's `score`.
+- **Chat** — `session_count` / `number_of_runs` count the non-voided
+  sessions; the board's `score` is the team's euro total.
+
 ## 3.0.0 — the backend's names, on every row
 
 Not published yet. A versioned break: three read payloads changed shape, and
@@ -648,7 +681,7 @@ Everything the console's creator editor does, on the same routes:
 
 - `client.creator_challenges()` / `client.creator_challenge(challenge_id)` — your challenges, and one of them with its three sibling rows: `configuration`, `evaluation` and `environment`, each under its own column names.
 - `client.update_challenge(challenge_id, name=…, description=…, is_public=…)` — the challenge row.
-- `client.update_settings(challenge_id, …)` — the configuration + evaluation columns, under their own names: `simulation_timeout_sec`, `max_upload_size_bytes`, `max_upload_files`, `max_active_submissions_per_participant`, `submission_filename`, `metric`, `metric2`, `is_elo_score`, `metric_order`, `is_stop_after_deployment`, `deployment_nb_constraint_run`, `deployment_nb_initial_score_run`, `episode_budget_brackets`, `frontend_precision`, `metrics_schema`; admins also `agent_max_time_per_step_second`, `env_max_time_per_step_second`, `simulation_max_steps` (the run limits) and `data_source_enabled`, `data_source_url`, `data_source_asset`, `data_source_filter`, `data_source_history_hours`, `batch_cron` (the continuous data feed). Answers `{"configuration": …, "evaluation": …}`.
+- `client.update_settings(challenge_id, …)` — the configuration + evaluation columns, under their own names: `simulation_timeout_sec`, `max_upload_size_bytes`, `max_upload_files`, `max_active_submissions_per_participant`, `submission_filename`, `metrics`, `window_days` (see [Metrics](#metrics)), `is_stop_after_deployment`, `deployment_nb_constraint_run`, `deployment_nb_initial_score_run`, `episode_budget_brackets`, the `elo_*` tunables; admins also `agent_max_time_per_step_second`, `env_max_time_per_step_second`, `simulation_max_steps` (the run limits) and `data_source_enabled`, `data_source_url`, `data_source_asset`, `data_source_filter`, `data_source_history_hours`, `batch_cron` (the continuous data feed). Answers `{"configuration": …, "evaluation": …}`.
 - `client.update_challenge_configuration(challenge_id, engine_id=…, docker_image_env_runtime_id=…, render_delay_second=…)` — **admin only**: the infrastructure the challenge runs on.
 - Env: `client.list_env_files(challenge_id)`, `upload_env_file`, `update_env_file_content`, `delete_env_file(challenge_id, filename)`, `check_env(challenge_id, content)` (the structural check, without saving), `sync_env_from_github`.
 - Benchmark: `client.list_benchmark_files(challenge_id)`, `upload_benchmark_file`, `update_benchmark_file_content`, `delete_benchmark_file(challenge_id, filename)`, `run_benchmark`, `benchmark_status`.
@@ -749,7 +782,7 @@ print(student.my_progress(landing["id"]))                # content % + next less
 - `client.add_course_challenge(course_id, challenge_id, title=None, summary=None, pass_threshold=None, is_published=True)` — the console's "Add challenge": one transactional call creates a private module (title defaults to the challenge's name, `summary` is the student page), links it at the end of the course and attaches the challenge; nothing is written if any part is refused.
 - `client.remove_course_challenge(course_id, module_id)` — the console's "Remove": one transactional call unlinks the entry and deletes its module when it is a simple module you may edit that no other course links; answers `{"message", "module_deleted"}`.
 - `client.update_course(id, **fields)`, `set_course_cover`, `list_course_modules`, `link_module(course_id, module_id, position=None)`, `unlink_module`, `reorder_modules`, `course_progress(course_id)` — teacher follow dashboard.
-- `client.teacher_courses()` — the courses you teach or assist on, each with its `role`; `client.challenges_for_course()` — the challenges you may attach (with `ranked_by` / `ranked_order` / `precision`).
+- `client.teacher_courses()` — the courses you teach or assist on, each with its `role`; `client.challenges_for_course()` — the challenges you may attach, each with `metric`, the ranking MetricSpec (the scale and direction of a `pass_threshold`).
 - `client.course_students(course_id, challenge_id=None)` — the roster (`user_id`, `student_number`, `student_email`, `project_url`, `enrolled_at_ts`, plus the team columns for the attached challenge you name — `None` without `challenge_id`); `client.remove_student(course_id, user_id)`.
 - `client.course_assistants(course_id)`, `add_course_assistant(course_id, username)`, `remove_course_assistant(course_id, user_id)` — teaching assistants (course owner only).
 - `client.export_course_csv(course_id, challenge_id, by_participant=False, dest_dir=".")` — one attached challenge's leaderboard CSV, as the console's Students tab downloads it (writes `leaderboard_course_<cid>_comp_<challenge_id>.csv`); `client.course_cover(course_id, dest_dir=".")` — a course's cover image (course payloads carry `has_cover`, not a path).
@@ -763,13 +796,45 @@ print(student.my_progress(landing["id"]))                # content % + next less
 ### Leaderboard
 
 - `client.leaderboard(challenge_id=None, top=None, *, aggregate=None, course_id=None, me=False, q=None, window=None)` — defaults to last challenge. The backend serves one envelope, `{challenge, total, leaders, me, matches}` (+ `course_context` with `course_id`); with pandas the call returns `leaders` as a DataFrame in rank order and every other key on `df.attrs`, without pandas the envelope dict as served.
-  - `df.attrs["challenge"]` — what every row shares: `challenge_id`, `is_elo_score`, `metric_order`, `ranked_order`, `metric`, `metric2`, `frontend_precision`, `metrics_schema`, `has_gpu`, `is_continuous`. `ranked_order` is `"desc"` (higher is better) or `"asc"` (lower is better, e.g. RMSE), and is always `"desc"` on an ELO board (`is_elo_score`).
-  - Columns — the backend's names: `rank`, `username`, `avatar_key`, `submission_id`, `submission_name`, `mean_reward`, `mean_reward2`, `reward_ci95`, `n_episodes_total`, `elo_score`, `elo_variance`, `number_of_runs`, `created_at_ts`, `last_end_run_ts`, `is_my_submission`, `team_id`, `team_name`, `team_members`, `action_time_max_sec`, `agent_metric_total_ram_max_bytes`, `agent_metric_vram_max_bytes`, `mean_metrics_detail`, `mean_reward_30d`, `mean_metrics_detail_30d`, `is_public` (`None` when the row is not yours to know) and, through a course with a bar, `passed`. On a chat challenge `mean_reward` is the team's euro total.
+  - `df.attrs["challenge"]` — what every row shares: `challenge_id`, `metrics` (the declaration, see [Metrics](#metrics)), `window_days`, `has_gpu`. `df.attrs["metrics"]` is the same declaration.
+  - Columns — the backend's names: `rank`, `username`, `avatar_key`, `submission_id`, `submission_name`, `score` (the ranking spec's value, `None` = unranked), `score_ci95`, `n_episodes_total`, `elo_variance`, `number_of_runs`, `created_at_ts`, `last_end_run_ts`, `is_my_submission`, `team_id`, `team_name`, `team_members`, `action_time_max_sec`, `agent_metric_total_ram_max_bytes`, `agent_metric_vram_max_bytes`, `is_public` (`None` when the row is not yours to know) and, through a course with a bar, `passed`; then **one column per declared key** (the row's `metrics[key]`) and, when `window_days` is set, one `metrics_window_<key>` column per key (the same fold over the last `window_days` days). On a chat challenge `score` (and the `loot` column) is the team's euro total. Without pandas the rows keep `metrics` / `metrics_window` as `{key: value}` dicts.
   - `aggregate="user"` — one row per participant (their best submission). This is what the console shows by default; omitted, every ranked submission is a row.
   - `course_id=…` — the board as a course sees it: only its students, per-row `passed` (tri-state: `None` while the row has no ranked value), and `df.attrs["course_context"]` = `{course_id, pass_threshold}`.
   - `top=N` — the first N rows (all of them without it). `me=True` puts your own row and its `window` neighbours (default 3) on `df.attrs["me"]`; `q="jo"` puts the matching usernames on `df.attrs["matches"]`; `df.attrs["total"]` counts every ranked row.
   - A refused query (an `aggregate` other than `"user"`, a `course_id` that does not hold the challenge) is an `MLArenaError` with the server's reason, `status_code` and `body`.
-- A challenge's direction is set with `client.update_settings(challenge_id, metric_order="asc")` before it starts. Course pass bars follow it: `passed` means `value >= pass_threshold` under `"desc"` and `value <= pass_threshold` under `"asc"` (see `ranked_order` in `my_progress` / `course_progress`).
+- A challenge's direction is its ranking spec's `order`, set through `metrics` before it starts. Course pass bars follow it: `passed` means `value >= pass_threshold` under `"desc"` and `value <= pass_threshold` under `"asc"` (see `metric` — the ranking spec — in `my_progress` / `course_progress`).
+
+### Metrics
+
+A challenge declares what its leaderboard shows as `metrics`, an ordered list of **MetricSpec** dicts — the same shape in the database, the REST payloads, the console and here. Every key is required:
+
+| key | values |
+|---|---|
+| `key` | `^[a-z][a-z0-9_]{0,31}$`, unique; not `score`, `rank` or `metrics` |
+| `label` | 1..40 characters, the column header |
+| `source` | `"score"` — the env's main score (at most one spec); `"env"` — `metrics_detail[key]` from `env.py`; `"platform"` — `elo`, `action_time_max`, `ram_max`, `vram_max`, `steps` or `n_episodes` |
+| `agg` | how runs fold into the submission's value: `"mean"`, `"sum"`, `"max"`, `"min"`, `"last"`, `"rating"` (ELO) |
+| `order` | `"desc"` higher is better, `"asc"` lower is better, `None` not comparable |
+| `format` | `"number"`, `"integer"`, `"percent"` (a fraction, shown ×100), `"seconds"`, `"bytes"`, `"currency"` |
+| `unit` | ≤ 8 characters or `None`; required for `currency` |
+| `precision` | decimal places, 0..10 |
+| `is_ranking` | exactly one spec is `True`, and it has an `order`: the board ranks on it |
+| `visible` | `False` = folded and served, but not a column in the console |
+
+A rated (ELO) board ranks on `{"key": "elo", "source": "platform", "agg": "rating", "order": "desc", "is_ranking": True, …}`; it needs a kind with the `elo` capability and an engine seating at least 2 agents. Chat challenges have a fixed declaration (`loot`, `currency`, `€`) that `update_settings` refuses to change.
+
+```python
+client.update_settings(challenge_id, metrics=[
+    {"key": "crps", "label": "Mean CRPS", "source": "score", "agg": "mean", "order": "asc",
+     "format": "number", "unit": "mm", "precision": 4, "is_ranking": True, "visible": True},
+    {"key": "n_samples", "label": "Samples", "source": "env", "agg": "sum", "order": None,
+     "format": "integer", "unit": None, "precision": 0, "is_ranking": False, "visible": True},
+], window_days=30)
+```
+
+- `metrics` replaces the whole list; the server validates it on the merged state (400 names the rule). Once the challenge has started only `label`, `unit`, `precision`, `format` and `visible` may change; `window_days` is frozen.
+- `window_days` (≥ 1) also folds every key over the last `window_days` days: `metrics_window` on the rows, `metrics_window_<key>` in the DataFrame.
+- A submission's values read everywhere as `score` (the ranking spec's value) + `metrics` (`{key: value}`): `leaderboard()`, `submission_overview()`, `creator_submissions()`. Where one object carries both values and the declaration, the declaration sits under `evaluation: {metrics, window_days}` (`submission_overview()`). Course payloads carry `metric` — the ranking spec — and `value`, the best submission's `score`.
 
 ## Get your API key
 

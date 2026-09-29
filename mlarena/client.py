@@ -45,6 +45,32 @@ class _Unset:
 _UNSET = _Unset()
 
 
+# SDK 4.0.0 (score model, D5): the six legacy score keywords of
+# `update_settings` are gone, with no alias. `metrics=[...]` replaces them all.
+_REMOVED_SCORE_KWARGS = (
+    "metric", "metric2", "is_elo_score", "metric_order",
+    "frontend_precision", "metrics_schema",
+)
+
+
+def _refuses_removed_score_kwargs(fn):
+    """Raise a TypeError naming `metrics` when a removed score keyword is
+    passed, instead of Python's bare "unexpected keyword argument"."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        removed = [name for name in _REMOVED_SCORE_KWARGS if name in kwargs]
+        if removed:
+            raise TypeError(
+                f"{fn.__name__}() no longer accepts {', '.join(removed)} "
+                "(removed in mlarena-sdk 4.0.0): declare the leaderboard with "
+                "metrics=[{key, label, source, agg, order, format, unit, "
+                "precision, is_ranking, visible}, ...] — see the README "
+                "'Metrics' section"
+            )
+        return fn(*args, **kwargs)
+    return wrapper
+
+
 class MLArenaClient:
     """Client for the ML Arena REST API.
 
@@ -558,8 +584,8 @@ class MLArenaClient:
         its three sibling rows as three objects, each under its own column
         names: `configuration` (engine, runtime image, step deadlines, upload
         limits, `submission_filename`, the GitHub sync), `evaluation`
-        (`metric`, `metric_order`, `is_elo_score`, the ELO parameters, the
-        episode budget brackets, `metrics_schema`) and `environment` (the
+        (`metrics` — the MetricSpec declaration —, `window_days`, the ELO
+        parameters, the episode budget brackets) and `environment` (the
         latest benchmark run's `benchmark_simulation_result_id` and
         `attach_path_files`). The configuration's `kernel_version` is the
         env runtime's kernel. Also `engine_name`, the
@@ -856,6 +882,7 @@ class MLArenaClient:
             raise _failed(MLArenaError, "update_challenge", resp)
         return resp.json()
 
+    @_refuses_removed_score_kwargs
     def update_settings(self, challenge_id: int, *,
                         simulation_timeout_sec: int | None = None,
                         max_upload_size_bytes: int | None = None,
@@ -865,16 +892,12 @@ class MLArenaClient:
                         agent_max_time_per_step_second: float | None = None,
                         env_max_time_per_step_second: float | None = None,
                         simulation_max_steps: int | None = None,
-                        metric: str | None = None,
-                        metric2: str | None = None,
-                        is_elo_score: bool | None = None,
-                        metric_order: str | None = None,
+                        metrics: list[dict] | None = None,
+                        window_days: int | None = None,
                         is_stop_after_deployment: bool | None = None,
                         deployment_nb_constraint_run: int | None = None,
                         deployment_nb_initial_score_run: int | None = None,
                         episode_budget_brackets: list | None = None,
-                        frontend_precision: int | None = None,
-                        metrics_schema: list | None = None,
                         elo_k_factor: int | None = None,
                         elo_d0: float | None = None,
                         elo_alpha: float | None = None,
@@ -898,9 +921,14 @@ class MLArenaClient:
         and the data-feed ones are ChallengeConfiguration columns, the rest
         are Evaluation columns. Once
         the challenge has started only the fields that cannot rescore an
-        existing run still apply — the leaderboard labels (`metric`,
-        `metric2`, `frontend_precision`) and `is_stop_after_deployment`;
-        everything else is rejected with 400 until the challenge is stopped.
+        existing run still apply — the presentation fields of `metrics`
+        (`label`, `unit`, `precision`, `format`, `visible`) and
+        `is_stop_after_deployment`; everything else is rejected with 400
+        until the challenge is stopped.
+
+        SDK 4.0.0 removed the keywords `metric`, `metric2`, `is_elo_score`,
+        `metric_order`, `frontend_precision` and `metrics_schema`: passing
+        one raises `TypeError` pointing at `metrics`.
 
         A kind accepts only the settings it has: the keywords of a
         capability flag that is false on the challenge's kind
@@ -908,7 +936,8 @@ class MLArenaClient:
         `runs` (simulation_timeout_sec, is_stop_after_deployment, the
         deployment_nb_* runs), `submission_upload` (max_upload_size_bytes,
         max_upload_files, max_active_submissions_per_participant),
-        `submission_filename`, `elo` (is_elo_score, elo_*),
+        `submission_filename`, `elo` (a `metrics` spec with
+        `agg: "rating"`, elo_*),
         `episode_budget_brackets` and `run_limits`. The others apply to
         every kind.
 
@@ -924,20 +953,26 @@ class MLArenaClient:
                 column check at upload and the y_test.csv start requirement,
                 so env.py must validate the file itself. Frozen once the
                 challenge has started.
-            metric: free-text label for the primary metric (e.g. "reward",
-                "accuracy", "bleu"). The DB column is String(20).
-            is_elo_score: when True, the leaderboard ranks by ELO rather than
-                mean metric. Refused (400) unless the challenge's engine
-                seats at least 2 agents per match.
-            metric_order: "desc" (the default: a higher score is better) or
-                "asc" (a lower score is better, e.g. RMSE). Decides who wins
-                each run, the episode budget tiers and, unless the challenge
-                is ELO-ranked (ELO is always higher-is-better), the
-                leaderboard order and course pass verdicts. Frozen once the
-                challenge has started; refused on an ELO challenge whose
-                submissions already have ratings. Checked against the stored
-                brackets and metrics schema, so a flip may need new brackets
-                in the same call.
+            metrics: the challenge's score declaration, the whole list (it
+                replaces the stored one). Each entry is a MetricSpec dict
+                with every key: `key`, `label`, `source` ("score" | "env" |
+                "platform"), `agg` ("mean" | "sum" | "max" | "min" |
+                "last" | "rating"), `order` ("desc" | "asc" | None),
+                `format` ("number" | "integer" | "percent" | "seconds" |
+                "bytes" | "currency"), `unit`, `precision` (0..10),
+                `is_ranking`, `visible`. Exactly one entry has
+                `is_ranking: True` with an `order`: its `order` decides who
+                wins each run, the episode budget tiers, the leaderboard
+                order and course pass verdicts. `agg: "rating"` (only on the
+                platform key `elo`, `order: "desc"`, ranking) makes the board
+                ELO-rated; refused unless the kind has `elo` and the engine
+                seats at least 2 agents. Validated on the merged state (400
+                names the rule); once started only the presentation fields
+                may change. Not editable on a chat challenge. See the README
+                "Metrics" section.
+            window_days: when set, every declared key is also folded over
+                the runs of the last `window_days` days (the leaderboard's
+                `metrics_window`). >= 1; frozen once started.
             is_stop_after_deployment: True (the creation default) means an
                 agent runs only its deployment runs and is never matched
                 again, which pins an ELO leaderboard to its bootstrap ratings
@@ -949,24 +984,9 @@ class MLArenaClient:
                 the best. A submission whose running mean is worse than a
                 tier's threshold gets that tier's episodes; one that beats
                 every threshold gets the last tier's. Thresholds strictly
-                ascending under metric_order "desc", strictly descending
-                under "asc"; n_episodes non-decreasing; max 100 episodes per
-                bracket. A single pair is a fixed budget.
-            frontend_precision: decimal places for numeric leaderboard
-                metrics (default 2). Per-metric `precision` in the schema
-                overrides it.
-            metrics_schema: the canonical leaderboard metric declaration —
-                an ordered list of descriptors, e.g.
-                `[{"key": "accuracy", "label": "Accuracy", "source": "env",
-                   "agg": "mean", "format": "percent"},
-                  {"key": "ram_max", "label": "RAM Max", "source": "platform",
-                   "agg": "max", "format": "bytes"}]`.
-                `source:"env"` keys are exactly what `env.evaluate` must
-                return in each `agent_results[i]["metrics_detail"]`
-                (equal-mapping, enforced at run time). See the leaderboard
-                row's `metrics_schema` column. A `higher_is_better`
-                on the `reward` descriptor must match metric_order.
-                Validated on save (400 names the descriptor).
+                ascending under a ranking `order` "desc", strictly
+                descending under "asc"; n_episodes non-decreasing; max 100
+                episodes per bracket. A single pair is a fixed budget.
 
         ELO tunables (kinds with `elo`; frozen while the challenge runs;
         None is not sent):
@@ -1016,16 +1036,12 @@ class MLArenaClient:
             "agent_max_time_per_step_second": agent_max_time_per_step_second,
             "env_max_time_per_step_second": env_max_time_per_step_second,
             "simulation_max_steps": simulation_max_steps,
-            "metric": metric,
-            "metric2": metric2,
-            "is_elo_score": is_elo_score,
-            "metric_order": metric_order,
+            "metrics": metrics,
+            "window_days": window_days,
             "is_stop_after_deployment": is_stop_after_deployment,
             "deployment_nb_constraint_run": deployment_nb_constraint_run,
             "deployment_nb_initial_score_run": deployment_nb_initial_score_run,
             "episode_budget_brackets": episode_budget_brackets,
-            "frontend_precision": frontend_precision,
-            "metrics_schema": metrics_schema,
             "elo_k_factor": elo_k_factor,
             "elo_d0": elo_d0,
             "elo_alpha": elo_alpha,
@@ -1354,7 +1370,7 @@ class MLArenaClient:
         the run), `env_error_type` / `env_error_message` / `env_stdout_logs`, the timestamps, and
         `submission_results` — the benchmark submission's row, its score
         under `submission_reward`. When the run completes cleanly the backend
-        scores the benchmark submission (`active`, `mean_reward`), which is
+        scores the benchmark submission (`active`, `score`), which is
         what `start_challenge` requires.
         """
         resp = self._request("GET",
@@ -1376,7 +1392,7 @@ class MLArenaClient:
         from ``draft`` or ``stopped`` (400 when already started). The first
         start sets ``start_date_ts``; a restart from ``stopped`` keeps it.
         Backend gates this behind: env.py uploaded, benchmark submission
-        ACTIVE with a non-null `mean_reward`. Failures bubble up as
+        ACTIVE with a non-null `score`. Failures bubble up as
         MLArenaError.
         """
         resp = self._request("PUT",
@@ -1607,11 +1623,14 @@ class MLArenaClient:
         """Every non-deleted submission on a challenge you own.
 
         Mirrors `GET /api/creator_challenge/challenge/{id}/submissions`
-        (`submissions.py`). Returns `{"submissions": [...], "is_elo_score":
-        bool, "ranked_order": "asc"|"desc"}`; each row carries
+        (`submissions.py`). Returns `{"submissions": [...], "metrics":
+        [MetricSpec, ...]}` — `metrics` is the challenge's declaration, and
+        `rank` follows its ranking spec's `order`; each row carries
         `submission_id`, `submission_name`, `user_id`, `username`,
-        `created_at_ts`, `last_end_run_ts`, `elo_score`, `mean_reward`,
-        `number_of_runs`, `rank`, `restart_allowed` and the status block.
+        `created_at_ts`, `last_end_run_ts`, `score` (the ranking value — the
+        rating on a rated board), `metrics` (`{key: value}` for every
+        declared key), `number_of_runs`, `rank`, `restart_allowed` and the
+        status block.
         `rank` is the place of the submission's row on the challenge
         leaderboard, one row per participant (the team's or your best active
         submission, as `leaderboard()` ranks it by default); None for a
@@ -2180,8 +2199,8 @@ class MLArenaClient:
           `status`, `finished_at_ts`, `failure_message`. All-null before the
           first deploy.
         - `run_info` — `submission_deploy_id`, `number_of_agents`, `has_gpu`,
-          `metric`, `is_elo_score`, `frontend_precision` and `results`, that
-          attempt's runs.
+          `metrics` (the challenge's MetricSpec declaration; None before the
+          first deploy) and `results`, that attempt's runs.
           Each run is a `RunResult`, the one run model every run list on the
           API serves (`submission_games` too): the job's own `job_status`
           (`pending` | `running` | `completed` | `failed` | `cancelled`),
@@ -2261,12 +2280,15 @@ class MLArenaClient:
         Mirrors `GET /api/submission_result/{cid}/{sid}/overview`
         (`submission_result.py`) — what the console's Dashboard tab shows.
 
-        Returns `created_at_ts`, `mean_reward`, `elo_score`, `number_of_runs`,
-        `last_end_run_ts`, the last-24h resource aggregates (`max_ram_usage`,
-        `avg_cpu_usage`, `avg_steps`, `runs_last_24h`, `max_vram_bytes`),
-        `submissions_in_queue`, and the challenge context for reading them
-        (`rank`, `is_elo_score`, `ranked_order`, `metric`,
-        `frontend_precision`, `has_gpu`). `rank` is the place of the submission's row on the challenge
+        Returns `created_at_ts`, `score` (the ranking value — the rating on
+        a rated board), `metrics` (`{key: value}` for every declared key),
+        `number_of_runs`, `last_end_run_ts`, the last-24h resource
+        aggregates (`max_ram_usage`, `avg_cpu_usage`, `avg_steps`,
+        `runs_last_24h`, `max_vram_bytes`), `submissions_in_queue`, and the
+        challenge context for reading them (`rank`, `evaluation` —
+        `{"metrics": [MetricSpec, ...], "window_days"}`, the declaration
+        whose ranking spec gives `score` its label, format and direction —
+        and `has_gpu`). `rank` is the place of the submission's row on the challenge
         leaderboard, one row per participant (the team's or your best active
         submission, as `leaderboard()` ranks it by default); None for a
         submission that has no row there.
@@ -2653,28 +2675,31 @@ class MLArenaClient:
         `leaders`, `me`, `matches` and, with ``course_id``,
         `course_context`. With pandas, the call returns `leaders` as a
         DataFrame and every other envelope key on ``df.attrs``
-        (``df.attrs["challenge"]["metric"]``, ``df.attrs["me"]``, …);
-        without pandas it returns the envelope dict as served.
+        (``df.attrs["challenge"]["window_days"]``, ``df.attrs["me"]``, …),
+        plus ``df.attrs["metrics"]``, the declaration; without pandas it
+        returns the envelope dict as served.
 
         **The `challenge` block** — what every row shares, served once:
-        `challenge_id`, `is_elo_score`, `metric_order`, `ranked_order`,
-        `metric`, `metric2`, `frontend_precision`, `metrics_schema`,
-        `has_gpu`, `is_continuous`. ``ranked_order`` says which way the board
-        ranks (``"desc"``: higher is better, ``"asc"``: lower is better;
-        always ``"desc"`` when ``is_elo_score``), and ``metric_order`` is the
-        direction of the metric itself.
+        `challenge_id`, `metrics` (the MetricSpec declaration, see the README
+        "Metrics" section), `window_days` (None unless the board also folds
+        a rolling window) and `has_gpu`. The spec with `is_ranking` is what
+        the board ranks on; its ``order`` says which way (``"desc"``: higher
+        is better, ``"asc"``: lower is better).
 
         **Columns** — the backend's own names, one set with the console:
         `rank`, `username`, `avatar_key`, `submission_id`,
-        `submission_name`, `mean_reward`, `mean_reward2`, `reward_ci95`,
-        `n_episodes_total`, `elo_score`, `elo_variance`, `number_of_runs`,
-        `created_at_ts` and `last_end_run_ts` (ISO-8601 UTC with a `Z`),
-        `is_my_submission`, `team_id`, `team_name`, `team_members`,
-        `action_time_max_sec`, `agent_metric_total_ram_max_bytes`,
-        `agent_metric_vram_max_bytes`, `mean_metrics_detail`,
-        `mean_reward_30d`, `mean_metrics_detail_30d`, `is_public` (None when
-        the row is not yours to know) and, through a course with a bar,
-        `passed`. Rows come in server rank order.
+        `submission_name`, `score` (the ranking spec's value; None =
+        unranked), `score_ci95`, `n_episodes_total`, `elo_variance`,
+        `number_of_runs`, `created_at_ts` and `last_end_run_ts` (ISO-8601
+        UTC with a `Z`), `is_my_submission`, `team_id`, `team_name`,
+        `team_members`, `action_time_max_sec`,
+        `agent_metric_total_ram_max_bytes`, `agent_metric_vram_max_bytes`,
+        `is_public` (None when the row is not yours to know) and, through a
+        course with a bar, `passed`. With pandas, each row's `metrics`
+        (`{key: value}`) becomes one column per declared key, named by the
+        key, and — when `window_days` is set — its `metrics_window` becomes
+        one `metrics_window_<key>` column per key. Rows come in server rank
+        order.
         """
         challenge_id = challenge_id or self._last_challenge
         if challenge_id is None:
@@ -2713,8 +2738,9 @@ class MLArenaClient:
             import pandas as pd
         except ImportError:
             return envelope
-        rows = pd.DataFrame(envelope["leaders"])
+        rows = pd.DataFrame(_leaderboard_records(envelope))
         rows.attrs.update({k: v for k, v in envelope.items() if k != "leaders"})
+        rows.attrs["metrics"] = envelope["challenge"]["metrics"]
         return rows
 
     def global_ranking(self, search: str | None = None, page: int = 1, per_page: int = 100):
@@ -2924,7 +2950,10 @@ class MLArenaClient:
         `submission_id`, `team_name`, `members`, `total_amount_eur` — the
         group's cumulative euros —, `scoreboard` (one
         `{"rule_key", "count", "total_amount_eur"}` per rule you have fired),
-        `session_count`, `rank`), `sessions` (yours and your teammates',
+        `session_count` — the non-voided sessions, the leaderboard's
+        `number_of_runs` —, `rank` — the group's place on `leaderboard()`,
+        whose `score` is the same euro total under the fixed `loot` spec,
+        `format: "currency"`, `unit: "€"`), `sessions` (yours and your teammates',
         newest first) and `open_session_id` (your open session, or None).
 
         Raises `ChallengeNotFoundError` when the challenge is not a chat
@@ -3536,7 +3565,9 @@ class MLArenaClient:
         Mirrors `GET /api/academic_courses/{course_id}/progress/me`. Requires
         enrollment (or manage rights). Each challenge cell carries `value`,
         `pass_threshold`, `passed` (null when there is nothing to judge) and
-        `ranked_order` ("desc": `passed` means value >= bar, "asc": <=).
+        `metric`, the challenge's ranking MetricSpec (its `order` "desc":
+        `passed` means value >= bar, "asc": <=; its `label`, `format` and
+        `precision` say how to read `value`, the best submission's `score`).
         """
         return self._course_call(
             "GET", f"/academic_courses/{course_id}/progress/me",
@@ -3650,8 +3681,9 @@ class MLArenaClient:
 
         `pass_threshold` is the course's validation bar: a student validates the
         challenge when their best leaderboard value meets it in the direction
-        the challenge ranks (`>=` when its `ranked_order` is "desc", `<=` when
-        it is "asc"; the returned link carries `ranked_order`). Omit it for no
+        the challenge ranks (`>=` when its ranking spec's `order` is "desc",
+        `<=` when it is "asc"; the returned link carries that spec as
+        `metric`). Omit it for no
         pass/fail — do not pass 0, which would validate every entrant.
         """
         body: dict = {"challenge_id": challenge_id}
@@ -3979,8 +4011,8 @@ class MLArenaClient:
         best result).
 
         Mirrors `GET /api/teacher/course/{id}/progress`. Requires teacher/TA/admin.
-        Challenge metas and cells carry `ranked_order` next to `pass_threshold`
-        (see `my_progress`).
+        Challenge metas and cells carry `metric`, the ranking MetricSpec,
+        next to `pass_threshold` (see `my_progress`).
         """
         return self._course_call(
             "GET", f"/teacher/course/{course_id}/progress",
@@ -4005,8 +4037,9 @@ class MLArenaClient:
         """The challenges you may attach to a module.
 
         Mirrors `GET /api/teacher/challenges-for-course`: public challenges plus
-        your own, each with `ranked_by` (the metric a threshold is on),
-        `ranked_order` (the direction it is compared in) and `precision`.
+        your own, each with `id`, `name` and `metric` — the ranking MetricSpec:
+        the scale a threshold is on (`label`, `format`, `precision`) and
+        the direction it is compared in (`order`).
         A challenge with no evaluation is not listed, because `attach_challenge`
         refuses it.
         """
@@ -4546,6 +4579,40 @@ def _to_dataframe(data):
         return pd.DataFrame(rows)
     except ImportError:
         return rows
+
+
+def _leaderboard_records(envelope: dict) -> list[dict]:
+    """The board's rows with `metrics` spread into one column per declared
+    key and, on a windowed board, `metrics_window` into one
+    `metrics_window_<key>` column per key.
+
+    A row's `metrics` is None while it has no scored run; otherwise it holds
+    every declared key (the backend's contract), so a missing key is a drift
+    and raises KeyError. A declared key that equals a row column would
+    silently overwrite it, so it raises instead.
+    """
+    challenge = envelope["challenge"]
+    keys = [spec["key"] for spec in challenge["metrics"]]
+    windowed = challenge["window_days"] is not None
+    records = []
+    for leader in envelope["leaders"]:
+        record = {k: v for k, v in leader.items()
+                  if k not in ("metrics", "metrics_window")}
+        values = leader["metrics"]
+        window = leader["metrics_window"]
+        for key in keys:
+            if key in record:
+                raise MLArenaError(
+                    f"leaderboard: declared metric key {key!r} collides with "
+                    "the row column of the same name"
+                )
+            record[key] = None if values is None else values[key]
+            if windowed:
+                record[f"metrics_window_{key}"] = (
+                    None if window is None else window[key]
+                )
+        records.append(record)
+    return records
 
 
 # --- Backwards compatibility for the Python names ----------------------------

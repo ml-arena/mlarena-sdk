@@ -90,13 +90,18 @@ def test_teacher_courses_reads_role_per_row():
 
 
 def test_challenges_for_course_lists_the_picker():
-    rows = [{"id": 42, "name": "CartPole-v1", "ranked_by": "reward",
-             "ranked_order": "desc", "precision": 2}]
+    metric = {"key": "reward", "label": "Reward", "source": "score",
+              "agg": "mean", "order": "desc", "format": "number",
+              "unit": None, "precision": 2, "is_ranking": True,
+              "visible": True}
+    rows = [{"id": 42, "name": "CartPole-v1", "metric": metric}]
     c, rec = make_client(lambda *_: (200, rows))
     out = c.challenges_for_course()
     _expect(rec.last["path"] == "/teacher/challenges-for-course", rec.last["path"])
     ids = list(out["id"]) if hasattr(out, "columns") else [r["id"] for r in out]
     _expect(ids == [42], ids)
+    got = list(out["metric"]) if hasattr(out, "columns") else [r["metric"] for r in out]
+    _expect(got == [metric], got)
 
 
 # --------------------------------------------------------------------------- #

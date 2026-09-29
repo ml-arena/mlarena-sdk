@@ -488,7 +488,12 @@ def _export_router(method, path, kwargs):
                 "challenges": [{
                     "challenge": {"id": 42, "name": "CartPole-v1"},
                     "label": "CartPole", "pass_threshold": None,
-                    "ranked_order": "desc",
+                    "metric": {
+                        "key": "reward", "label": "Reward", "source": "score",
+                        "agg": "mean", "order": "desc", "format": "number",
+                        "unit": None, "precision": 2, "is_ranking": True,
+                        "visible": True,
+                    },
                 }],
                 "lessons": [{"title": "What is RL?", "slug": "what-is-rl",
                              "kind": "lesson", "gated": False,
