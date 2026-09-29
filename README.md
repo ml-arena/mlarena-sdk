@@ -4,7 +4,7 @@ Python SDK for [ML Arena](https://ml-arena.com) — make submissions, manage cha
 
 ## 3.0.0 — the backend's names, on every row
 
-Not published yet. A versioned break: two read payloads changed shape, and
+Not published yet. A versioned break: three read payloads changed shape, and
 there is no alias — the keys come straight from the server, as in 2.0.
 Everything else below is additive over 2.2.
 
@@ -56,6 +56,17 @@ Everything else below is additive over 2.2.
 
   The two timestamps are ISO-8601 UTC strings with a `Z`, not the old
   formats.
+- **A challenge has a `status`, not `is_started`.** Every challenge row —
+  `challenges()`, `creator_challenges()`, `copyable_challenges()`,
+  `chat_challenge()` — carries `status`: `"draft"` (created, never
+  started), `"started"` or `"stopped"`. There is no `is_started` alias:
+  `row["is_started"]` is `row["status"] == "started"`. `stop_challenge()`
+  moves a started challenge to `stopped` (it used to go back to "not
+  started"); `start_challenge()` accepts `draft` or `stopped`, and a restart
+  keeps the challenge's `start_date_ts`. `challenges(status=…)` takes
+  `"started"` (the default) or `"all"` — `"active"` now answers 400. A chat
+  session's `can_send_reason` adds `challenge_stopped` next to
+  `challenge_not_started`.
 - **`leaderboard()` has one shape.** The backend serves one envelope —
   `{challenge, total, leaders, me, matches}` plus `course_context` with
   `course_id` — whether or not `top` is passed (the bare array it served
@@ -175,13 +186,13 @@ Everything else below is additive over 2.2.
   `challenge_start_date`). A `challenges()` row no longer carries
   `is_public`, `engine_name` or `evaluation_metric` — nothing read them;
   `challenge(id)` has the engine and the kernel. `challenges(status=…)`
-  takes `"active"` or `"all"` and answers 400 to anything else, where any
+  takes `"started"` or `"all"` and answers 400 to anything else, where any
   other value used to mean "all".
 - **Two admin routes are gone.** `POST /api/challenges/` and `POST
   /api/challenges/{id}/configuration` had no SDK method and no console
   caller: a challenge is created, with its configuration, evaluation and
   environment, by `create_challenge()`. `PUT /api/challenges/{id}` no longer
-  accepts `is_started` / `is_public` — starting is `start_challenge()`,
+  accepts the start flag or `is_public` — starting is `start_challenge()`,
   behind its env-test and benchmark gate, and visibility is
   `update_challenge(is_public=…)`.
 - **Teams, from the SDK.** The twelve `/api/teams/*` routes were console-only;
@@ -622,7 +633,7 @@ print(c.leaderboard(cid).head())
 
 ### Challenges
 
-- `client.challenges(q=None, tags=None, status="active", page=None, per_page=None)` — public list. `status` is `"active"` (started challenges only) or `"all"`.
+- `client.challenges(q=None, tags=None, status="started", page=None, per_page=None)` — public list. `status` is `"started"` (started challenges only) or `"all"` (draft, started and stopped). Each row's `status` is `"draft"`, `"started"` or `"stopped"`.
 - `client.challenge(challenge_id)` — the participant view: the kernel, the limits, the engine's health.
 - `client.recent_replays(challenge_id, limit=10)` — the challenge's newest replays with signed render URLs.
 - `client.create_challenge(name, kernel_version, description=None, copy_from_challenge_id=None, tag_names=None)` — creator scope. The backend resolves the engine + default evaluation + default env runtime from `kernel_version`. Pass `tag_names=["rl", "research"]` to attach tags at creation time; unknown names raise `MLArenaError`.
@@ -643,7 +654,7 @@ Everything the console's creator editor does, on the same routes:
 - Benchmark: `client.list_benchmark_files(challenge_id)`, `upload_benchmark_file`, `update_benchmark_file_content`, `delete_benchmark_file(challenge_id, filename)`, `run_benchmark`, `benchmark_status`.
 - Presentation: `client.challenge_markdown(challenge_id)` / `set_challenge_markdown`, `client.challenge_image(challenge_id, dest_dir=".")` / `set_challenge_image` / `delete_challenge_image`.
 - Agent template: `client.update_agent_template(challenge_id, …)`, `client.csv_ground_truth(challenge_id)` (file challenges).
-- Lifecycle: `client.start_challenge(challenge_id)` / `stop_challenge(challenge_id)`.
+- Lifecycle: `client.start_challenge(challenge_id)` (from `draft` or `stopped`) / `stop_challenge(challenge_id)` (from `started` to `stopped`).
 - Participants: `client.creator_runs(challenge_id)` (the last 30 runs with the env's diagnostics), `client.creator_submissions(challenge_id)`, `client.clean_redeploy_submission(challenge_id, submission_id)`, `client.clean_redeploy_all(challenge_id)`, `client.soft_delete_submission(challenge_id, submission_id)`.
 - Assistants: `client.challenge_assistants(challenge_id)`, `client.add_challenge_assistant(challenge_id, username)`, `client.remove_challenge_assistant(challenge_id, user_id)`.
 

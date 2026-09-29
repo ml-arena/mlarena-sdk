@@ -620,8 +620,11 @@ def test_challenge_read_routes():
     c, rec = make_client(router)
     c.challenges()
     assert rec.last["path"] == "/challenges/"
-    c.challenges(page=1)
+    # The catalog filter is the route's own value set: "started" | "all".
+    assert rec.last["params"]["status"] == "started"
+    c.challenges(page=1, status="all")
     assert rec.last["path"] == "/challenges/"
+    assert rec.last["params"]["status"] == "all"
     # The list route surfaces the caller's enrolled-course challenges on
     # page 1 and, for admins, unstarted ones: the token must travel.
     assert rec.last["headers"]["Authorization"].startswith("Bearer ")

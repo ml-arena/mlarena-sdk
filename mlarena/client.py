@@ -394,7 +394,7 @@ class MLArenaClient:
         *,
         q: str | None = None,
         tags: list[str] | str | None = None,
-        status: str | None = None,
+        status: str = "started",
         page: int | None = None,
         per_page: int | None = None,
     ):
@@ -408,11 +408,13 @@ class MLArenaClient:
         With no args, returns all matching challenges as a DataFrame
         (auto-paginates internally). Pass ``page``/``per_page`` to fetch a
         single page; pass ``q``/``tags``/``status`` to filter server-side.
-        ``status`` is ``"active"`` (only started challenges, the default) or
-        ``"all"`` — the route knows no other value and answers 400.
+        ``status`` is ``"started"`` (only started challenges, the default) or
+        ``"all"`` (draft, started and stopped) — the route knows no other
+        value and answers 400.
 
         Each row carries ``id``, ``name``, ``description``, ``miniature``,
-        ``is_started``, ``is_award_points``, ``number_of_agents``, ``tags``,
+        ``status`` (``"draft"`` | ``"started"`` | ``"stopped"``),
+        ``is_award_points``, ``number_of_agents``, ``tags``,
         ``statistics`` and ``course`` (always null on these rows: only the
         console's "My Courses" grouping, ``course_challenges``, nests the
         course). Call ``challenge(id)`` for the engine, the kernel and the
@@ -533,7 +535,8 @@ class MLArenaClient:
         this includes the caller's **hidden** (`is_public=False`) challenges
         — useful for finding a challenge you created but did not make
         public. Each item carries
-        `id`, `name`, `is_started`, `is_public`, `kind`, `role`.
+        `id`, `name`, `status` (`draft` | `started` | `stopped`), `is_public`,
+        `kind`, `role`.
 
         Requires a `creator`-scope token.
         """
@@ -599,7 +602,7 @@ class MLArenaClient:
 
         Mirrors `GET /api/creator_challenge/copyable_challenges`
         (`lifecycle.py`). Returns `{"challenges": [{"id", "name",
-        "is_started", "engine_name"}]}` — the ones you own (a challenge you
+        "status", "engine_name"}]}` — the ones you own (a challenge you
         only assist on is not a copy source).
         """
         resp = self._request("GET",
@@ -829,10 +832,9 @@ class MLArenaClient:
         ``name`` is locked once the challenge has started — a rename strands
         the links and course material already pointing at it. ``description``
         and ``is_public`` stay editable while it runs, so a creator can fix the
-        blurb or hide an active challenge without stopping it (stopping
-        rewrites ``start_date_ts``). When ``is_public=False``, only the owner,
-        creator assistants, admins, and the members (students, teachers, TAs)
-        of a course that teaches it can view or interact with the challenge.
+        blurb or hide a started challenge without stopping it. When
+        ``is_public=False``, only the owner, creator assistants, admins, and
+        the members (students, teachers, TAs) of a course that teaches it can view or interact with the challenge.
         """
         body: dict = {}
         if name is not None:
@@ -1368,8 +1370,11 @@ class MLArenaClient:
         return resp.json()
 
     def start_challenge(self, challenge_id: int) -> dict:
-        """Flip a creator challenge into the started state.
+        """Move a creator challenge to ``status="started"``.
 
+        Mirrors `PUT /api/creator_challenge/challenge/{id}/start`. Accepted
+        from ``draft`` or ``stopped`` (400 when already started). The first
+        start sets ``start_date_ts``; a restart from ``stopped`` keeps it.
         Backend gates this behind: env.py uploaded, benchmark submission
         ACTIVE with a non-null `mean_reward`. Failures bubble up as
         MLArenaError.
@@ -1387,12 +1392,13 @@ class MLArenaClient:
         return resp.json()
 
     def stop_challenge(self, challenge_id: int) -> dict:
-        """Flip a creator challenge back into the not-started state.
+        """Move a started creator challenge to ``status="stopped"``.
 
-        Mirrors `PUT /api/creator_challenge/challenge/{id}/stop`. Stopping
-        only clears `is_started`; it leaves submissions, results and the
-        benchmark record untouched, so the challenge can be re-started
-        afterwards.
+        Mirrors `PUT /api/creator_challenge/challenge/{id}/stop`. Accepted
+        only from ``started`` (400 otherwise). Stopping leaves submissions,
+        results, the benchmark record and ``start_date_ts`` untouched, and
+        unlocks the authoring fields like a draft, so the challenge can be
+        fixed and restarted with `start_challenge()`.
         """
         resp = self._request("PUT",
             self._url(
@@ -2895,7 +2901,8 @@ class MLArenaClient:
     def chat_challenge(self, challenge_id: int) -> dict:
         """The participant view of a chat challenge — `ChatChallengeView`.
 
-        Mirrors `GET /api/chat/challenge/{cid}` (`backend/app/views/chat/`). Returns `challenge_id`, `challenge_name`, `is_started`,
+        Mirrors `GET /api/chat/challenge/{cid}` (`backend/app/views/chat/`). Returns `challenge_id`, `challenge_name`, `status`
+        (`draft` | `started` | `stopped`),
         `manifest` (what the agent registered: `bot_name`, `tagline`,
         `welcome_message`, `charter_md`, `rules_public_md`, the public
         `scoring_rules`, its `tools`; None until the ChatPod is up),
@@ -2957,7 +2964,8 @@ class MLArenaClient:
         first message), `participant` (your group's `total_amount_eur` and
         `scoreboard`, the same keys `chat_challenge()` serves) and `can_send`
         with `can_send_reason` (`session_voided` | `session_closed` |
-        `turn_in_flight` | `challenge_not_started` | `agent_offline` |
+        `turn_in_flight` | `challenge_not_started` | `challenge_stopped` |
+        `agent_offline` |
         `turn_limit_reached`, None exactly when `can_send` is true). Readable
         by the session's user, their teammates, the challenge's creator /
         assistants and admins.
