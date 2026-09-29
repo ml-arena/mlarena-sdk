@@ -324,9 +324,9 @@ def test_tail_logs_emits_a_run_line_again_when_it_changes():
         if state["polls"] == 1:
             steps, job_status, agent_error, env_error = 5, "running", None, None
         elif state["polls"] == 2:
-            steps, job_status, agent_error, env_error = 9, "failed", "code_error", None
+            steps, job_status, agent_error, env_error = 9, "completed", "code_error", None
         elif state["polls"] == 3:
-            steps, job_status, agent_error, env_error = 9, "failed", "code_error", "simulation_error"
+            steps, job_status, agent_error, env_error = 9, "completed", "code_error", "simulation_error"
         else:
             return (200, {"status": "deploy_failed", "last_status_message": "crash",
                           "is_settled": True, "run_info": {"results": []}})
@@ -356,12 +356,55 @@ def test_tail_logs_emits_a_run_line_again_when_it_changes():
     assert lines == [
         "[deploy_run] running",
         "  run: job_status=running steps=5 reward=1.0 outcome=None",
-        "  run: job_status=failed steps=9 reward=1.0 outcome=None",
+        "  run: job_status=completed steps=9 reward=1.0 outcome=None",
         "    agent error[code_error]: boom",
-        "  run: job_status=failed steps=9 reward=1.0 outcome=None",
+        "  run: job_status=completed steps=9 reward=1.0 outcome=None",
         "    agent error[code_error]: boom",
         "    env error[simulation_error]",
         "[deploy_failed] crash",
+    ], lines
+
+
+def test_tail_logs_names_the_platforms_cause_on_a_failed_run_only():
+    """A run the platform lost says why on the job (`job_error_type`); a
+    `pending` retry carries the previous attempt's cause, which is not a
+    failure of this run and is not printed."""
+    state = {"polls": 0}
+
+    def router(method, path, kwargs):
+        state["polls"] += 1
+        if state["polls"] == 1:
+            job_status = "pending"
+        elif state["polls"] == 2:
+            job_status = "failed"
+        else:
+            return (200, {"status": "deploy_failed", "last_status_message": "lost",
+                          "is_settled": True, "run_info": {"results": []}})
+        return (200, {
+            "status": "deploy_run",
+            "last_status_message": "running",
+            "is_settled": False,
+            "run_info": {"results": [
+                {"job_status": job_status, "job_error_type": "pod_failed",
+                 "job_error_message": "ImagePullBackOff",
+                 "env_error_type": None, "env_error_message": None,
+                 "submission_results": [
+                     {"submission_id": 11, "agent_nb_steps": None,
+                      "submission_reward": None, "game_outcome": "incomplete",
+                      "agent_error_type": None, "agent_error_message": None},
+                 ]},
+            ]},
+        })
+
+    c, _ = make_client(router)
+    lines = with_fake_clock(lambda: list(c.tail_logs(4, 11)))
+
+    assert lines == [
+        "[deploy_run] running",
+        "  run: job_status=pending steps=None reward=None outcome=incomplete",
+        "  run: job_status=failed steps=None reward=None outcome=incomplete",
+        "    job error[pod_failed]: ImagePullBackOff",
+        "[deploy_failed] lost",
     ], lines
 
 

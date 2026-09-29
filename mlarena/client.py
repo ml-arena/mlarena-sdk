@@ -1350,8 +1350,8 @@ class MLArenaClient:
         Mirrors `GET /api/creator_challenge/challenge/{id}/benchmark/status`
         (`benchmark.py`). The run is the same dict `creator_runs()` lists
         (`RunResult`): `job_status` (`pending`, `running`, then `completed`,
-        `failed`, `reaped` or `cancelled`), `env_error_type` /
-        `env_error_message` / `env_stdout_logs`, the timestamps, and
+        `failed` or `cancelled`), `job_error_type` (why the platform lost
+        the run), `env_error_type` / `env_error_message` / `env_stdout_logs`, the timestamps, and
         `submission_results` — the benchmark submission's row, its score
         under `submission_reward`. When the run completes cleanly the backend
         scores the benchmark submission (`active`, `mean_reward`), which is
@@ -2184,13 +2184,18 @@ class MLArenaClient:
           attempt's runs.
           Each run is a `RunResult`, the one run model every run list on the
           API serves (`submission_games` too): the job's own `job_status`
-          (`pending` | `running` | `completed` | `failed` | `cancelled` |
-          `reaped`), `job_started_at_ts`, `job_completed_at_ts`,
-          `job_error_message`, `job_retry_count`, `created_at_ts`,
-          `simulate_end_time_ts`, `is_test`, `is_deployment`, `env_nb_steps`,
-          the env's `step_time_*_sec` / `env_metric_*` columns and, when the
-          challenge's own code is why the run ended, `env_error_type`
-          (`code_error` | `simulation_error` | `pod_crash` | `unknown`).
+          (`pending` | `running` | `completed` | `failed` | `cancelled`),
+          `job_started_at_ts`, `job_completed_at_ts`, `job_error_type` +
+          `job_error_message` (the platform's cause, set on a `failed` run
+          and on a `pending` retry for its last lost attempt: `pod_failed` |
+          `pod_deadline` | `worker_error` | `worker_shutdown` |
+          `wire_mismatch` | `spec_error` | `lost`), `job_retry_count`,
+          `created_at_ts`, `simulate_end_time_ts`, `is_test`,
+          `is_deployment`, `env_nb_steps`, the env's `step_time_*_sec` /
+          `env_metric_*` columns and, when the challenge's own code is why
+          the run ended, `env_error_type` (`code_error` | `simulation_error`
+          | `pod_crash`). `completed` means an outcome arrived: it can carry
+          an `env_error_type`.
           `submission_results` lists one `RunSubmissionResult` per agent in
           the run — **yours is the row whose `submission_id` is this
           submission's**, the others are the opponents. A row carries
@@ -2272,10 +2277,12 @@ class MLArenaClient:
         they were always null. A backend still serving them is simply older —
         this method returns the body verbatim either way.
 
-        `agent_error_type` / `agent_error_message` are the newest run's
-        failure, under the run's own column names (the keys every run payload
-        uses). The message is None unless the submission is yours: it is your
-        agent's traceback.
+        `job_status`, `job_error_type`, `env_error_type`, `agent_error_type`
+        and `agent_error_message` are the newest run's causes, one per owner
+        (the platform, the challenge, your agent), under the run's own column
+        names (the keys every run payload uses); all None before the first
+        run. The agent message is None unless the submission is yours: it is
+        your agent's traceback.
         """
         resp = self._request("GET",
             self._url(f"/submission_result/{challenge_id}/{submission_id}/overview"),
@@ -2368,9 +2375,10 @@ class MLArenaClient:
         **your own row** of that run (the `submission_results` entry whose
         `submission_id` is this submission's), then an
         `agent error[<agent_error_type>]: <agent_error_message>` line when
-        your agent is why the run ended and an `env error[<env_error_type>]`
+        your agent is why the run ended, an `env error[<env_error_type>]`
         line when the challenge's code is (its message is the creator's, so
-        it is not printed). A line is emitted only when what it says changed:
+        it is not printed), and a `job error[<job_error_type>]:
+        <job_error_message>` line when the platform lost a `failed` run. A line is emitted only when what it says changed:
         a deploy that takes twenty polls prints each run once per state, not
         twenty times.
 
@@ -2438,6 +2446,9 @@ class MLArenaClient:
                                 mine.get("agent_error_message")),
                     _error_line("env", run.get("env_error_type"),
                                 run.get("env_error_message")),
+                    _error_line("job", run["job_error_type"],
+                                run.get("job_error_message"))
+                    if run.get("job_status") == "failed" else None,
                 ) if line is not None)
                 if last_run_lines.get(index) == (run_line, error_lines):
                     continue
@@ -4549,8 +4560,8 @@ def _to_dataframe(data):
 def _error_line(side: str, error_type, message) -> str | None:
     """One `tail_logs` error line: `    agent error[code_error]: boom`.
 
-    `side` is `agent` (the caller's own `RunSubmissionResult`) or `env` (the
-    run). The message is appended only when served — it is None on a row
+    `side` is `agent` (the caller's own `RunSubmissionResult`), `env` (the
+    run) or `job` (the platform's cause on a failed run). The message is appended only when served — it is None on a row
     that is not the caller's and on the env side of a participant read.
     """
     if not error_type:
