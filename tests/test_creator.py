@@ -269,6 +269,25 @@ def test_update_settings_sends_the_column_names():
     }, rec.last["json"])
 
 
+def test_update_settings_sends_the_elo_tunables():
+    """The ELO tunables are Evaluation columns, sent under their own names."""
+    c, rec = make_client(lambda *_: (200, {"configuration": {}, "evaluation": {}}))
+    tunables = {
+        "elo_k_factor": 16, "elo_d0": 400.0, "elo_alpha": 0.0, "elo_beta": 5.0,
+        "elo_momentum": 0.5, "elo_initial_variance": 10000.0,
+        "elo_initial_score": 1000.0,
+    }
+    c.update_settings(7, is_elo_score=True, **tunables)
+    _expect(rec.last["json"] == {"is_elo_score": True, **tunables}, rec.last["json"])
+
+
+def test_create_challenge_docstring_names_only_real_kinds():
+    """The kinds are the backend's KINDS keys; env-image families are not."""
+    doc = mlarena.client.MLArenaClient.create_challenge.__doc__
+    _expect('"gymnasium"' not in doc and '"pettingzoo"' not in doc, doc)
+    _expect("available_kinds()" in doc, doc)
+
+
 def test_update_settings_without_a_field_raises_before_any_request():
     c, rec = make_client()
     try:

@@ -398,7 +398,12 @@ class MLArenaClient:
         page: int | None = None,
         per_page: int | None = None,
     ):
-        """List challenges. Public; no auth required.
+        """List the challenges the caller may see. Public; no auth required.
+
+        Anonymous callers get the public challenges. A signed-in caller also
+        gets the ones they own or assist on, and the ones taught by a course
+        they are enrolled in, teach or assist (published modules only) — the
+        same rule every challenge route applies.
 
         With no args, returns all matching challenges as a DataFrame
         (auto-paginates internally). Pass ``page``/``per_page`` to fetch a
@@ -408,9 +413,10 @@ class MLArenaClient:
 
         Each row carries ``id``, ``name``, ``description``, ``miniature``,
         ``is_started``, ``is_award_points``, ``number_of_agents``, ``tags``,
-        ``statistics`` and ``course`` — ``{"id", "name", "code"}`` on the
-        enrolled-course rows, null elsewhere. Call ``challenge(id)`` for the
-        engine, the kernel and the limits.
+        ``statistics`` and ``course`` (always null on these rows: only the
+        console's "My Courses" grouping, ``course_challenges``, nests the
+        course). Call ``challenge(id)`` for the engine, the kernel and the
+        limits.
         """
         base_params: dict = {}
         if q:
@@ -421,8 +427,8 @@ class MLArenaClient:
             base_params["tags"] = ",".join(tags) if isinstance(tags, list) else tags
 
         # Public route, but it answers differently to the caller it can
-        # identify (enrolled courses' challenges on page 1, admins' unstarted
-        # challenges): send the token.
+        # identify (non-public challenges they own, assist on or reach through
+        # a course; every challenge for an admin): send the token.
         if page is not None or per_page is not None:
             params = {**base_params, "page": page or 1, "per_page": per_page or 24}
             resp = self._request("GET", self._url("/challenges/"), params=params,
@@ -570,9 +576,11 @@ class MLArenaClient:
         Mirrors `GET /api/creator_challenge/available_kinds` (`kinds.py`).
         Each entry carries `kernel_version` (what `create_challenge` takes),
         `label`, `description`, `protocol`, `isolation`, `has_engine`,
-        `capabilities` (`agent_template`, `benchmark`, `dataset`,
-        `env_structural_check`, `runs`, `chat`) and
-        `minimal_loop_snippet`. `has_engine` is False when
+        `capabilities` (`agent_template`, `benchmark`,
+        `env_structural_check`, `runs`, `chat`, `submission_upload`,
+        `submission_filename`, `elo`, `episode_budget_brackets`,
+        `run_limits` — the tabs, checks and `update_settings` keywords the
+        kind has) and `minimal_loop_snippet`. `has_engine` is False when
         the deployment has no engine for that kernel, and creating one then
         answers 503.
         """
@@ -662,12 +670,12 @@ class MLArenaClient:
                            is_public: bool | None = None) -> dict:
         """Create a new challenge via the creator-scope authoring flow.
 
-        `kernel_version` carries a catalog KIND: one of `"flex_v1"`,
-        `"gymnasium"`, `"pettingzoo"`, `"file_v1"` (list them live via
-        `GET /creator_challenge/available_kinds`). Since the worker
-        consolidation only two kernels exist — `gymnasium`/`pettingzoo` are
-        presets over the flex_v1 kernel that pair the flexkit loop-library
-        env template with the matching env-image family.
+        `kernel_version` is a kind, and a kind is a kernel: the keys of
+        `KINDS` in `backend/app/views/creator_challenge/_helpers.py`, served
+        by `available_kinds()` — call it for the live list and whether each
+        has an engine. Gymnasium, PettingZoo and the other env-image
+        families are not kinds: they are flex_v1 challenges whose env
+        runtime an admin picks.
 
         The backend resolves the engine + default evaluation + env-image
         family from the kind. To pin a specific engine, use the creator UI
@@ -679,11 +687,13 @@ class MLArenaClient:
         call. Unknown names raise `MLArenaError` (fail fast — the catalog
         is admin-curated; new tags are not auto-created).
 
-        Pass `is_public=False` to hide the challenge from public listings,
-        search, and direct URLs at creation time. Only the owner, creator
-        assistants, and admins can view or interact with a hidden
-        challenge; everyone else gets 404. Visibility can be toggled later
-        via `update_challenge(is_public=...)`. Defaults to public.
+        A new challenge is private unless `is_public=True` is passed: hidden
+        from public listings, search and direct URLs. Only the owner,
+        creator assistants, admins, and the students, teachers and TAs of a
+        course that teaches it (through a published module) can view or
+        interact with a hidden challenge; everyone else gets 404.
+        Visibility can be toggled later via
+        `update_challenge(is_public=...)`.
 
         Requires a `creator`-scope token.
         """
@@ -821,7 +831,8 @@ class MLArenaClient:
         and ``is_public`` stay editable while it runs, so a creator can fix the
         blurb or hide an active challenge without stopping it (stopping
         rewrites ``start_date_ts``). When ``is_public=False``, only the owner,
-        creator assistants, and admins can view or interact with the challenge.
+        creator assistants, admins, and the members (students, teachers, TAs)
+        of a course that teaches it can view or interact with the challenge.
         """
         body: dict = {}
         if name is not None:
@@ -862,6 +873,13 @@ class MLArenaClient:
                         episode_budget_brackets: list | None = None,
                         frontend_precision: int | None = None,
                         metrics_schema: list | None = None,
+                        elo_k_factor: int | None = None,
+                        elo_d0: float | None = None,
+                        elo_alpha: float | None = None,
+                        elo_beta: float | None = None,
+                        elo_momentum: float | None = None,
+                        elo_initial_variance: float | None = None,
+                        elo_initial_score: float | None = None,
                         data_source_enabled: bool | _Unset = _UNSET,
                         data_source_url: str | None | _Unset = _UNSET,
                         data_source_asset: str | None | _Unset = _UNSET,
@@ -882,6 +900,16 @@ class MLArenaClient:
         `metric2`, `frontend_precision`) and `is_stop_after_deployment`;
         everything else is rejected with 400 until the challenge is stopped.
 
+        A kind accepts only the settings it has: the keywords of a
+        capability flag that is false on the challenge's kind
+        (`available_kinds()[i]["capabilities"]`) are refused with 400 —
+        `runs` (simulation_timeout_sec, is_stop_after_deployment, the
+        deployment_nb_* runs), `submission_upload` (max_upload_size_bytes,
+        max_upload_files, max_active_submissions_per_participant),
+        `submission_filename`, `elo` (is_elo_score, elo_*),
+        `episode_budget_brackets` and `run_limits`. The others apply to
+        every kind.
+
         Returns `{"configuration": {...}, "evaluation": {...}}` — the two rows
         as the update left them, each under its own column names.
 
@@ -897,7 +925,8 @@ class MLArenaClient:
             metric: free-text label for the primary metric (e.g. "reward",
                 "accuracy", "bleu"). The DB column is String(20).
             is_elo_score: when True, the leaderboard ranks by ELO rather than
-                mean metric (multi-agent kernels).
+                mean metric. Refused (400) unless the challenge's engine
+                seats at least 2 agents per match.
             metric_order: "desc" (the default: a higher score is better) or
                 "asc" (a lower score is better, e.g. RMSE). Decides who wins
                 each run, the episode budget tiers and, unless the challenge
@@ -935,6 +964,20 @@ class MLArenaClient:
                 (equal-mapping, enforced at run time). See the leaderboard
                 row's `metrics_schema` column. A `higher_is_better`
                 on the `reward` descriptor must match metric_order.
+                Validated on save (400 names the descriptor).
+
+        ELO tunables (kinds with `elo`; frozen while the challenge runs;
+        None is not sent):
+            elo_k_factor: largest rating change per match (int >= 1).
+            elo_d0: rating scale of the expected-score formula (> 0; 400 is
+                chess).
+            elo_alpha / elo_beta: pairing weights (>= 0) of rating
+                uncertainty (who plays) and rating proximity (against whom);
+                0 = uniform.
+            elo_momentum: weight of the old rating variance in each update,
+                in [0, 1).
+            elo_initial_variance: variance of an unrated submission (> 0).
+            elo_initial_score: rating of an unrated submission.
 
         Run limits (admin only — anyone else gets `PermissionDeniedError`,
         403; strictly positive; frozen while the challenge runs):
@@ -981,6 +1024,13 @@ class MLArenaClient:
             "episode_budget_brackets": episode_budget_brackets,
             "frontend_precision": frontend_precision,
             "metrics_schema": metrics_schema,
+            "elo_k_factor": elo_k_factor,
+            "elo_d0": elo_d0,
+            "elo_alpha": elo_alpha,
+            "elo_beta": elo_beta,
+            "elo_momentum": elo_momentum,
+            "elo_initial_variance": elo_initial_variance,
+            "elo_initial_score": elo_initial_score,
         }
         body = {key: value for key, value in sent.items() if value is not None}
         feed = {
@@ -1556,8 +1606,10 @@ class MLArenaClient:
         `submission_id`, `submission_name`, `user_id`, `username`,
         `created_at_ts`, `last_end_run_ts`, `elo_score`, `mean_reward`,
         `number_of_runs`, `rank`, `restart_allowed` and the status block.
-        `rank` is over the active submissions only — the public leaderboard's
-        scope — and null otherwise.
+        `rank` is the place of the submission's row on the challenge
+        leaderboard, one row per participant (the team's or your best active
+        submission, as `leaderboard()` ranks it by default); None for a
+        submission that has no row there.
         """
         return self._creator_get(
             challenge_id, "/submissions", "creator_submissions"
@@ -2203,7 +2255,10 @@ class MLArenaClient:
         `avg_cpu_usage`, `avg_steps`, `runs_last_24h`, `max_vram_bytes`),
         `submissions_in_queue`, and the challenge context for reading them
         (`rank`, `is_elo_score`, `ranked_order`, `metric`,
-        `frontend_precision`, `has_gpu`).
+        `frontend_precision`, `has_gpu`). `rank` is the place of the submission's row on the challenge
+        leaderboard, one row per participant (the team's or your best active
+        submission, as `leaderboard()` ranks it by default); None for a
+        submission that has no row there.
 
         The warm-up counterparts (`warmup_mean_reward`, `warmup_number_of_runs`,
         `warmup_elo_score`) that older backends served are gone: nothing had
@@ -2239,6 +2294,10 @@ class MLArenaClient:
         (the challenge's own `start_date_ts` column), `last_end_run_ts` and the
         status block. Deleted submissions are not
         listed: a row you deleted is gone from here, as from the console.
+        `rank` is the place of the submission's row on the challenge
+        leaderboard, one row per participant (the team's or your best active
+        submission, as `leaderboard()` ranks it by default); None for a
+        submission that has no row there.
         """
         resp = self._request("GET",
             self._url("/submissions/mine"),
@@ -2558,10 +2617,10 @@ class MLArenaClient:
         the query keys the console sends — `limit` (here `top`), `aggregate`,
         `course_id`, `me`, `q`, `window` — each sent only when passed.
 
-        - ``aggregate="user"``: one row per participant (their best
-          submission; a team's best for a team), **the console's default**.
-          The backend also accepts ``"submission"``, its own default: every
-          ranked submission is a row, which is what omitting it gives here.
+        - ``aggregate="user"`` (the default, as on the console): one row per
+          participant — their best active submission, a team's best for a
+          team, ranked among participants. ``"submission"``: every active
+          submission is a row.
         - ``course_id``: read the board through a course. Only that course's
           students are listed, rows gain ``passed`` when the course sets a bar
           (tri-state: None while the row has no ranked value), and the
@@ -2643,6 +2702,19 @@ class MLArenaClient:
 
     def global_ranking(self, search: str | None = None, page: int = 1, per_page: int = 100):
         """Global user ranking across all challenges (points + medals).
+
+        How medals and points are awarded (the /ranking page's text, word for
+        word):
+
+        Every hour, each challenge that awards points & medals ranks
+        its participants (a team, or a user on their own) by their
+        best active submission, as its leaderboard does. Ranks 1, 2
+        and 3 earn a gold, silver and bronze medal. Every rank earns
+        100000 × rank^-0.75 × log10(1 + log10(N)) ÷ √(team size)
+        points, where N is the number of ranked participants. Each
+        team member receives the team's medal and points. When the
+        challenge stops, its last standings stay. Your total is the
+        sum of your points over all challenges.
 
         Mirrors `GET /api/ranking/` (`ranking.py`). Returns a DataFrame of the
         requested page (default: top 100) with the server's own column names:
