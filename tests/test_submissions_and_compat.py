@@ -1367,7 +1367,7 @@ def test_the_client_reads_no_retired_payload_key():
                 "mean_metrics_detail", "mean_reward_30d", "is_continuous",
                 # the overview's renamed error pair (the run's column names)
                 "last_error_type", "last_error_message",
-                # 5.0: the per-run columns (R5)
+                # 4.2: the per-run columns (R5)
                 "submission_reward", "submission_reward2",
                 "submission_reward_variance", "submission_reward_n_episodes",
                 "metrics_detail"):

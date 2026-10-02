@@ -2,18 +2,18 @@
 
 Python SDK for [ML Arena](https://ml-arena.com) — make submissions, manage challenges, manage courses, and read leaderboards from any notebook or IDE.
 
-## 5.0.0 — unreleased (ships with the platform's R5 rollout)
+## 4.2.0 — the platform's R5 run keys
 
 Breaking: the per-run keys follow the platform's per-run columns, and the
-4.1.0 deprecated alias is gone. Use 5.0.0 against a platform that has R5;
-4.x reads `None` for every renamed key there.
+4.1.0 deprecated alias is gone. Use 4.2.0 against a platform that has R5;
+4.1 and older read `None` for every renamed key there.
 
 - **Per-run keys renamed**, no alias (the keys come straight from the
   server). A `submission_results` row of a run (`submission_status()
   ["run_info"]["results"]`, `submission_games()["games"]`, `creator_runs()`,
   `run_benchmark()`, `benchmark_status()`):
 
-  | 4.x | 5.0 |
+  | ≤ 4.1 | 4.2 |
   |---|---|
   | `submission_reward` | `score` |
   | `submission_reward_variance` | `score_variance` |
@@ -68,7 +68,7 @@ and moved a challenge's sizing onto the challenge itself.
   need a kind with `agent_containers`, `number_of_agents` one with
   `multi_agent`. Frozen once started, except `machine_id` for an admin.
 - **`update_challenge_configuration()` is a deprecated alias** of
-  `update_settings()` (a `DeprecationWarning`, removed at 5.0.0): the route
+  `update_settings()` (a `DeprecationWarning`, removed at 4.2.0): the route
   `PUT /api/challenges/{id}/configuration` is gone. `engine_id` raises
   `TypeError` pointing at `machine_id` — take the id from `machines()`.
   It now returns `update_settings`'s reply (`{"configuration",

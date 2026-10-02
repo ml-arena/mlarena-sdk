@@ -81,7 +81,7 @@ When this table drifts from `client.py`, fix the code, not the table.
 
 - `_RENAMED_METHODS`: old method names (`competitions`, `create_competition`, `deploy_agent`, `agent_status`, `agent_games`, …) warn (`DeprecationWarning`) and call the new method. The module raises at import if a target method is missing.
 - `_LEGACY_KWARGS`: old keyword names (`competition_id`, `agent_id`, `agent_name`, …) are accepted on every public method; passing both spellings raises `TypeError`.
-- No method-level alias outside the challenge/submission rename: `update_challenge_configuration` (deprecated in 4.1.0) was removed at 5.0.0.
+- No method-level alias outside the challenge/submission rename: `update_challenge_configuration` (deprecated in 4.1.0) was removed at 4.2.0.
 - `CompetitionNotFoundError` is `ChallengeNotFoundError`. `PermissionDeniedError` subclasses `AuthenticationError`, so `except AuthenticationError` still catches a 403.
 
 ## Auth scopes

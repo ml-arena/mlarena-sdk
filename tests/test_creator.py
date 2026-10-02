@@ -464,7 +464,7 @@ def test_update_settings_refuses_engine_id():
 
 
 def test_update_challenge_configuration_is_gone():
-    """The 4.1.0 deprecated alias was removed at 5.0.0."""
+    """The 4.1.0 deprecated alias was removed at 4.2.0."""
     _expect(not hasattr(mlarena.client.MLArenaClient, "update_challenge_configuration"),
             "update_challenge_configuration still defined")
 
