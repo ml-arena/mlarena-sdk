@@ -2814,12 +2814,13 @@ class MLArenaClient:
     def leaderboard(self, challenge_id: int | None = None, top: int | None = None, *,
                     aggregate: str | None = None, course_id: int | None = None,
                     me: bool = False, q: str | None = None,
-                    window: int | None = None):
+                    window: int | None = None, offset: int | None = None):
         """Get the leaderboard for a challenge.
 
         Mirrors `GET /api/leaderboard/challenge/{id}` (`leaderboard.py`) with
-        the query keys the console sends — `limit` (here `top`), `aggregate`,
-        `course_id`, `me`, `q`, `window` — each sent only when passed.
+        the query keys the console sends — `limit` (here `top`), `offset`,
+        `aggregate`, `course_id`, `me`, `q`, `window` — each sent only when
+        passed.
 
         - ``aggregate="user"`` (the default, as on the console): one row per
           participant — their best active submission, a team's best for a
@@ -2830,8 +2831,12 @@ class MLArenaClient:
           (tri-state: None while the row has no ranked value), and the
           envelope carries a ``course_context`` block (`course_id`,
           `pass_threshold`).
-        - ``top=N``: the first N rows (every ranked row without it).
-          ``me=True`` adds your own row with `rank`, `percentile` and its
+        - ``top=N``: the first N rows (every ranked row without it);
+          ``offset=K`` starts the page at the K-th row (0-based), so
+          ``top=50, offset=100`` is rows 101-150 — the console's page 3.
+          ``me=True`` adds your own row with `rank`, `position` (its
+          1-based place in board order; ties share a rank, not a position),
+          `percentile` and its
           ``window`` neighbours (default 3, at most 25) under `me`; ``q``
           adds the rows whose username contains it under `matches` (at most
           50).
@@ -2872,6 +2877,8 @@ class MLArenaClient:
         params: dict = {}
         if top is not None:
             params["limit"] = top
+        if offset is not None:
+            params["offset"] = offset
         if aggregate is not None:
             params["aggregate"] = aggregate
         if course_id is not None:
@@ -2962,14 +2969,16 @@ class MLArenaClient:
 
         Flat, under the same names a `global_ranking()` row uses: `user_id`,
         `username`, `rank`, `current_points`, `percentile`, `medals_gold`,
-        `medals_silver`, `medals_bronze`. The route used to nest all but the
+        `medals_silver`, `medals_bronze`, plus `position`: the user's 1-based
+        place in `global_ranking()`'s order (``page = (position - 1) //
+        per_page + 1``), None when `rank` is. The route used to nest all but the
         first two under a `stats` key that this method silently unwrapped;
         both the wrapper and the unwrap are gone.
 
         A user who is not ranked (no points yet) is a normal answer: `rank`
         and `percentile` are None (until 4.1.0 the route answered 404). A
         404 — raised as `ChallengeNotFoundError`, a `NotFoundError` — now
-        means the user does not exist. Ties share a rank.
+        means the user does not exist. Ties share a rank, not a position.
         """
         resp = self._request("GET", self._url(f"/ranking/user/{user_id}"),
                              headers=self._headers(), timeout=30)
