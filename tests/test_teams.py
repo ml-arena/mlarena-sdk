@@ -16,10 +16,14 @@ import mlarena
 from mlarena.exceptions import MLArenaError, PermissionDeniedError
 
 
+_NO_BODY = object()
+
+
 class FakeResponse:
-    def __init__(self, status_code=200, json_data=None):
+    # `None` is a body the server sends (`null`), so "no body" is a sentinel.
+    def __init__(self, status_code=200, json_data=_NO_BODY):
         self.status_code = status_code
-        self._json = {} if json_data is None else json_data
+        self._json = {} if json_data is _NO_BODY else json_data
         self.text = ""
 
     def json(self):
@@ -86,6 +90,24 @@ def test_challenge_team_route():
     assert c.challenge_team(4) == TEAM
     assert rec.last["method"] == "GET"
     assert rec.last["path"] == "/teams/challenge/4/team"
+
+
+def test_challenge_team_is_none_when_you_are_on_no_team():
+    """4.1.0: the route answers 200 `null` when you have no team (it was a
+    404 raised as ChallengeNotFoundError); the method returns None."""
+    c, rec = make_client(lambda *_: (200, None))
+    assert c.challenge_team(4) is None
+    assert rec.last["path"] == "/teams/challenge/4/team"
+
+
+def test_challenge_team_404_is_a_challenge_you_cannot_see():
+    from mlarena.exceptions import ChallengeNotFoundError
+    c, _ = make_client(lambda *_: (404, {"error": "Challenge not found"}))
+    try:
+        c.challenge_team(4)
+        raise AssertionError("expected ChallengeNotFoundError")
+    except ChallengeNotFoundError as exc:
+        assert exc.status_code == 404
 
 
 def test_my_role_is_served_not_derived():

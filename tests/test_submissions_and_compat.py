@@ -578,14 +578,16 @@ def test_submit_propagates_a_refused_deploy_with_the_servers_limits():
     assert (c._last_submission_id, c._last_challenge) == (11, 4)
 
 
-def _deploy_failed_status(failure_message, last_status_message="deploy failed"):
+def _deploy_failed_status(failure_message, last_status_message="deploy failed",
+                          failure_owner=None):
     return {
         "status": "deploy_failed", "phase": "deployment",
         "last_status_message": last_status_message, "status_update_ts": None,
         "is_uploadable": True, "is_deployable": True, "is_settled": True,
         "latest_deploy": {"id": 9, "created_at_ts": None, "status": "failed",
                           "finished_at_ts": None,
-                          "failure_message": failure_message},
+                          "failure_message": failure_message,
+                          "failure_owner": failure_owner},
         "run_info": {"results": []}, "queue_info": {},
     }
 
@@ -606,14 +608,30 @@ def test_submit_wait_raises_when_the_deploy_fails():
     assert rec.last["path"] == "/submissions/challenge/4/11/status"
 
 
-def test_submit_wait_falls_back_to_the_status_message_without_a_failure_message():
-    final = _deploy_failed_status(None, last_status_message="engine gone")
+def test_submit_wait_names_the_failure_owner_when_the_verdict_says():
+    """`latest_deploy.failure_owner` (4.1.0) says who the verdict blames; the
+    raised message carries it after the reason, and a legacy verdict with no
+    owner (None) keeps the bare reason (the test above)."""
+    final = _deploy_failed_status("Traceback: ModuleNotFoundError: torch",
+                                  failure_owner="participant")
     c, _ = make_client(_submit_router_with(after_deploy=final))
     try:
         with_fake_clock(lambda: c.submit(4, agent=MyAgent, wait=True))
         raise AssertionError("expected SubmissionError")
     except SubmissionError as exc:
-        assert str(exc) == "engine gone"
+        assert str(exc) == ("Traceback: ModuleNotFoundError: torch "
+                            "(failure_owner: participant)")
+        assert exc.body["latest_deploy"]["failure_owner"] == "participant"
+
+
+def test_submit_wait_falls_back_to_the_status_message_without_a_failure_message():
+    final = _deploy_failed_status(None, last_status_message="machine gone")
+    c, _ = make_client(_submit_router_with(after_deploy=final))
+    try:
+        with_fake_clock(lambda: c.submit(4, agent=MyAgent, wait=True))
+        raise AssertionError("expected SubmissionError")
+    except SubmissionError as exc:
+        assert str(exc) == "machine gone"
         assert exc.body["status"] == "deploy_failed"
 
 
@@ -790,8 +808,14 @@ def test_challenge_admin_and_creator_routes():
         return (201, {"id": 4}) if method == "POST" else (200, {"id": 4})
 
     c, rec = make_client(router, scope="creator")
-    c.update_challenge_configuration(4, engine_id=2)
-    assert (rec.last["method"], rec.last["path"]) == ("PUT", "/challenges/4/configuration")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        c.update_challenge_configuration(4, machine_id=2)
+    assert (rec.last["method"], rec.last["path"]) == (
+        "PUT", "/creator_challenge/challenge/4/settings")
+    assert rec.last["json"] == {"machine_id": 2}
+    c.machines(kernel_version="file_v1")
+    assert (rec.last["method"], rec.last["path"]) == ("GET", "/machines/")
     c.creator_challenges()
     assert rec.last["path"] == "/creator_challenge/challenges"
     c.list_tags()
@@ -1172,14 +1196,14 @@ def test_a_403_is_a_permission_denied_that_carries_the_reason():
 
 def test_a_failed_deploy_status_keeps_the_servers_reason():
     """It ended on `raise_for_status()`, which threw the body away."""
-    c, _ = make_client(lambda *_: (500, {"error": "the engine is down"}))
+    c, _ = make_client(lambda *_: (500, {"error": "the machine is down"}))
     try:
         c.submission_deploy_status(4, 11)
         raise AssertionError("expected SubmissionError")
     except SubmissionError as exc:
-        assert "the engine is down" in str(exc)
+        assert "the machine is down" in str(exc)
         assert exc.status_code == 500
-        assert exc.body == {"error": "the engine is down"}
+        assert exc.body == {"error": "the machine is down"}
 
 
 def test_a_refused_deploy_carries_the_servers_limits():
@@ -1333,7 +1357,9 @@ def test_the_client_reads_no_retired_payload_key():
                 "daily_deploys_count", "isEloRanked", "latest_error",
                 "submission_performance",
                 # 3.0: the flat 2.x run and the PascalCase leaderboard row
-                "error_type", "opponents", "number_agent", "summary_status",
+                # (its `error_type` is not listed: 4.1.0's chat turn view
+                # serves a key of that name, read by `_wait_for_chat_turn`)
+                "opponents", "number_agent", "summary_status",
                 "Rank", "Username", "SubmissionName", "MeanReward",
                 "IsMySubmission", "submissionId", "RankedOrder",
                 "IsEloRanked", "PassThreshold", "Passed", "ranked_by",

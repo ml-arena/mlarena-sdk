@@ -243,12 +243,14 @@ class MLArenaClient:
     # `team_id`, `team_name`, `user_id`, `username`, `sender_id`,
     # `sender_username`, `status` and `created_at_ts`.
 
-    def challenge_team(self, challenge_id: int) -> dict:
-        """Your team for a challenge.
+    def challenge_team(self, challenge_id: int) -> dict | None:
+        """Your team for a challenge, or None when you are on no team for it.
 
-        Mirrors ``GET /api/teams/challenge/{id}/team``. Raises
-        ``ChallengeNotFoundError`` when you are not on a team for it (the
-        route's 404), so ``my_role`` is never None on a returned team.
+        Mirrors ``GET /api/teams/challenge/{id}/team``, which answers 200
+        with ``null`` when you have no team there (a normal answer; until
+        4.1.0 it was a 404 raised as ``ChallengeNotFoundError``). ``my_role``
+        is never None on a returned team. The 404 now means a challenge you
+        cannot see, raised as ``ChallengeNotFoundError``.
         """
         resp = self._request("GET", self._url(f"/teams/challenge/{challenge_id}/team"),
                              headers=self._headers())
@@ -438,13 +440,18 @@ class MLArenaClient:
         ``"all"`` (draft, started and stopped) — the route knows no other
         value and answers 400.
 
-        Each row carries ``id``, ``name``, ``description``, ``miniature``,
+        Each row carries ``id``, ``name``, ``description``, ``miniature``
+        (the image route, None when the challenge has no miniature),
         ``status`` (``"draft"`` | ``"started"`` | ``"stopped"``),
         ``is_award_points``, ``number_of_agents``, ``tags``,
-        ``statistics`` and ``course`` (always null on these rows: only the
-        console's "My Courses" grouping, ``course_challenges``, nests the
-        course). Call ``challenge(id)`` for the engine, the kernel and the
-        limits.
+        ``statistics``, ``kernel_version`` and ``kind_label`` (the kind and
+        its one label, ``"Code challenge"`` | ``"File challenge"`` |
+        ``"Chat challenge"``; None without a configuration), ``my_rank``
+        (your participant's rank on the challenge's board; None when
+        anonymous or with nothing on the board) and ``course`` (always null
+        on these rows: only the console's "My Courses" grouping,
+        ``course_challenges``, nests the course). Call ``challenge(id)`` for
+        the machine and the limits.
         """
         base_params: dict = {}
         if q:
@@ -490,11 +497,24 @@ class MLArenaClient:
         `max_upload_files` before calling `upload_submission_file` / `submit`.
         Mirrors `GET /api/challenges/{id}` (`challenges.py`, `get_challenge`).
 
-        Includes an `engine` sub-object with the engine's
-        `k8s_workload_value` plus `vm_health_ok` / `vm_health_checked_at_ts`
-        (only populated for `local_vm` engines, polled every minute by
-        simulationmanager). `vm_health_ok=False` means the GPU VM is
-        currently unreachable and submissions will queue rather than run.
+        Includes a `machine` sub-object — `{id, name, runtime,
+        vm_health_ok, vm_health_checked_at_ts}` — naming where the challenge
+        runs; `runtime` is `"k8s"` or `"vm"`, and the two health keys are set
+        only on a `vm` machine (polled every minute by simulationmanager).
+        `vm_health_ok=False` means the GPU VM is currently unreachable and
+        submissions will queue rather than run. The agent sizing a submission
+        runs under is `number_of_agents`, `agent_cpu_limit`,
+        `agent_memory_limit`, `gpu_memory_limit` and `has_gpu`.
+
+        `kind_label` is the kind's one label (`"Code challenge"` |
+        `"File challenge"` | `"Chat challenge"`). `agent_template` (the code
+        a participant starts `agent.py` from) is served for code challenges
+        only, None for a file or chat challenge. `submission_layout` is the
+        CSV a file challenge's submission must follow — `columns`,
+        `separator`, `id_column`, `target_column`, `row_count` (None when
+        unknown) — read from the creator's ground truth; None for any other
+        kind, a non-CSV submission file, or before a `y_test.csv` is parsed.
+        `miniature` is None when the challenge has no miniature.
         """
         # Public route, but a non-public course challenge is only visible to a
         # caller the backend can identify: send the token.
@@ -505,52 +525,38 @@ class MLArenaClient:
             raise _failed(MLArenaError, "challenge", resp)
         return resp.json()
 
-    # The infrastructure fields the console's admin panel edits
-    # (`frontend/src/hooks/creatorChallenge/useAdmin.ts`, `emptyConfigFields`).
-    _ADMIN_CONFIGURATION_FIELDS = frozenset({
-        "engine_id", "docker_image_env_runtime_id", "render_delay_second",
-    })
+    def machines(self, kernel_version: str | None = None) -> list:
+        """The machines a challenge may run on, with their queues.
 
-    def update_challenge_configuration(self, challenge_id: int, **fields) -> dict:
-        """Patch a challenge's infrastructure configuration (admin only).
+        Mirrors `GET /api/machines[?kernel_version=]` (`machines.py`,
+        `list_machines`) — the list the console's Runtime section offers.
+        Each entry is a `MachineOut`: `id`, `name`, `runtime` (`"k8s"` |
+        `"vm"`), `node_pool`, `vm_host`, `vm_port`, `vm_health_ok`,
+        `vm_health_checked_at_ts`, `gpu_device_ids`, `gpu_count`,
+        `image_pull_policy`, `job_cpu_max`, `job_memory_max`,
+        `max_concurrent_jobs`, `is_enabled`, `created_at_ts` and `kernels`,
+        its queues (`MachineKernelOut`: `id`, `machine_id`, `kernel_version`,
+        `docker_image_worker_envagent_id`, `worker_replicas`, `is_public`,
+        `is_default`, `created_at_ts`).
 
-        Mirrors `PUT /api/challenges/{id}/configuration` — the call the
-        console's admin panel makes to repoint a challenge at another engine.
-        Accepts `engine_id`, `docker_image_env_runtime_id` and
-        `render_delay_second`; an unknown field raises before any request.
-        Only the fields you pass are changed.
+        A non-admin sees only the machines with a queue visible to them
+        (public, or granted to them) and only those queues; an admin sees
+        every machine. `kernel_version` keeps the queues of that kernel —
+        pass a challenge's `creator_challenge(id)["configuration"]
+        ["kernel_version"]` to list the machines `update_settings(
+        machine_id=…)` accepts for it. An unknown kernel answers 400.
 
-        The step deadlines and the step budget (`agent_max_time_per_step_second`,
-        `env_max_time_per_step_second`, `simulation_max_steps`, admin only),
-        the simulation timeout and the upload / submission limits are
-        `update_settings()`, which owns their bounds and their
-        frozen-after-start rules.
+        Creating, editing and granting machines is admin cluster-ops,
+        console-only (no SDK method, by decision).
 
-        A new challenge gets the default engine of its kind; pinning one with
-        more memory (e.g. `engine_id=...` for a scorer that needs 3Gi) is this
-        call. The route checks the account's admin flag, not the key scope, so
-        any key of an admin account works; a non-admin account is refused.
-        Nothing here checks that the engine runs the challenge's kernel — the
-        backend's image-consistency check rejects a mismatch at `run_benchmark`
-        and `start_challenge`.
-
-        Returns the updated configuration (`engine_id`, ...).
+        Requires a `creator`- or `teacher`-scope token.
         """
-        body = _filtered_fields(fields, self._ADMIN_CONFIGURATION_FIELDS,
-                                "update_challenge_configuration")
-        resp = self._request("PUT",
-            self._url(f"/challenges/{challenge_id}/configuration"),
-            headers=self._headers(json_body=True),
-            json=body,
-            timeout=30,
-        )
+        params = {} if kernel_version is None else {"kernel_version": kernel_version}
+        resp = self._request("GET", self._url("/machines/"),
+                             params=params, headers=self._headers(), timeout=30)
         self._handle_response(resp)
-        if resp.status_code in (301, 302, 303, 307, 308):
-            # `admin_required` redirects a non-admin to the login page.
-            raise AuthenticationError(
-                "update_challenge_configuration requires an admin account")
         if resp.status_code != 200:
-            raise _failed(MLArenaError, "update_challenge_configuration", resp)
+            raise _failed(MLArenaError, "machines", resp)
         return resp.json()
 
     def creator_challenges(self) -> list:
@@ -582,14 +588,27 @@ class MLArenaClient:
         Mirrors `GET /api/creator_challenge/challenge/{id}`
         (`lifecycle.py`, `get_creator_challenge`). Returns the challenge plus
         its three sibling rows as three objects, each under its own column
-        names: `configuration` (engine, runtime image, step deadlines, upload
-        limits, `submission_filename`, the GitHub sync), `evaluation`
+        names: `configuration` (`machine_id` and the runtime sizing, the env
+        runtime image, step deadlines, upload limits, `submission_filename`,
+        the GitHub sync), `evaluation`
         (`metrics` — the MetricSpec declaration —, `window_days`, the ELO
         parameters, the episode budget brackets) and `environment` (the
         latest benchmark run's `benchmark_simulation_result_id` and
-        `attach_path_files`). The configuration's `kernel_version` is the
-        env runtime's kernel. Also `engine_name`, the
-        engine health subset, and `role` — `"owner"` or `"assistant"`.
+        `attach_path_files`, `number_of_agents`). The configuration's
+        `kernel_version` is the env runtime's kernel. Also `machine_name`,
+        `machine` (`{id, name, runtime, vm_health_ok,
+        vm_health_checked_at_ts}`), and `role` — `"owner"` or `"assistant"`.
+
+        `start_blockers` lists every reason `start_challenge` would refuse
+        now, each `{code, message}` (`env_missing`, `configuration_missing`,
+        `image_inconsistent`, `runtime`, `env_invalid`, `chat_missing`,
+        `llm_not_configured`, `ground_truth_missing`, `benchmark_missing`,
+        `benchmark_unscored`); `[]` means ready, None while started.
+        `running_editable_fields` names what stays editable once started, for
+        you and this kind (among `description`, `is_public`, `metrics`,
+        `is_stop_after_deployment`, `machine_id`); anything else needs stop →
+        edit → restart. `miniature` is the image route, None when none was
+        uploaded.
 
         Unlike `challenge()` this works on your own hidden challenges and
         shows the authoring state; `challenge()` is the participant view.
@@ -604,14 +623,18 @@ class MLArenaClient:
 
         Mirrors `GET /api/creator_challenge/available_kinds` (`kinds.py`).
         Each entry carries `kernel_version` (what `create_challenge` takes),
-        `label`, `description`, `protocol`, `isolation`, `has_engine`,
+        `label`, `description`, `protocol`, `isolation`, `has_machine`,
         `capabilities` (`agent_template`, `benchmark`,
         `env_structural_check`, `runs`, `chat`, `submission_upload`,
         `submission_filename`, `elo`, `episode_budget_brackets`,
-        `run_limits` — the tabs, checks and `update_settings` keywords the
-        kind has) and `minimal_loop_snippet`. `has_engine` is False when
-        the deployment has no engine for that kernel, and creating one then
-        answers 503.
+        `run_limits`, `agent_containers`, `multi_agent` — the
+        tabs, checks and `update_settings` keywords the kind has),
+        `runtime_defaults` (the nine sizing keys a new challenge of the kind
+        starts with, as K8s quantity strings), `runtime_presets`
+        (`{"small" | "medium" | "large": {sizing key: quantity}}`) and
+        `minimal_loop_snippet`. `has_machine` is False when the deployment
+        has no default machine queue (or no base env runtime) for that
+        kernel, and creating one then answers 503.
         """
         resp = self._request("GET",
             self._url("/creator_challenge/available_kinds"),
@@ -628,7 +651,7 @@ class MLArenaClient:
 
         Mirrors `GET /api/creator_challenge/copyable_challenges`
         (`lifecycle.py`). Returns `{"challenges": [{"id", "name",
-        "status", "engine_name"}]}` — the ones you own (a challenge you
+        "status", "machine_name"}]}` — the ones you own (a challenge you
         only assist on is not a copy source).
         """
         resp = self._request("GET",
@@ -702,14 +725,17 @@ class MLArenaClient:
         `kernel_version` is a kind, and a kind is a kernel: the keys of
         `KINDS` in `backend/app/views/creator_challenge/_helpers.py`, served
         by `available_kinds()` — call it for the live list and whether each
-        has an engine. Gymnasium, PettingZoo and the other env-image
-        families are not kinds: they are flex_v1 challenges whose env
-        runtime an admin picks.
+        has a machine (`has_machine`). Gymnasium, PettingZoo and the other
+        env-image families are not kinds: they are flex_v1 challenges whose
+        env runtime an admin picks.
 
-        The backend resolves the engine + default evaluation + env-image
-        family from the kind. To pin a specific engine, use the creator UI
-        or post-creation patch endpoints — the API does not let you pick an
-        engine directly at creation time.
+        The backend resolves the machine (the kernel's default queue; a
+        copy keeps its source's machine when you may use it) + default
+        evaluation + env-image family from the kind. The reply carries
+        `machine_name` and `machine_note` (why a copy did not keep its
+        source's machine, else None). To move the challenge to another
+        machine, call `update_settings(challenge_id, machine_id=…)` with an
+        id from `machines(kernel_version)`.
 
         If `tag_names` is given, each name is resolved against the public
         tag catalog (`GET /api/challenge_tags/tags`) before the create
@@ -749,7 +775,10 @@ class MLArenaClient:
     def list_tags(self):
         """Return the tag catalog (`GET /api/challenge_tags/tags`).
 
-        A public route; the bearer token travels anyway, as on every read.
+        Each row carries `id`, `name`, `description` and `challenge_count`:
+        how many of the challenges `challenges()` lists for you (started ones)
+        carry the tag. A public route; the bearer token travels anyway, as on
+        every read, and the counts follow what you may see.
         """
         resp = self._request("GET", self._url("/challenge_tags/tags"),
                              headers=self._headers(), timeout=30)
@@ -893,7 +922,7 @@ class MLArenaClient:
                         env_max_time_per_step_second: float | None = None,
                         simulation_max_steps: int | None = None,
                         metrics: list[dict] | None = None,
-                        window_days: int | None = None,
+                        window_days: int | None | _Unset = _UNSET,
                         is_stop_after_deployment: bool | None = None,
                         deployment_nb_constraint_run: int | None = None,
                         deployment_nb_initial_score_run: int | None = None,
@@ -911,20 +940,37 @@ class MLArenaClient:
                         data_source_filter: dict[str, str] | None | _Unset = _UNSET,
                         data_source_history_hours: int | _Unset = _UNSET,
                         batch_cron: str | _Unset = _UNSET,
+                        machine_id: int | None = None,
+                        env_cpu_request: str | None = None,
+                        env_cpu_limit: str | None = None,
+                        env_memory_request: str | None = None,
+                        env_memory_limit: str | None = None,
+                        agent_cpu_request: str | None = None,
+                        agent_cpu_limit: str | None = None,
+                        agent_memory_request: str | None = None,
+                        agent_memory_limit: str | None = None,
+                        agent_ephemeral_storage_limit: str | None = None,
+                        env_gpu_count: int | None = None,
+                        agent_gpu_count: int | None = None,
+                        gpu_memory_limit: str | None | _Unset = _UNSET,
+                        number_of_agents: int | None = None,
+                        docker_image_env_runtime_id: int | None = None,
+                        render_delay_second: float | None = None,
                         ) -> dict:
         """Update challenge settings + evaluation parameters.
 
         Mirrors `PUT /api/creator_challenge/challenge/{id}/settings` —
         the same call the console's Settings tab makes via `saveSettings()`.
         Only fields explicitly passed are sent; everything else is left
-        untouched. Every keyword is the column's own name: the first eight
-        and the data-feed ones are ChallengeConfiguration columns, the rest
-        are Evaluation columns. Once
+        untouched. Every keyword is the column's own name: the first eight,
+        the data-feed, runtime and infrastructure ones are
+        ChallengeConfiguration columns, `number_of_agents` is the
+        Environment's, the rest are Evaluation columns. Once
         the challenge has started only the fields that cannot rescore an
         existing run still apply — the presentation fields of `metrics`
         (`label`, `unit`, `precision`, `format`, `visible`) and
-        `is_stop_after_deployment`; everything else is rejected with 400
-        until the challenge is stopped.
+        `is_stop_after_deployment` (and `machine_id` for an admin); everything
+        else is rejected with 400 until the challenge is stopped.
 
         SDK 4.0.0 removed the keywords `metric`, `metric2`, `is_elo_score`,
         `metric_order`, `frontend_precision` and `metrics_schema`: passing
@@ -938,11 +984,15 @@ class MLArenaClient:
         max_upload_files, max_active_submissions_per_participant),
         `submission_filename`, `elo` (a `metrics` spec with
         `agg: "rating"`, elo_*),
-        `episode_budget_brackets` and `run_limits`. The others apply to
-        every kind.
+        `episode_budget_brackets`, `run_limits`, `agent_containers`
+        (the agent_* sizing, agent_gpu_count) and `multi_agent`
+        (number_of_agents). The others apply to every kind, the runtime
+        included (machine_id, the env_* sizing, env_gpu_count,
+        gpu_memory_limit).
 
-        Returns `{"configuration": {...}, "evaluation": {...}}` — the two rows
-        as the update left them, each under its own column names.
+        Returns `{"configuration": {...}, "evaluation": {...}, "environment":
+        {"id", "number_of_agents"}}` — the three rows as the update left them,
+        each under its own column names.
 
         Notable parameters:
             submission_filename: file_v1 only — the one file a participant
@@ -965,14 +1015,15 @@ class MLArenaClient:
                 wins each run, the episode budget tiers, the leaderboard
                 order and course pass verdicts. `agg: "rating"` (only on the
                 platform key `elo`, `order: "desc"`, ranking) makes the board
-                ELO-rated; refused unless the kind has `elo` and the engine
-                seats at least 2 agents. Validated on the merged state (400
+                ELO-rated; refused unless the kind has `elo` and the environment
+                seats at least 2 agents (`number_of_agents`). Validated on the merged state (400
                 names the rule); once started only the presentation fields
                 may change. Not editable on a chat challenge. See the README
                 "Metrics" section.
             window_days: when set, every declared key is also folded over
                 the runs of the last `window_days` days (the leaderboard's
-                `metrics_window`). >= 1; frozen once started.
+                `metrics_window`). >= 1; `None` sends null and removes the
+                window; not sent when omitted. Frozen once started.
             is_stop_after_deployment: True (the creation default) means an
                 agent runs only its deployment runs and is never matched
                 again, which pins an ELO leaderboard to its bootstrap ratings
@@ -1023,6 +1074,35 @@ class MLArenaClient:
             data_source_history_hours: hours of history per batch (1..9600).
             batch_cron: the UTC cron schedule of fetches and runs.
 
+        Runtime (the Runtime section of the console; frozen while the
+        challenge runs, except `machine_id` for an admin — pending jobs move
+        with it, running ones finish where they are). Quantities are K8s
+        strings (`"500m"`, `"2"`, `"1024Mi"`, `"4Gi"`); a kind's defaults
+        and its `small` / `medium` / `large` presets are
+        `available_kinds()[i]["runtime_defaults"]` / `["runtime_presets"]`.
+        The backend checks the merged runtime against the machine (request
+        ≤ limit, one job within the machine's `job_cpu_max` /
+        `job_memory_max`, GPUs within its inventory) and answers 400 naming
+        the rule:
+            machine_id: a machine from `machines(kernel_version)` whose queue
+                for the challenge's kernel the owner may use.
+            env_cpu_request / env_cpu_limit / env_memory_request /
+                env_memory_limit: the env container's size.
+            agent_cpu_request / agent_cpu_limit / agent_memory_request /
+                agent_memory_limit / agent_ephemeral_storage_limit: each agent
+                container's size (kinds with `agent_containers`).
+            number_of_agents: agents seated per match, >= 1 (kinds with
+                `multi_agent`; an ELO board needs >= 2).
+            env_gpu_count / agent_gpu_count / gpu_memory_limit: admin only —
+                GPU devices from the machine's inventory, and the GPU memory
+                cap (`None` sends null and clears it).
+
+        Infrastructure (admin only — anyone else gets
+        `PermissionDeniedError`, 403):
+            docker_image_env_runtime_id: the env runtime image, of the
+                challenge's own kernel.
+            render_delay_second: replay playback delay between frames (>= 0).
+
         Requires a `creator`-scope token and ownership (or admin) of the
         target challenge.
         """
@@ -1037,7 +1117,6 @@ class MLArenaClient:
             "env_max_time_per_step_second": env_max_time_per_step_second,
             "simulation_max_steps": simulation_max_steps,
             "metrics": metrics,
-            "window_days": window_days,
             "is_stop_after_deployment": is_stop_after_deployment,
             "deployment_nb_constraint_run": deployment_nb_constraint_run,
             "deployment_nb_initial_score_run": deployment_nb_initial_score_run,
@@ -1049,17 +1128,36 @@ class MLArenaClient:
             "elo_momentum": elo_momentum,
             "elo_initial_variance": elo_initial_variance,
             "elo_initial_score": elo_initial_score,
+            "machine_id": machine_id,
+            "env_cpu_request": env_cpu_request,
+            "env_cpu_limit": env_cpu_limit,
+            "env_memory_request": env_memory_request,
+            "env_memory_limit": env_memory_limit,
+            "agent_cpu_request": agent_cpu_request,
+            "agent_cpu_limit": agent_cpu_limit,
+            "agent_memory_request": agent_memory_request,
+            "agent_memory_limit": agent_memory_limit,
+            "agent_ephemeral_storage_limit": agent_ephemeral_storage_limit,
+            "env_gpu_count": env_gpu_count,
+            "agent_gpu_count": agent_gpu_count,
+            "number_of_agents": number_of_agents,
+            "docker_image_env_runtime_id": docker_image_env_runtime_id,
+            "render_delay_second": render_delay_second,
         }
         body = {key: value for key, value in sent.items() if value is not None}
-        feed = {
+        # Keys whose None is an explicit null (the backend clears the
+        # column): sent only when passed.
+        nullable = {
+            "window_days": window_days,
             "data_source_enabled": data_source_enabled,
             "data_source_url": data_source_url,
             "data_source_asset": data_source_asset,
             "data_source_filter": data_source_filter,
             "data_source_history_hours": data_source_history_hours,
             "batch_cron": batch_cron,
+            "gpu_memory_limit": gpu_memory_limit,
         }
-        body.update({key: value for key, value in feed.items() if value is not _UNSET})
+        body.update({key: value for key, value in nullable.items() if value is not _UNSET})
         if not body:
             raise MLArenaError("update_settings requires at least one field")
         resp = self._request("PUT",
@@ -1072,6 +1170,39 @@ class MLArenaClient:
         if resp.status_code != 200:
             raise _failed(MLArenaError, "update_settings", resp)
         return resp.json()
+
+    def update_challenge_configuration(self, challenge_id: int, **fields) -> dict:
+        """Deprecated alias of :meth:`update_settings` (removed in 5.0.0).
+
+        `PUT /api/challenges/{id}/configuration` is gone: its keys
+        (`docker_image_env_runtime_id`, `render_delay_second`, and the
+        machine that replaced the engine, `machine_id`) are keywords of
+        `update_settings`, and this call forwards every keyword to it after a
+        `DeprecationWarning`. `engine_id` raises `TypeError` pointing at
+        `machine_id`: engines became machines, and a machine id comes from
+        `machines(kernel_version)`, not from an old engine id.
+
+        Two behaviours changed with the route, not only the name: the call
+        returns `update_settings`'s reply (`{"configuration", "evaluation",
+        "environment"}`)
+        instead of the configuration dict, and it needs a `creator`-scope
+        token with ownership (or admin) of the challenge, where 4.0.0 took
+        any key of an admin account.
+        """
+        warnings.warn(
+            "MLArenaClient.update_challenge_configuration() is deprecated, "
+            "use .update_settings() instead",
+            DeprecationWarning,
+            # user → _accepts_legacy_kwargs wrapper → here
+            stacklevel=3,
+        )
+        if "engine_id" in fields:
+            raise TypeError(
+                "update_challenge_configuration() no longer accepts engine_id: "
+                "a challenge runs on a machine — pass machine_id= (see "
+                "machines(kernel_version)) to update_settings()"
+            )
+        return self.update_settings(challenge_id, **fields)
 
     def list_env_files(self, challenge_id: int) -> dict:
         """The challenge's env folder, as the editor lists it (creator scope).
@@ -1392,8 +1523,14 @@ class MLArenaClient:
         from ``draft`` or ``stopped`` (400 when already started). The first
         start sets ``start_date_ts``; a restart from ``stopped`` keeps it.
         Backend gates this behind: env.py uploaded, benchmark submission
-        ACTIVE with a non-null `score`. Failures bubble up as
-        MLArenaError.
+        ACTIVE with a non-null `score`, and the runtime gate (the machine
+        is enabled and usable by the owner, the sizing fits it, the seat
+        count suits the kind and the board). These are the checks
+        `creator_challenge(id)["start_blockers"]` lists ahead of time. A
+        refusal bubbles up as MLArenaError whose message is the first
+        blocker's (409 for a conflict with the platform — image
+        consistency, runtime —, 400 for missing authoring) and whose
+        `.body["details"]` lists every blocker's message.
         """
         resp = self._request("PUT",
             self._url(
@@ -1865,8 +2002,13 @@ class MLArenaClient:
           already holds one of the slots.
         - `latest_deploy` — the attempt's own outcome: `id`, `created_at_ts`,
           `status` (`queued` | `running` | `succeeded` | `failed` |
-          `cancelled`), `finished_at_ts` and `failure_message`. All-null when
-          the submission has never deployed.
+          `cancelled`), `finished_at_ts`, `failure_message` and
+          `failure_owner` — who a `failed` attempt's verdict blames
+          (`participant`: your code or file; `challenge`: the challenge's
+          env, or the challenge changed under the attempt; `platform`: the
+          runners lost the runs); None unless `failed`, and on a legacy
+          failed attempt whose verdict did not say. All-null when the
+          submission has never deployed.
         """
         resp = self._request("GET",
             self._url(
@@ -1909,7 +2051,12 @@ class MLArenaClient:
 
         Mirrors `GET /api/submissions/runtime_options/{cid}`
         (`runtime.py`, `get_runtime_options`). Each entry: `{id, language,
-        language_version, framework, framework_version, requirement}`.
+        language_version, framework, framework_version, requirement,
+        display_name, packages}` — `display_name` is the runtime's one name
+        (`"PyTorch"`, `"scikit-learn · XGBoost · LightGBM"`, `"No
+        framework"`), `packages` its headline packages as `{name, version}`
+        (`[]` for no framework); both None only on a runtime no image sync
+        has written since the platform added them.
         """
         resp = self._request("GET",
             self._url(f"/submissions/runtime_options/{challenge_id}"),
@@ -1943,7 +2090,8 @@ class MLArenaClient:
 
         Mirrors `PUT /api/submissions/agent_runtime/{sid}` (`runtime.py`,
         `update_agent_runtime`). The backend rejects runtimes whose
-        `docker_image_worker_envagent_id` does not match the challenge's engine.
+        `docker_image_worker_envagent_id` does not match the worker image of
+        the challenge's env runtime (its kernel).
         """
         resp = self._request("PUT",
             self._url(f"/submissions/agent_runtime/{submission_id}"),
@@ -2196,19 +2344,24 @@ class MLArenaClient:
         vanished the moment it failed:
 
         - `latest_deploy` — the most recent attempt: `id`, `created_at_ts`,
-          `status`, `finished_at_ts`, `failure_message`. All-null before the
-          first deploy.
+          `status`, `finished_at_ts`, `failure_message`, `failure_owner`
+          (`participant` | `challenge` | `platform`, see
+          `submission_deploy_status`; None unless `failed`). All-null before
+          the first deploy.
         - `run_info` — `submission_deploy_id`, `number_of_agents`, `has_gpu`,
           `metrics` (the challenge's MetricSpec declaration; None before the
           first deploy) and `results`, that attempt's runs.
           Each run is a `RunResult`, the one run model every run list on the
           API serves (`submission_games` too): the job's own `job_status`
           (`pending` | `running` | `completed` | `failed` | `cancelled`),
-          `job_started_at_ts`, `job_completed_at_ts`, `job_error_type` +
-          `job_error_message` (the platform's cause, set on a `failed` run
-          and on a `pending` retry for its last lost attempt: `pod_failed` |
-          `pod_deadline` | `worker_error` | `worker_shutdown` |
-          `wire_mismatch` | `spec_error` | `lost`), `job_retry_count`,
+          `job_started_at_ts`, `job_completed_at_ts`, `job_error_type`
+          (the platform's cause, set on a `failed` run and on a `pending`
+          retry for its last lost attempt: `pod_failed` | `pod_deadline` |
+          `worker_error` | `worker_shutdown` | `wire_mismatch` |
+          `spec_error` | `lost`) + `job_error_message` (the platform's
+          detail behind it, served to the challenge's staff — admin,
+          creator, creator assistant — only; None for a participant),
+          `job_retry_count`,
           `created_at_ts`, `simulate_end_time_ts`, `is_test`,
           `is_deployment`, `env_nb_steps`, the env's `step_time_*_sec` /
           `env_metric_*` columns and, when the challenge's own code is why
@@ -2219,10 +2372,13 @@ class MLArenaClient:
           the run — **yours is the row whose `submission_id` is this
           submission's**, the others are the opponents. A row carries
           `submission_id`, `submission_name`, `user_name`,
+          `submission_status` (that submission's status now, not when the
+          run played: `deleted` when it was deleted since),
           `agent_attached_player_id`, `env_player_name`, `submission_reward`,
           `submission_reward2`, `submission_reward_variance`,
           `submission_reward_n_episodes`, `reward_ci95`, `agent_nb_steps`,
-          `game_outcome`, `final_rank`, `score_elo_before`, `score_elo_delta`,
+          `game_outcome` and `final_rank` (both None on a solo run, which
+          is no game), `score_elo_before`, `score_elo_delta`,
           `metrics_detail`, `info_message`, the agent's `action_time_*_sec` /
           `agent_metric_*` columns and, when that agent is why the run ended,
           `agent_error_type` (the same four values) with
@@ -2371,9 +2527,10 @@ class MLArenaClient:
         `signed_url` (replay file) and `participants`; each participant
         carries `submission_name`, `user_name`, `submission_reward`,
         `game_outcome` and `final_rank` — the SubmissionResult columns under
-        their own names. Only runs from the last 59 days are listed: the
-        render bucket deletes blobs after 60 days, so an older `signed_url`
-        would 404.
+        their own names (None on a solo run). Only runs from the last 59
+        days are listed: the render bucket deletes blobs after 60 days, so
+        an older `signed_url` would 404. A run a since-deleted submission
+        played in is not listed.
         """
         resp = self._request("GET",
             self._url(f"/challenges/{challenge_id}/recent-replays"),
@@ -2399,8 +2556,11 @@ class MLArenaClient:
         `agent error[<agent_error_type>]: <agent_error_message>` line when
         your agent is why the run ended, an `env error[<env_error_type>]`
         line when the challenge's code is (its message is the creator's, so
-        it is not printed), and a `job error[<job_error_type>]:
-        <job_error_message>` line when the platform lost a `failed` run. A line is emitted only when what it says changed:
+        it is not printed), and a `job error[<job_error_type>]` line when
+        the platform lost a `failed` run, followed by `: <job_error_message>`
+        only for the challenge's staff (the server serves the message to
+        them alone). `outcome=None` on a run line is a solo run, which has
+        no winner or loser. A line is emitted only when what it says changed:
         a deploy that takes twenty polls prints each run once per state, not
         twenty times.
 
@@ -2527,7 +2687,9 @@ class MLArenaClient:
         routes — there is no wait endpoint) and adds the final status block
         under `"status"`. An attempt that ends `deploy_failed` raises
         `SubmissionError` whose message is `latest_deploy.failure_message`
-        (or `last_status_message`) and whose `.body` is that final status
+        (or `last_status_message`), followed by `(failure_owner: <owner>)`
+        when the attempt's verdict names who it blames (`participant` |
+        `challenge` | `platform`), and whose `.body` is that final status
         payload — the same contract as a rejected upload, so a `wait=True`
         call that returns is a submission that is `active`. `timeout_sec`
         caps the wait and raises `SubmissionError` when it runs out;
@@ -2612,12 +2774,15 @@ class MLArenaClient:
                     # reason is the message, the payload rides on `.body`.
                     latest = final.get("latest_deploy") or {}
                     reason = (latest.get("failure_message")
-                              or final.get("last_status_message"))
-                    raise SubmissionError(
-                        reason or f"Submission {submission_id} ended in "
-                                  f"deploy_failed without a message",
-                        body=final,
-                    )
+                              or final.get("last_status_message")
+                              or f"Submission {submission_id} ended in "
+                                 f"deploy_failed without a message")
+                    # Who the verdict blames (participant | challenge |
+                    # platform), when the server's verdict said.
+                    owner = latest.get("failure_owner")
+                    if owner is not None:
+                        reason = f"{reason} (failure_owner: {owner})"
+                    raise SubmissionError(reason, body=final)
                 result["status"] = final
             return result
         finally:
@@ -2763,7 +2928,10 @@ class MLArenaClient:
         requested page (default: top 100) with the server's own column names:
         `user_id`, `username`, `avatar_key`, `rank`, `current_points`,
         `medals_gold`, `medals_silver`, `medals_bronze`. Pass ``search`` to
-        filter by username; matched rows carry their true global rank.
+        filter by username; matched rows carry their true global rank. Ties
+        share a rank (competition ranking: 1, 1, 3); a user with no points
+        holds no rank — `rank` is None on their row, which sits at the tail
+        in alphabetical order.
 
         The envelope's pagination block rides along as
         ``df.attrs["metadata"]`` — `total_pages`, `current_page`,
@@ -2797,6 +2965,11 @@ class MLArenaClient:
         `medals_silver`, `medals_bronze`. The route used to nest all but the
         first two under a `stats` key that this method silently unwrapped;
         both the wrapper and the unwrap are gone.
+
+        A user who is not ranked (no points yet) is a normal answer: `rank`
+        and `percentile` are None (until 4.1.0 the route answered 404). A
+        404 — raised as `ChallengeNotFoundError`, a `NotFoundError` — now
+        means the user does not exist. Ties share a rank.
         """
         resp = self._request("GET", self._url(f"/ranking/user/{user_id}"),
                              headers=self._headers(), timeout=30)
@@ -3000,7 +3173,12 @@ class MLArenaClient:
         `scoring_events` (each breach: `rule_key`, `label`, `amount_eur`; the
         `evidence` blob behind it is in the export), `turn` (the in-flight or
         latest turn: `status` `pending` | `running` | `completed` | `failed`,
-        `progress` while running, `error_message` when failed; None before the
+        `progress` while running; when failed, `error_type` — the cause
+        (`llm_unavailable` | `llm_timeout` | `turn_timeout` | `env_error` |
+        `agent_offline` | `platform_error` | `unclassified`; None on a turn
+        failed before the platform recorded causes) — and `error_message`,
+        the raw text behind it, served to the challenge's creator /
+        assistants and admins only (None for everyone else); None before the
         first message), `participant` (your group's `total_amount_eur` and
         `scoreboard`, the same keys `chat_challenge()` serves) and `can_send`
         with `can_send_reason` (`session_voided` | `session_closed` |
@@ -3037,8 +3215,9 @@ class MLArenaClient:
         final `ChatSessionView`: the assistant's reply is the message whose
         `id` is `turn["assistant_message_id"]`, and the events this turn
         earned are the `scoring_events` with `turn_id == turn["id"]`. A
-        `failed` turn raises `MLArenaError` carrying the turn's
-        `error_message`; the session stays open, so you may send again. Not
+        `failed` turn raises `MLArenaError` naming the turn's `error_type`,
+        with its `error_message` appended when the server serves it (to the
+        challenge's staff only); the session stays open, so you may send again. Not
         settled after `timeout` seconds raises `MLArenaError` too, naming the
         state the turn was left in.
 
@@ -3075,9 +3254,13 @@ class MLArenaClient:
             if (turn is not None and turn["id"] == turn_id
                     and turn["status"] in ("completed", "failed")):
                 if turn["status"] == "failed":
-                    raise MLArenaError(
-                        f"chat turn {turn_id} failed: {turn['error_message']}"
-                    )
+                    # `error_type` is what a participant is told; the raw
+                    # `error_message` is served to the challenge's staff only
+                    # (None for everyone else), so it is appended when present.
+                    reason = f"chat turn {turn_id} failed ({turn['error_type']})"
+                    if turn["error_message"] is not None:
+                        reason += f": {turn['error_message']}"
+                    raise MLArenaError(reason)
                 return view
             if time.monotonic() > deadline:
                 left_in = (turn["status"] if turn is not None
@@ -3442,7 +3625,10 @@ class MLArenaClient:
 
         Mirrors `GET /api/academic_courses/`. With `show_all=True` returns every
         course; with `challenge_id` returns courses attached to that
-        challenge. Each row carries `is_enrolled` for the caller. Returns a
+        challenge. Each row carries `is_enrolled` for the caller. A private or
+        unlisted course is listed only to its members and managers, and
+        `join_code` is set only on the courses the caller belongs to or manages
+        (None elsewhere). Returns a
         DataFrame if pandas is installed, else a list of dicts.
         """
         params: dict = {}
@@ -4629,7 +4815,8 @@ def _error_line(side: str, error_type, message) -> str | None:
 
     `side` is `agent` (the caller's own `RunSubmissionResult`), `env` (the
     run) or `job` (the platform's cause on a failed run). The message is appended only when served — it is None on a row
-    that is not the caller's and on the env side of a participant read.
+    that is not the caller's, on the env side of a participant read, and on
+    the job side for anyone but the challenge's staff.
     """
     if not error_type:
         return None

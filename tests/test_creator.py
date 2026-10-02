@@ -1,8 +1,8 @@
 """SDK tests for the creator-challenge methods the console had and the SDK did
 not: the authoring reads (challenge detail, env / benchmark files, markdown,
 image, tags, runs, submissions, assistants, kinds), the deletes, and the
-clean-redeploy actions — plus the payload keys the settings and configuration
-writes now send.
+clean-redeploy actions — plus the payload keys the settings write sends and
+the machine list.
 
 Same offline harness as ``test_teacher_admin.py``: the client's single HTTP
 chokepoint (``MLArenaClient._request``) is replaced by a recorder, so each test
@@ -407,28 +407,124 @@ def test_data_source_weather_series_sends_the_response_keys():
             rec.last["params"])
 
 
-def test_update_challenge_configuration_is_the_infrastructure_fields_only():
-    c, rec = make_client(lambda *_: (200, {"engine_id": 3}))
-    c.update_challenge_configuration(
-        7, engine_id=3, docker_image_env_runtime_id=2, render_delay_second=0.05
-    )
+RUNTIME_KWARGS = {
+    "machine_id": 3,
+    "env_cpu_request": "500m", "env_cpu_limit": "1",
+    "env_memory_request": "512Mi", "env_memory_limit": "1Gi",
+    "agent_cpu_request": "250m", "agent_cpu_limit": "500m",
+    "agent_memory_request": "256Mi", "agent_memory_limit": "512Mi",
+    "agent_ephemeral_storage_limit": "1Gi",
+    "env_gpu_count": 0, "agent_gpu_count": 1, "gpu_memory_limit": "8Gi",
+    "number_of_agents": 2,
+    "docker_image_env_runtime_id": 2, "render_delay_second": 0.05,
+}
+
+
+def test_update_settings_sends_the_runtime_fields():
+    """The machine, the sizing columns, the seat count and the infrastructure
+    keys of the removed configuration route go through PUT /settings under
+    their column names (machine_model D7)."""
+    c, rec = make_client(lambda *_: (200, {"configuration": {}, "evaluation": {}}))
+    c.update_settings(7, **RUNTIME_KWARGS)
     _expect(rec.last["method"] == "PUT", rec.last["method"])
-    _expect(rec.last["path"] == "/challenges/7/configuration", rec.last["path"])
+    _expect(rec.last["path"] == CREATOR + "/settings", rec.last["path"])
+    _expect(rec.last["json"] == RUNTIME_KWARGS, rec.last["json"])
+
+
+def test_update_settings_gpu_memory_limit_none_clears_it():
+    """`gpu_memory_limit=None` is an explicit null (the backend clears the
+    cap); the other runtime keywords' None means "not sent"."""
+    c, rec = make_client(lambda *_: (200, {"configuration": {}, "evaluation": {}}))
+    c.update_settings(7, gpu_memory_limit=None, machine_id=None)
+    _expect(rec.last["json"] == {"gpu_memory_limit": None}, rec.last["json"])
+
+
+def test_update_settings_window_days_none_removes_the_window():
+    """`window_days=None` is an explicit null (the board goes back to no
+    window, as the console can do); omitting it sends nothing."""
+    c, rec = make_client(lambda *_: (200, {"configuration": {}, "evaluation": {}}))
+    c.update_settings(7, window_days=None)
+    _expect(rec.last["json"] == {"window_days": None}, rec.last["json"])
+    c.update_settings(7, window_days=30)
+    _expect(rec.last["json"] == {"window_days": 30}, rec.last["json"])
+    c.update_settings(7, simulation_timeout_sec=60)
+    _expect(rec.last["json"] == {"simulation_timeout_sec": 60}, rec.last["json"])
+
+
+def test_update_challenge_configuration_is_a_deprecated_alias_of_update_settings():
+    import warnings
+    c, rec = make_client(lambda *_: (200, {"configuration": {}, "evaluation": {}}))
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        c.update_challenge_configuration(
+            7, machine_id=3, docker_image_env_runtime_id=2, render_delay_second=0.05
+        )
+    _expect(any(issubclass(w.category, DeprecationWarning)
+                and "update_settings" in str(w.message) for w in caught),
+            [str(w.message) for w in caught])
+    _expect(rec.last["method"] == "PUT", rec.last["method"])
+    _expect(rec.last["path"] == CREATOR + "/settings", rec.last["path"])
     _expect(rec.last["json"] == {
-        "engine_id": 3,
+        "machine_id": 3,
         "docker_image_env_runtime_id": 2,
         "render_delay_second": 0.05,
     }, rec.last["json"])
 
-    # The step deadlines and the simulation budget are update_settings'.
-    for field in ("agent_max_time_per_step_second", "simulation_max_steps",
-                  "env_max_time_per_step_second", "agent_template"):
+
+def test_update_challenge_configuration_refuses_engine_id():
+    """Engines became machines: no silent id mapping, a TypeError naming
+    machine_id, before any request."""
+    import warnings
+    c, rec = make_client()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
         try:
-            c.update_challenge_configuration(7, **{field: 1})
-        except MLArenaError:
-            pass
+            c.update_challenge_configuration(7, engine_id=3)
+        except TypeError as exc:
+            _expect("machine_id" in str(exc), str(exc))
         else:
-            raise AssertionError(f"configuration still accepts {field}")
+            raise AssertionError("update_challenge_configuration accepted engine_id")
+    _expect(rec.calls == [], "no request was sent")
+    try:
+        c.update_settings(7, engine_id=3)
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("update_settings accepts engine_id")
+
+
+def test_machines_lists_the_visible_queues():
+    rows = [{"id": 3, "name": "gke-autoscaling", "kernels": []}]
+    c, rec = make_client(lambda *_: (200, rows))
+    _expect(c.machines() == rows, "rows as served")
+    _expect((rec.last["method"], rec.last["path"]) == ("GET", "/machines/"),
+            (rec.last["method"], rec.last["path"]))
+    _expect(rec.last["params"] == {}, rec.last["params"])
+    c.machines(kernel_version="flex_v1")
+    _expect(rec.last["params"] == {"kernel_version": "flex_v1"}, rec.last["params"])
+
+
+def test_machines_refusal_carries_the_reply():
+    c, _ = make_client(lambda *_: (400, {"error": "Unknown kernel_version 'x'"}))
+    try:
+        c.machines(kernel_version="x")
+    except MLArenaError as exc:
+        _expect(exc.status_code == 400, exc.status_code)
+    else:
+        raise AssertionError("expected MLArenaError")
+
+
+def test_no_engine_left_in_the_public_docstrings():
+    """engine → machine (machine_model): the kinds, challenge and creator
+    docstrings name the served keys."""
+    cls = mlarena.client.MLArenaClient
+    for name in ("challenge", "creator_challenge", "available_kinds",
+                 "create_challenge", "copyable_challenges", "challenges"):
+        doc = getattr(cls, name).__doc__
+        _expect("engine" not in doc.lower(), f"{name}: {doc}")
+    _expect("has_machine" in cls.available_kinds.__doc__, "has_machine")
+    _expect("runtime_presets" in cls.available_kinds.__doc__, "runtime_presets")
+    _expect("machine_name" in cls.creator_challenge.__doc__, "machine_name")
 
 
 def test_recent_replays_passes_its_limit():

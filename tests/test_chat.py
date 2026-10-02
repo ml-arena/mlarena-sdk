@@ -140,12 +140,14 @@ def _view(session_id=5, turn=None, messages=(), events=(), total="0.00",
     }
 
 
-def _turn(turn_id, status, assistant_message_id=None, error_message=None):
+def _turn(turn_id, status, assistant_message_id=None, error_type=None,
+          error_message=None):
     return {
         "id": turn_id, "status": status, "user_message_id": turn_id * 10,
         "assistant_message_id": assistant_message_id,
         "created_at_ts": "2026-09-18T10:00:01Z",
-        "error_message": error_message, "progress": None,
+        "error_type": error_type, "error_message": error_message,
+        "progress": None,
     }
 
 
@@ -449,15 +451,28 @@ def test_send_chat_message_poll_interval_is_honoured(monkeypatch, clock):
 
 
 def test_send_chat_message_failed_turn_raises_with_the_error_message(monkeypatch, clock):
+    """A staff reader is served the raw `error_message`: it follows the type."""
     views = iter([
         _view(5, _turn(7, "running")),
-        _view(5, _turn(7, "failed",
+        _view(5, _turn(7, "failed", error_type="env_error",
                        error_message="env.py raised: KeyError 'dossier'")),
     ])
     c, _ = make_client(monkeypatch, lambda m, p, k: (202, {"turn": _turn(7, "pending"), "message": {}})
                        if m == "POST" else (200, next(views)))
-    with pytest.raises(MLArenaError, match="chat turn 7 failed: env.py raised: KeyError 'dossier'"):
+    with pytest.raises(MLArenaError) as exc:
         c.send_chat_message(5, "x")
+    assert str(exc.value) == "chat turn 7 failed (env_error): env.py raised: KeyError 'dossier'"
+
+
+def test_send_chat_message_failed_turn_names_the_type_without_the_message(monkeypatch, clock):
+    """A participant is served `error_type` only (`error_message` is None,
+    staff-only since 4.1.0): the error names the type and appends nothing."""
+    views = iter([_view(5, _turn(7, "failed", error_type="llm_timeout"))])
+    c, _ = make_client(monkeypatch, lambda m, p, k: (202, {"turn": _turn(7, "pending"), "message": {}})
+                       if m == "POST" else (200, next(views)))
+    with pytest.raises(MLArenaError) as exc:
+        c.send_chat_message(5, "x")
+    assert str(exc.value) == "chat turn 7 failed (llm_timeout)"
 
 
 def test_send_chat_message_times_out_naming_the_state(monkeypatch, clock):
@@ -569,7 +584,8 @@ def test_reset_closes_the_session_and_opens_a_new_one(monkeypatch, clock):
 
 
 def test_say_propagates_a_failed_turn(monkeypatch, clock):
-    views = iter([_view(1, _turn(1, "failed", error_message="the agent could not answer")),])
+    views = iter([_view(1, _turn(1, "failed", error_type="agent_offline",
+                                 error_message="the agent could not answer")),])
 
     def router(method, path, kwargs):
         if path.endswith("/sessions"):
@@ -580,7 +596,7 @@ def test_say_propagates_a_failed_turn(monkeypatch, clock):
 
     c, _ = make_client(monkeypatch, router)
     chat = c.chat(4, echo=False)
-    with pytest.raises(MLArenaError, match="chat turn 1 failed: the agent could not answer"):
+    with pytest.raises(MLArenaError, match=r"chat turn 1 failed \(agent_offline\): the agent could not answer"):
         chat.say("x")
     # The session stays: the next say() does not reopen.
     assert chat.session_id == 1
@@ -608,4 +624,4 @@ def test_chat_names_are_exported_at_package_level():
     assert mlarena.ChatConversation is ChatConversation
     assert mlarena.ChatSessionNotFoundError is ChatSessionNotFoundError
     assert issubclass(mlarena.ChatSessionNotFoundError, mlarena.NotFoundError)
-    assert mlarena.__version__ == "4.0.0"
+    assert mlarena.__version__ == "4.1.0"

@@ -2,9 +2,100 @@
 
 Python SDK for [ML Arena](https://ml-arena.com) — make submissions, manage challenges, manage courses, and read leaderboards from any notebook or IDE.
 
+## 4.1.0 — machines, not engines
+
+Additive over 4.0.0, plus one deprecation: the platform
+replaced engines with **machines** (the infrastructure a challenge runs on)
+and moved a challenge's sizing onto the challenge itself.
+
+- **`machines(kernel_version=None)`** — `GET /api/machines`: the machines
+  you may run a challenge on, each with its `kernels` (the queues visible to
+  you; an admin sees every machine). Pass a kernel to list the machines
+  `update_settings(machine_id=…)` accepts for a challenge of that kind.
+  Creating, editing and granting machines is console-only.
+- **`update_settings()` sets the runtime.** New keywords `machine_id`,
+  `env_cpu_request`, `env_cpu_limit`, `env_memory_request`,
+  `env_memory_limit`, `agent_cpu_request`, `agent_cpu_limit`,
+  `agent_memory_request`, `agent_memory_limit`,
+  `agent_ephemeral_storage_limit` (K8s quantity strings, `"500m"`,
+  `"1Gi"`), `number_of_agents`; admins also `env_gpu_count`,
+  `agent_gpu_count`, `gpu_memory_limit` (`None` clears it),
+  `docker_image_env_runtime_id` and `render_delay_second`. The agent keys
+  need a kind with `agent_containers`, `number_of_agents` one with
+  `multi_agent`. Frozen once started, except `machine_id` for an admin.
+- **`update_challenge_configuration()` is a deprecated alias** of
+  `update_settings()` (a `DeprecationWarning`, removed at 5.0.0): the route
+  `PUT /api/challenges/{id}/configuration` is gone. `engine_id` raises
+  `TypeError` pointing at `machine_id` — take the id from `machines()`.
+  It now returns `update_settings`'s reply (`{"configuration",
+  "evaluation", "environment"}`) instead of the configuration dict, and needs a
+  `creator`-scope key with ownership (or admin) of the challenge — 4.0.0
+  took any key of an admin account.
+- **`update_settings(window_days=None)`** sends null and removes the
+  leaderboard window (omitting the keyword leaves it unchanged).
+- **`available_kinds()`** rows carry `has_machine`, `runtime_defaults` and
+  `runtime_presets` (`small` / `medium` / `large`); `capabilities` adds
+  `agent_containers` and `multi_agent` (the runtime keys apply to every kind).
+- **`update_settings()` answers `environment`** (`{id, number_of_agents}`)
+  next to `configuration` and `evaluation`; `start_challenge()` answers 409
+  naming the rule when the runtime gate refuses.
+- **Renamed keys**, no alias (the keys come straight from the server):
+
+  | 4.0 | 4.1 |
+  |---|---|
+  | `challenge()["engine"]` (`k8s_workload_value`, `vm_health_ok`, `vm_health_checked_at_ts`) | `challenge()["machine"]` (`id`, `name`, `runtime` = `"k8s"` \| `"vm"`, `vm_health_ok`, `vm_health_checked_at_ts`) |
+  | `creator_challenge()["engine_name"]`, `["engine"]` | `["machine_name"]`, `["machine"]` |
+  | `creator_challenge()["configuration"]["engine_id"]` | `["configuration"]["machine_id"]` (+ the twelve sizing columns) |
+  | `creator_challenge()["environment"]["possible_agents"]` | `["environment"]["number_of_agents"]` |
+  | `creator_challenges()` / `copyable_challenges()` rows' `engine_name` | `machine_name` |
+  | `create_challenge()` reply's `engine_name` | `machine_name` (+ `machine_note`) |
+  | `available_kinds()` rows' `has_engine` | `has_machine` |
+  | `update_challenge_configuration(engine_id=…)` | `update_settings(machine_id=…)` |
+
+  The agent limits `challenge()` serves (`agent_cpu_limit`,
+  `agent_memory_limit`, `gpu_memory_limit`, `has_gpu`) now come from the
+  challenge's own configuration, not from its engine.
+
+Served, not guessed (the platform's UX-fields wave):
+
+- **`challenge_team()` returns `None`** when you are on no team for the
+  challenge (the route answers 200 `null`); 4.0.0 raised
+  `ChallengeNotFoundError` on its 404. A 404 now means a challenge you
+  cannot see.
+- **Rankings.** `user_global_rank()` answers for a user with no points yet
+  with `rank` and `percentile` None (4.0.0: a 404, which now means the user
+  does not exist). `global_ranking()` rows: ties share a rank, and a user
+  with no points has `rank` None.
+- **Failed chat turns.** The turn view carries `error_type`
+  (`llm_unavailable`, `llm_timeout`, `turn_timeout`, `env_error`,
+  `agent_offline`, `platform_error`, `unclassified`); the raw
+  `error_message` is served to the challenge's staff only. A failed
+  `send_chat_message()` raises `MLArenaError("chat turn N failed
+  (<error_type>)")`, with `: <error_message>` appended when served.
+- **Deploys and runs.** `latest_deploy.failure_owner` (`participant` |
+  `challenge` | `platform`, None unless `failed`) says who a failed
+  attempt's verdict blames; `submit(wait=True)` appends it to its
+  `SubmissionError` message. `job_error_message` is served to the
+  challenge's staff only (participants read `job_error_type`). Each
+  `RunSubmissionResult` row carries `submission_status` (`deleted` when
+  that submission was deleted since the run). A solo run has
+  `game_outcome` / `final_rank` None (no more `winner`), and
+  `recent_replays()` skips runs a deleted submission played in.
+- **Catalog and challenge.** `challenges()` rows add `kernel_version`,
+  `kind_label` (`"Code challenge"` | `"File challenge"` | `"Chat
+  challenge"`) and `my_rank`; `miniature` is None when there is none.
+  `challenge()` adds `kind_label` and `submission_layout` (the CSV a file
+  challenge expects); `agent_template` is None for file and chat
+  challenges. `list_tags()` rows add `challenge_count`.
+- **Creator.** `creator_challenge()` adds `start_blockers` (`{code,
+  message}` list; `[]` = ready, None while started),
+  `running_editable_fields` and `miniature`; a refused `start_challenge()`
+  lists every blocker in `.body["details"]`. `runtime_options()` entries
+  add `display_name` and `packages` (`{name, version}`).
+
 ## 4.0.0 — one score declaration
 
-Not published yet. A versioned break, with no alias (the keys come straight
+A versioned break, with no alias (the keys come straight
 from the server). See [Metrics](#metrics).
 
 - **`update_settings(metrics=…, window_days=…)`.** The six keywords
@@ -37,7 +128,7 @@ from the server). See [Metrics](#metrics).
 
 ## 3.0.0 — the backend's names, on every row
 
-Not published yet. A versioned break: three read payloads changed shape, and
+A versioned break: three read payloads changed shape, and
 there is no alias — the keys come straight from the server, as in 2.0.
 Everything else below is additive over 2.2.
 
@@ -600,8 +691,10 @@ serve the same `RunResult`. A run carries the job's own `job_status`
 `env_nb_steps`, the env's resource columns and, when the challenge's own code
 is why it ended, `env_error_type` (`code_error` | `simulation_error` |
 `pod_crash` | `unknown`). Its `submission_results` list one row per agent in
-the run — `submission_id`, `submission_name`, `user_name`, `submission_reward`,
-`agent_nb_steps`, `game_outcome`, `final_rank`, `score_elo_delta`,
+the run — `submission_id`, `submission_name`, `user_name`, `submission_status`
+(`deleted` when that submission was deleted since), `submission_reward`,
+`agent_nb_steps`, `game_outcome`, `final_rank` (both `None` on a solo run),
+`score_elo_delta`,
 `metrics_detail`, the agent's resource columns and, when that agent is why the
 run ended, `agent_error_type` (the same four values) with
 `agent_error_message`. Your row is the one whose `submission_id` is yours; the
@@ -617,7 +710,9 @@ for run in c.submission_status(cid, sid)["run_info"]["results"]:
 ```
 
 `agent_error_message` and `agent_stdout_logs` are `None` on a row that is not
-yours. `run_info` and `latest_deploy` are served in **every** post-deploy
+yours; a run's `job_error_message` is `None` unless you are the challenge's
+staff. A failed `latest_deploy` names who its verdict blames in
+`failure_owner` (`participant` | `challenge` | `platform`). `run_info` and `latest_deploy` are served in **every** post-deploy
 state, so the reason a deploy failed is still there once it has failed.
 `submission_overview()` summarises the newest run under the same names:
 `agent_error_type` / `agent_error_message`.
@@ -667,10 +762,11 @@ print(c.leaderboard(cid).head())
 ### Challenges
 
 - `client.challenges(q=None, tags=None, status="started", page=None, per_page=None)` — public list. `status` is `"started"` (started challenges only) or `"all"` (draft, started and stopped). Each row's `status` is `"draft"`, `"started"` or `"stopped"`.
-- `client.challenge(challenge_id)` — the participant view: the kernel, the limits, the engine's health.
+- `client.challenge(challenge_id)` — the participant view: the kernel, the limits, the machine and its health.
 - `client.recent_replays(challenge_id, limit=10)` — the challenge's newest replays with signed render URLs.
-- `client.create_challenge(name, kernel_version, description=None, copy_from_challenge_id=None, tag_names=None)` — creator scope. The backend resolves the engine + default evaluation + default env runtime from `kernel_version`. Pass `tag_names=["rl", "research"]` to attach tags at creation time; unknown names raise `MLArenaError`.
-- `client.available_kinds()` / `client.copyable_challenges()` — creator scope. What `kernel_version` and `copy_from_challenge_id` accept.
+- `client.create_challenge(name, kernel_version, description=None, copy_from_challenge_id=None, tag_names=None)` — creator scope. The backend resolves the machine (the kernel's default queue) + default evaluation + default env runtime from `kernel_version`; the reply names it (`machine_name`). Pass `tag_names=["rl", "research"]` to attach tags at creation time; unknown names raise `MLArenaError`.
+- `client.available_kinds()` / `client.copyable_challenges()` — creator scope. What `kernel_version` and `copy_from_challenge_id` accept; each kind's `has_machine`, `runtime_defaults` and `runtime_presets`.
+- `client.machines(kernel_version=None)` — creator or teacher scope. The machines (and their queues) you may run a challenge on.
 - `client.list_tags()` — public read of the tag catalog.
 - `client.challenge_tags(challenge_id)` — creator scope. The tags currently on a challenge.
 - `client.set_challenge_tags(challenge_id, tag_names=None, tag_ids=None)` — creator scope. Replaces the tag set on a challenge you own; pass `[]` to clear all tags.
@@ -681,8 +777,8 @@ Everything the console's creator editor does, on the same routes:
 
 - `client.creator_challenges()` / `client.creator_challenge(challenge_id)` — your challenges, and one of them with its three sibling rows: `configuration`, `evaluation` and `environment`, each under its own column names.
 - `client.update_challenge(challenge_id, name=…, description=…, is_public=…)` — the challenge row.
-- `client.update_settings(challenge_id, …)` — the configuration + evaluation columns, under their own names: `simulation_timeout_sec`, `max_upload_size_bytes`, `max_upload_files`, `max_active_submissions_per_participant`, `submission_filename`, `metrics`, `window_days` (see [Metrics](#metrics)), `is_stop_after_deployment`, `deployment_nb_constraint_run`, `deployment_nb_initial_score_run`, `episode_budget_brackets`, the `elo_*` tunables; admins also `agent_max_time_per_step_second`, `env_max_time_per_step_second`, `simulation_max_steps` (the run limits) and `data_source_enabled`, `data_source_url`, `data_source_asset`, `data_source_filter`, `data_source_history_hours`, `batch_cron` (the continuous data feed). Answers `{"configuration": …, "evaluation": …}`.
-- `client.update_challenge_configuration(challenge_id, engine_id=…, docker_image_env_runtime_id=…, render_delay_second=…)` — **admin only**: the infrastructure the challenge runs on.
+- `client.update_settings(challenge_id, …)` — the configuration + evaluation columns, under their own names: `simulation_timeout_sec`, `max_upload_size_bytes`, `max_upload_files`, `max_active_submissions_per_participant`, `submission_filename`, `metrics`, `window_days` (see [Metrics](#metrics)), `is_stop_after_deployment`, `deployment_nb_constraint_run`, `deployment_nb_initial_score_run`, `episode_budget_brackets`, the `elo_*` tunables; admins also `agent_max_time_per_step_second`, `env_max_time_per_step_second`, `simulation_max_steps` (the run limits) and `data_source_enabled`, `data_source_url`, `data_source_asset`, `data_source_filter`, `data_source_history_hours`, `batch_cron` (the continuous data feed). The runtime: `machine_id` (from `machines(kernel_version)`), `env_cpu_request`, `env_cpu_limit`, `env_memory_request`, `env_memory_limit`, the `agent_*` sizing (kinds with `agent_containers`), `number_of_agents` (kinds with `multi_agent`); admins also `env_gpu_count`, `agent_gpu_count`, `gpu_memory_limit`, `docker_image_env_runtime_id`, `render_delay_second`. Answers `{"configuration": …, "evaluation": …, "environment": …}`.
+- `client.update_challenge_configuration(challenge_id, …)` — deprecated alias of `update_settings` (4.1.0; removed at 5.0.0).
 - Env: `client.list_env_files(challenge_id)`, `upload_env_file`, `update_env_file_content`, `delete_env_file(challenge_id, filename)`, `check_env(challenge_id, content)` (the structural check, without saving), `sync_env_from_github`.
 - Benchmark: `client.list_benchmark_files(challenge_id)`, `upload_benchmark_file`, `update_benchmark_file_content`, `delete_benchmark_file(challenge_id, filename)`, `run_benchmark`, `benchmark_status`.
 - Presentation: `client.challenge_markdown(challenge_id)` / `set_challenge_markdown`, `client.challenge_image(challenge_id, dest_dir=".")` / `set_challenge_image` / `delete_challenge_image`.
@@ -707,7 +803,7 @@ chat.reset()                                            # close it and start a f
 
 - `client.chat_challenge(challenge_id)` — the participant view: `manifest` (bot name, `charter_md`, the public `scoring_rules`), `agent_online`, limits, your group's `participant` (`total_amount_eur`, `scoreboard`, `rank`), your `sessions`.
 - `client.open_chat_session(challenge_id)` — opens a session **and accepts the charter**; returns the `ChatSessionView`. One open session per user per challenge.
-- `client.send_chat_message(session_id, content, wait=True, timeout=180, poll_interval=0.7)` — sends, then polls `chat_session` until that turn is `completed` (returns the final view) or `failed` (raises `MLArenaError` with the turn's `error_message`). `wait=False` returns the 202 `{"turn", "message"}` (the turn as the session view serves it).
+- `client.send_chat_message(session_id, content, wait=True, timeout=180, poll_interval=0.7)` — sends, then polls `chat_session` until that turn is `completed` (returns the final view) or `failed` (raises `MLArenaError` naming the turn's `error_type`, plus its `error_message` when served — to the challenge's staff only). `wait=False` returns the 202 `{"turn", "message"}` (the turn as the session view serves it).
 - `client.chat_session(session_id)` (`participant.total_amount_eur` + `scoreboard`, `can_send` with `can_send_reason`), `client.close_chat_session(session_id)`, `client.export_chat_session(session_id, format="json"|"md")` — the evidence: transcript, tool log, scoring events with their `evidence` blobs, turn timings, totals.
 - Creator: `client.chat_admin(challenge_id)`, `client.update_chat_settings(challenge_id, llm_base_url=…, llm_model=…, llm_api_key=…, turn_timeout_sec=…, max_turns_per_session=…, max_sessions_per_participant=…)` (only the keywords you pass are sent; `None` lifts a limit, `llm_api_key=""` clears the key), `client.chat_sessions(challenge_id, status=None)`, `client.void_chat_session(session_id, reason)` / `unvoid_chat_session(session_id)`, `client.export_chat_evidence(challenge_id)`.
 
@@ -821,7 +917,7 @@ A challenge declares what its leaderboard shows as `metrics`, an ordered list of
 | `is_ranking` | exactly one spec is `True`, and it has an `order`: the board ranks on it |
 | `visible` | `False` = folded and served, but not a column in the console |
 
-A rated (ELO) board ranks on `{"key": "elo", "source": "platform", "agg": "rating", "order": "desc", "is_ranking": True, …}`; it needs a kind with the `elo` capability and an engine seating at least 2 agents. Chat challenges have a fixed declaration (`loot`, `currency`, `€`) that `update_settings` refuses to change.
+A rated (ELO) board ranks on `{"key": "elo", "source": "platform", "agg": "rating", "order": "desc", "is_ranking": True, …}`; it needs a kind with the `elo` capability and an environment seating at least 2 agents (`number_of_agents`). Chat challenges have a fixed declaration (`loot`, `currency`, `€`) that `update_settings` refuses to change.
 
 ```python
 client.update_settings(challenge_id, metrics=[
