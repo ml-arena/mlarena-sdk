@@ -159,31 +159,91 @@ def test_creator_challenge_returns_the_three_sibling_rows():
     _expect("evaluation_metric" not in got["configuration"], got["configuration"])
 
 
-def test_benchmark_status_is_the_run_or_none():
-    """The latest benchmark run, in the run shape `creator_runs()` lists, or
-    None (a JSON `null`) before the first run."""
+def test_benchmark_status_is_the_run_and_its_checks():
+    """`{run, checks}` as served (4.3.0): the run in the shape `creator_runs()`
+    lists (None before the first run), the config's budgets checked against it."""
     run = {"simulation_result_id": 41, "job_status": "completed",
            "env_error_type": None,
            "submission_results": [{"submission_id": 3, "score": 1.5}]}
-    c, rec = make_client(lambda *_: (200, run))
+    check = {"key": "simulation_timeout_sec", "label": "Run wallclock", "configured": 360,
+             "measured": 12.0, "ratio": 0.0333, "status": "ok", "message": "…"}
+    c, rec = make_client(lambda *_: (200, {"run": run, "checks": [check]}))
     got = c.benchmark_status(7)
     _expect(rec.last["method"] == "GET" and rec.last["path"] == CREATOR + "/benchmark/status",
             rec.last)
-    _expect(got["submission_results"][0]["score"] == 1.5, got)
+    _expect(got["run"]["submission_results"][0]["score"] == 1.5, got)
+    _expect(got["checks"][0]["status"] == "ok", got)
 
-    c, _rec = make_client()
-    c._request = lambda *a, **k: _NullJson()
-    _expect(c.benchmark_status(7) is None, "no run yet is None")
+    c, _rec = make_client(lambda *_: (200, {"run": None, "checks": []}))
+    _expect(c.benchmark_status(7) == {"run": None, "checks": []}, "no run yet")
 
 
-class _NullJson(FakeResponse):
-    """A 200 whose body is JSON `null` (FakeResponse maps None to {})."""
+# --------------------------------------------------------------------------- #
+# The challenge config (4.3.0)
+# --------------------------------------------------------------------------- #
 
-    def __init__(self):
-        super().__init__(200)
+def test_config_fields_and_schema_are_public_reads():
+    field = {"key": "simulation_timeout_sec", "group": "evaluation", "level": "basic",
+             "writer": "creator", "capability": "runs", "running_editable": False,
+             "in_file": True, "help": "…"}
+    c, rec = make_client(lambda *_: (200, {"fields": [field]}))
+    _expect(c.config_fields() == [field], "the registry rows")
+    _expect(rec.last["method"] == "GET" and rec.last["path"] == "/creator_challenge/config_fields",
+            rec.last)
 
-    def json(self):
-        return None
+    c, rec = make_client(lambda *_: (200, {"title": "challenge.toml", "properties": {}}))
+    _expect(c.config_schema()["title"] == "challenge.toml", "the JSON Schema")
+    _expect(rec.last["path"] == "/creator_challenge/config_schema.json", rec.last)
+
+
+def test_export_config_returns_and_writes_the_toml():
+    text = "#:schema x\nsimulation_timeout_sec = 600\n"
+    c, rec = make_client(lambda *_: FakeResponse(200, text=text))
+    _expect(c.export_config(7) == text, "the text")
+    _expect(rec.last["method"] == "GET" and rec.last["path"] == CREATOR + "/config.toml", rec.last)
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "challenge.toml")
+        c.export_config(7, path=path)
+        with open(path) as fh:
+            _expect(fh.read() == text, "written to path")
+
+
+def test_a_refused_challenge_toml_raises_with_the_line():
+    error = {"error": "challenge.toml:2: unknown key 'bogus'"}
+    c, _rec = make_client(lambda *_: (400, error))
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "challenge.toml")
+        with open(path, "w") as fh:
+            fh.write("simulation_timeout_sec = 600\nbogus = 1\n")
+        try:
+            c.upload_env_file(7, path)
+        except MLArenaError as exc:
+            _expect(exc.status_code == 400 and "challenge.toml:2" in str(exc), str(exc))
+        else:
+            raise AssertionError("a refused file raises")
+
+
+def test_update_settings_sends_required_files_and_refuses_the_dropped_key():
+    c, rec = make_client(lambda *_: (200, {"configuration": {}, "evaluation": {}}))
+    c.update_settings(7, required_files=["y_test.csv"])
+    _expect(rec.last["json"] == {"required_files": ["y_test.csv"]}, rec.last["json"])
+    try:
+        c.update_settings(7, env_max_time_per_step_second=1.5)
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("env_max_time_per_step_second is gone (4.3.0)")
+
+
+def test_a_file_owned_key_is_the_backend_400():
+    error = {"error": "simulation_timeout_sec is set in challenge.toml (line 3); edit the file"}
+    c, _rec = make_client(lambda *_: (400, error))
+    try:
+        c.update_settings(7, simulation_timeout_sec=300)
+    except MLArenaError as exc:
+        _expect("challenge.toml (line 3)" in str(exc), str(exc))
+    else:
+        raise AssertionError("a file-owned key raises")
 
 
 # --------------------------------------------------------------------------- #
@@ -383,19 +443,17 @@ def test_update_settings_sends_the_data_feed_fields():
 
 
 def test_update_settings_sends_the_run_limit_fields():
-    """The admin-only step deadlines and step budget go through PUT /settings
-    under their column names; the configuration PUT no longer takes them."""
+    """The agent-call deadline and step budget (creator keys since 4.3.0) go
+    through PUT /settings under their column names."""
     c, rec = make_client(lambda *_: (200, {"configuration": {}, "evaluation": {}}))
     c.update_settings(
         7,
         agent_max_time_per_step_second=0.25,
-        env_max_time_per_step_second=1.5,
         simulation_max_steps=500,
     )
     _expect(rec.last["path"] == CREATOR + "/settings", rec.last["path"])
     _expect(rec.last["json"] == {
         "agent_max_time_per_step_second": 0.25,
-        "env_max_time_per_step_second": 1.5,
         "simulation_max_steps": 500,
     }, rec.last["json"])
 

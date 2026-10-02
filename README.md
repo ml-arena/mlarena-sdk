@@ -2,6 +2,36 @@
 
 Python SDK for [ML Arena](https://ml-arena.com) — make submissions, manage challenges, manage courses, and read leaderboards from any notebook or IDE.
 
+## 4.3.0 — one challenge config, two editors
+
+Requires a platform with the challenge config (step E1_C). The config of a
+challenge is one flat document: every key is the column's name, the
+`update_settings` keyword and the `challenge.toml` key. Two editors write it —
+`update_settings` (and the console's Config tab) and the env folder's
+`challenge.toml` — and each key has one owner.
+
+- **`challenge.toml` is applied when it is saved** (`upload_env_file` /
+  `update_env_file_content`): validated like `update_settings`, written only
+  if it applies; a refusal names each key's line. The keys it holds are the
+  file's: `update_settings` refuses them with a 400 naming the line.
+- `creator_challenge()` carries `config`: `values`, `origin` per key
+  (`file` | `console` | `default`), `file_lines`, `file_applied_at_ts`,
+  `file_in_sync`; two new start blockers, `config_not_applied` and
+  `required_file_missing`.
+- New: `config_fields()` (the key registry), `config_schema()` (the JSON
+  Schema of `challenge.toml`), `export_config(challenge_id, path=None)` (the
+  resolved config as a `challenge.toml`), `mlarena.local.eval_context(env_dir,
+  challenge_id=None, client=None)` (the env's `eval_context` for a local
+  test, `config` included).
+- **Breaking:** `benchmark_status()` returns `{"run": …, "checks": […]}` (was
+  the run, or None): `checks` compares the run with the config's budgets.
+- **Breaking:** `update_settings(env_max_time_per_step_second=…)` is gone (the
+  platform dropped the key). `agent_max_time_per_step_second`,
+  `simulation_max_steps` and `render_delay_second` are creator keys (were
+  admin-only); `required_files` is new; `simulation_timeout_sec` is capped by
+  the machine's `job_timeout_max_sec` (`machines()`), not by 600.
+- New dependency on Python 3.10 only: `tomli` (stdlib `tomllib` from 3.11).
+
 ## 4.2.0 — the platform's R5 run keys
 
 Breaking: the per-run keys follow the platform's per-run columns, and the
@@ -823,11 +853,17 @@ print(c.leaderboard(cid).head())
 
 Everything the console's creator editor does, on the same routes:
 
-- `client.creator_challenges()` / `client.creator_challenge(challenge_id)` — your challenges, and one of them with its three sibling rows: `configuration`, `evaluation` and `environment`, each under its own column names.
+- `client.creator_challenges()` / `client.creator_challenge(challenge_id)` — your challenges, and one of them with its three sibling rows: `configuration`, `evaluation` and `environment`, each under its own column names, plus `config` (the flat config document: `values`, `origin` per key, `file_lines`, `file_in_sync`).
+- The challenge config — one document, two editors. From simple to advanced:
+  1. **env.py only**: every key starts at its kind default; change what you need with `update_settings` (or the console's Config tab).
+  2. **`challenge.toml`** beside env.py, holding only the keys your env relies on (e.g. `agent_max_time_per_step_second = 60.0`); `upload_env_file(cid, "challenge.toml")` applies it, and those keys become the file's (`update_settings` refuses them).
+  3. **Challenge as code**: `export_config(cid, "challenge.toml")` writes every value you set, defaults commented; commit it with env.py and sync from GitHub.
+  `config_fields()` lists every key (group, level, who may write it, which kinds, frozen once started, allowed in the file); `config_schema()` is the file's JSON Schema. In a local test, `env.eval_context = mlarena.local.eval_context(".")` gives the env the platform's numbers (`self.eval_context["config"]["agent_max_time_per_step_second"]`).
 - `client.update_challenge(challenge_id, name=…, description=…, is_public=…)` — the challenge row.
-- `client.update_settings(challenge_id, …)` — the configuration + evaluation columns, under their own names: `simulation_timeout_sec`, `max_upload_size_bytes`, `max_upload_files`, `max_active_submissions_per_participant`, `submission_filename`, `metrics`, `window_days` (see [Metrics](#metrics)), `is_stop_after_deployment`, `deployment_nb_constraint_run`, `deployment_nb_initial_score_run`, `episode_budget_brackets`, the `elo_*` tunables; admins also `agent_max_time_per_step_second`, `env_max_time_per_step_second`, `simulation_max_steps` (the run limits) and `data_source_enabled`, `data_source_url`, `data_source_asset`, `data_source_filter`, `data_source_history_hours`, `batch_cron` (the continuous data feed). The runtime: `machine_id` (from `machines(kernel_version)`), `env_cpu_request`, `env_cpu_limit`, `env_memory_request`, `env_memory_limit`, the `agent_*` sizing (kinds with `agent_containers`), `number_of_agents` (kinds with `multi_agent`); admins also `env_gpu_count`, `agent_gpu_count`, `gpu_memory_limit`, `docker_image_env_runtime_id`, `render_delay_second`. Answers `{"configuration": …, "evaluation": …, "environment": …}`.
-- Env: `client.list_env_files(challenge_id)`, `upload_env_file`, `update_env_file_content`, `delete_env_file(challenge_id, filename)`, `check_env(challenge_id, content)` (the structural check, without saving), `sync_env_from_github`.
-- Benchmark: `client.list_benchmark_files(challenge_id)`, `upload_benchmark_file`, `update_benchmark_file_content`, `delete_benchmark_file(challenge_id, filename)`, `run_benchmark`, `benchmark_status`.
+- `client.update_settings(challenge_id, …)` — the configuration + evaluation columns, under their own names: `simulation_timeout_sec`, `max_upload_size_bytes`, `max_upload_files`, `max_active_submissions_per_participant`, `submission_filename`, `metrics`, `window_days` (see [Metrics](#metrics)), `is_stop_after_deployment`, `deployment_nb_constraint_run`, `deployment_nb_initial_score_run`, `episode_budget_brackets`, the `elo_*` tunables; admins also `data_source_enabled`, `data_source_url`, `data_source_asset`, `data_source_filter`, `data_source_history_hours`, `batch_cron` (the continuous data feed). Also `agent_max_time_per_step_second`, `simulation_max_steps` (the run limits), `render_delay_second` and `required_files`; `simulation_timeout_sec` at most the machine's `job_timeout_max_sec`. A key `challenge.toml` holds is refused (edit the file). The runtime: `machine_id` (from `machines(kernel_version)`), `env_cpu_request`, `env_cpu_limit`, `env_memory_request`, `env_memory_limit`, the `agent_*` sizing (kinds with `agent_containers`), `number_of_agents` (kinds with `multi_agent`); admins also `env_gpu_count`, `agent_gpu_count`, `gpu_memory_limit`, `docker_image_env_runtime_id`. Answers `{"configuration": …, "evaluation": …, "environment": …, "config": …}`.
+- Env: `client.list_env_files(challenge_id)`, `upload_env_file`, `update_env_file_content`, `delete_env_file(challenge_id, filename)`, `check_env(challenge_id, content)` (the structural check, without saving), `sync_env_from_github`. Saving, syncing or deleting `challenge.toml` applies or forgets the config file.
+- Config: `client.config_fields()`, `client.config_schema()`, `client.export_config(challenge_id, path=None)`.
+- Benchmark: `client.list_benchmark_files(challenge_id)`, `upload_benchmark_file`, `update_benchmark_file_content`, `delete_benchmark_file(challenge_id, filename)`, `run_benchmark`, `benchmark_status` (`{run, checks}`: the run and the config's budgets checked against it).
 - Presentation: `client.challenge_markdown(challenge_id)` / `set_challenge_markdown`, `client.challenge_image(challenge_id, dest_dir=".")` / `set_challenge_image` / `delete_challenge_image`.
 - Agent template: `client.agent_template(challenge_id)` (the stored template, or the default one), `client.update_agent_template(challenge_id, …)`, `client.csv_ground_truth(challenge_id)` (file challenges).
 - Lifecycle: `client.start_challenge(challenge_id)` (from `draft` or `stopped`) / `stop_challenge(challenge_id)` (from `started` to `stopped`).

@@ -534,7 +534,9 @@ class MLArenaClient:
         `"vm"`), `node_pool`, `vm_host`, `vm_port`, `vm_health_ok`,
         `vm_health_checked_at_ts`, `gpu_device_ids`, `gpu_count`,
         `image_pull_policy`, `job_cpu_max`, `job_memory_max`,
-        `max_concurrent_jobs`, `is_enabled`, `created_at_ts` and `kernels`,
+        `job_timeout_max_sec` (the longest `simulation_timeout_sec` a
+        challenge on it may ask for), `max_concurrent_jobs`, `is_enabled`,
+        `created_at_ts` and `kernels`,
         its queues (`MachineKernelOut`: `id`, `machine_id`, `kernel_version`,
         `docker_image_worker_envagent_id`, `worker_replicas`, `is_public`,
         `is_default`, `created_at_ts`).
@@ -599,15 +601,28 @@ class MLArenaClient:
         `machine` (`{id, name, runtime, vm_health_ok,
         vm_health_checked_at_ts}`), and `role` — `"owner"` or `"assistant"`.
 
+        `config` is the challenge config as one flat document (the platform's
+        docs/challenge_contract.md): `values` — every config key the kind
+        accepts, as stored (never `llm_api_key`) —, `origin` — per key,
+        `"file"` (the applied `challenge.toml` holds it: `update_settings`
+        refuses it), `"console"` (set by `update_settings` or the console) or
+        `"default"` —, `file_lines` (the line of each file-owned key),
+        `file_applied_at_ts` (None without a file) and `file_in_sync` (False
+        when the env folder's `challenge.toml` is not the text that was
+        applied). `config_fields()` describes every key.
+
         `start_blockers` lists every reason `start_challenge` would refuse
         now, each `{code, message}` (`env_missing`, `configuration_missing`,
-        `image_inconsistent`, `runtime`, `env_invalid`, `chat_missing`,
-        `llm_not_configured`, `ground_truth_missing`, `benchmark_missing`,
-        `benchmark_unscored`); `[]` means ready, None while started.
-        `running_editable_fields` names what stays editable once started, for
-        you and this kind (among `description`, `is_public`, `metrics`,
-        `is_stop_after_deployment`, `machine_id`); anything else needs stop →
-        edit → restart. `miniature` is the image route, None when none was
+        `image_inconsistent`, `config_not_applied`, `required_file_missing`,
+        `runtime` — the machine's caps, its time cap included —,
+        `env_invalid`, `chat_missing`, `llm_not_configured`,
+        `ground_truth_missing`, `benchmark_missing`, `benchmark_unscored`);
+        `[]` means ready, None while started. `running_editable_fields` names
+        what stays editable once started, for you and this kind (among
+        `description`, `is_public`, `metrics`, `is_stop_after_deployment`,
+        `render_delay_second`, the chat LLM keys and limits, and
+        `machine_id` for an admin); anything else needs stop → edit →
+        restart. `miniature` is the image route, None when none was
         uploaded.
 
         Unlike `challenge()` this works on your own hidden challenges and
@@ -617,6 +632,64 @@ class MLArenaClient:
         challenge.
         """
         return self._creator_get(challenge_id, "", "creator_challenge")
+
+    def config_fields(self) -> list:
+        """Every challenge config key, in display order (public read).
+
+        Mirrors `GET /api/creator_challenge/config_fields` (`config.py`) — the
+        registry the console's Config tab is generated from. Each entry:
+        `key` (the column, `update_settings` keyword and `challenge.toml`
+        key), `group` (`evaluation` | `competition` | `data_feed` |
+        `resources` | `chat`), `level` (`basic` | `advanced`), `writer`
+        (`creator` | `admin`), `capability` (the `available_kinds()`
+        capability a kind needs for it, None = every kind),
+        `running_editable` (still writable once started), `in_file` (may be
+        written in `challenge.toml`) and `help`.
+        """
+        resp = self._request("GET", self._url("/creator_challenge/config_fields"),
+                             headers=self._headers(), timeout=30)
+        self._handle_response(resp)
+        if resp.status_code != 200:
+            raise _failed(MLArenaError, "config_fields", resp)
+        return resp.json()["fields"]
+
+    def config_schema(self) -> dict:
+        """The JSON Schema of `challenge.toml` (public read).
+
+        Mirrors `GET /api/creator_challenge/config_schema.json`: the
+        `#:schema` line an exported file starts with, for editor completion
+        (Taplo / VS Code Even Better TOML). Keys a file may hold only.
+        """
+        resp = self._request("GET", self._url("/creator_challenge/config_schema.json"),
+                             headers=self._headers(), timeout=30)
+        self._handle_response(resp)
+        if resp.status_code != 200:
+            raise _failed(MLArenaError, "config_schema", resp)
+        return resp.json()
+
+    def export_config(self, challenge_id: int, path: str | None = None) -> str:
+        """The challenge's resolved config as a `challenge.toml` (creator scope).
+
+        Mirrors `GET /api/creator_challenge/challenge/{id}/config.toml` — the
+        console's *Export challenge.toml*. Every key the kind accepts and a
+        file may hold: the file's and the console's as values, the defaults
+        commented out with their help. Uploading it back
+        (`upload_env_file(cid, "challenge.toml")`) makes the file own every
+        written key. Returns the text; writes it to `path` when given.
+        """
+        resp = self._request("GET",
+            self._url(f"/creator_challenge/challenge/{challenge_id}/config.toml"),
+            headers=self._headers(),
+            timeout=30,
+        )
+        self._handle_response(resp)
+        if resp.status_code != 200:
+            raise _failed(MLArenaError, "export_config", resp)
+        text = resp.text
+        if path is not None:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(text)
+        return text
 
     def available_kinds(self) -> list:
         """The challenge kinds `create_challenge` accepts (creator scope).
@@ -935,8 +1008,8 @@ class MLArenaClient:
                         max_active_submissions_per_participant: int | None = None,
                         submission_filename: str | None = None,
                         agent_max_time_per_step_second: float | None = None,
-                        env_max_time_per_step_second: float | None = None,
                         simulation_max_steps: int | None = None,
+                        required_files: list[str] | None = None,
                         metrics: list[dict] | None = None,
                         window_days: int | None | _Unset = _UNSET,
                         is_stop_after_deployment: bool | None = None,
@@ -976,12 +1049,17 @@ class MLArenaClient:
         """Update challenge settings + evaluation parameters.
 
         Mirrors `PUT /api/creator_challenge/challenge/{id}/settings` —
-        the same call the console's Settings tab makes via `saveSettings()`.
-        Only fields explicitly passed are sent; everything else is left
-        untouched. Every keyword is the column's own name: the first eight,
-        the data-feed, runtime and infrastructure ones are
-        ChallengeConfiguration columns, `number_of_agents` is the
-        Environment's, the rest are Evaluation columns. Once
+        the same call the console's Config tab makes. Only fields explicitly
+        passed are sent; everything else is left untouched. Every keyword is a
+        config key (`config_fields()`), the name of the column that holds it
+        and the key a `challenge.toml` would use.
+
+        The config has two editors: this method (and the console's form) and
+        the env folder's `challenge.toml`. A key the applied file holds is
+        owned by the file: sending it here raises `MLArenaError` (400)
+        `"<key> is set in challenge.toml (line N); edit the file"` — change
+        the file (`upload_env_file`) instead. `creator_challenge(id)
+        ["config"]["origin"]` says who owns each key. Once
         the challenge has started only the fields that cannot rescore an
         existing run still apply — the presentation fields of `metrics`
         (`label`, `unit`, `precision`, `format`, `visible`) and
@@ -1068,13 +1146,22 @@ class MLArenaClient:
             elo_initial_variance: variance of an unrated submission (> 0).
             elo_initial_score: rating of an unrated submission.
 
-        Run limits (admin only — anyone else gets `PermissionDeniedError`,
-        403; strictly positive; frozen while the challenge runs):
+        Run budgets (creator keys; strictly positive; frozen while the
+        challenge runs):
+            simulation_timeout_sec: the wallclock of one run, in seconds, at
+                most the challenge's machine's `job_timeout_max_sec`
+                (`machines()`); above it the backend answers 400 naming the
+                cap.
             agent_max_time_per_step_second: deadline of one agent call
                 (`AgentProxy.call`), in seconds.
-            env_max_time_per_step_second: deadline of one env step, in
-                seconds.
-            simulation_max_steps: the step budget of one simulation.
+            simulation_max_steps: the step budget of one episode (flexkit
+                loops).
+            required_files: names that must exist in the env folder before
+                the challenge can start (e.g. `["y_test.csv"]`); plain file
+                names. A missing one is the `required_file_missing` start
+                blocker.
+        SDK 4.3.0 removed `env_max_time_per_step_second` (the platform
+        dropped it: it was measured and never enforced).
 
         Data feed (admin only — anyone else gets `PermissionDeniedError`,
         403; frozen while the challenge runs). Each is sent only when passed,
@@ -1117,6 +1204,8 @@ class MLArenaClient:
         `PermissionDeniedError`, 403):
             docker_image_env_runtime_id: the env runtime image, of the
                 challenge's own kernel.
+
+        Replay (a creator key, editable while started):
             render_delay_second: replay playback delay between frames (>= 0).
 
         Requires a `creator`-scope token and ownership (or admin) of the
@@ -1130,8 +1219,8 @@ class MLArenaClient:
                 max_active_submissions_per_participant,
             "submission_filename": submission_filename,
             "agent_max_time_per_step_second": agent_max_time_per_step_second,
-            "env_max_time_per_step_second": env_max_time_per_step_second,
             "simulation_max_steps": simulation_max_steps,
+            "required_files": required_files,
             "metrics": metrics,
             "is_stop_after_deployment": is_stop_after_deployment,
             "deployment_nb_constraint_run": deployment_nb_constraint_run,
@@ -1235,6 +1324,16 @@ class MLArenaClient:
         Multipart PUT to `/api/creator_challenge/challenge/{id}/env/files`.
         Use this for binary files; for text content driven by a template,
         prefer `update_env_file_content`.
+
+        `challenge.toml` is the challenge config's file editor: it is applied
+        when it is saved — validated like `update_settings`, with the same
+        permissions — and written only if it applies. A refused file raises
+        `MLArenaError` (400, or 403 for an admin-only key) whose message names
+        each key's line (`challenge.toml:3: unknown key 'x'`), and nothing
+        changes. Accepted, it owns every key it holds; the reply carries the
+        new `config` (as in `creator_challenge`). Once started, a file is
+        accepted only when it changes keys a started challenge still accepts.
+        `export_config()` writes a starting file.
         """
         if not os.path.isfile(file_path):
             raise MLArenaError(f"File not found: {file_path}")
@@ -1289,7 +1388,8 @@ class MLArenaClient:
 
         JSON PUT to the same endpoint as `upload_env_file`. The backend runs
         the kernel-specific AST validator on env.py and returns a
-        `validation` block in the response.
+        `validation` block in the response. `challenge.toml` is applied on
+        save, as `upload_env_file` describes.
         """
         resp = self._request("PUT",
             self._url(
@@ -1455,7 +1555,7 @@ class MLArenaClient:
 
     def run_benchmark(self, challenge_id: int) -> dict:
         """Kick off the benchmark simulation. Returns the new run, in the
-        shape `benchmark_status` serves it (`job_status` `pending`).
+        shape `benchmark_status()["run"]` serves it (`job_status` `pending`).
 
         Requires that env.py has been uploaded and a benchmark `agent.py`
         (or the challenge's submission file for file_v1, e.g. submission.csv /
@@ -1474,11 +1574,23 @@ class MLArenaClient:
             raise _failed(MLArenaError, "run_benchmark", resp)
         return resp.json()
 
-    def benchmark_status(self, challenge_id: int) -> dict | None:
-        """The latest benchmark run, or None before the first one.
+    def benchmark_status(self, challenge_id: int) -> dict:
+        """The latest benchmark run and the config's budgets checked against it.
 
         Mirrors `GET /api/creator_challenge/challenge/{id}/benchmark/status`
-        (`benchmark.py`). The run is the same dict `creator_runs()` lists
+        (`benchmark.py`). Returns `{"run": …, "checks": […]}` (SDK 4.3.0; the
+        run alone before). `run` is None before the first run.
+
+        `checks` is empty until the run completes; then one entry per budget:
+        `key` (the config key), `label`, `configured`, `measured`, `ratio`
+        (measured / configured, None for a non-numeric check), `status`
+        (`ok`, `warn` above 0.8, `fail` above 1, `unmeasured`) and
+        `message` — the run's wallclock against `simulation_timeout_sec`,
+        the longest agent call against `agent_max_time_per_step_second`,
+        memory peaks against the limits, episodes against the budget, and
+        the env metric keys returned against `metrics`.
+
+        `run` is the same dict `creator_runs()` lists
         (`RunResult`): `job_status` (`pending`, `running`, then `completed`,
         `failed` or `cancelled`), `job_error_type` (why the platform lost
         the run), `env_error_type` / `env_error_message` / `env_stdout_logs`, the timestamps, and
