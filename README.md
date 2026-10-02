@@ -2,6 +2,19 @@
 
 Python SDK for [ML Arena](https://ml-arena.com) — make submissions, manage challenges, manage courses, and read leaderboards from any notebook or IDE.
 
+## 4.2.0 — unreleased
+
+Additive over 4.1.0: two reads the console had and the SDK did not.
+
+- `client.agent_template(challenge_id)` — creator scope. `GET
+  /api/creator_challenge/challenge/{id}/agent-template`: `{"agent_template":
+  str}`, the stored template or the platform's default one, as the console's
+  template editor shows it (`creator_challenge()["configuration"]
+  ["agent_template"]` stays the raw, nullable column).
+- `client.public_stats()` — `GET /api/public/stats/`: the landing page's
+  counters `{"users", "challenges", "submissions"}`; `challenges` counts what
+  `challenges()` lists for you.
+
 ## 4.1.0 — machines, not engines
 
 Additive over 4.0.0, plus one deprecation: the platform
@@ -768,6 +781,7 @@ print(c.leaderboard(cid).head())
 - `client.available_kinds()` / `client.copyable_challenges()` — creator scope. What `kernel_version` and `copy_from_challenge_id` accept; each kind's `has_machine`, `runtime_defaults` and `runtime_presets`.
 - `client.machines(kernel_version=None)` — creator or teacher scope. The machines (and their queues) you may run a challenge on.
 - `client.list_tags()` — public read of the tag catalog.
+- `client.public_stats()` — public read of the landing counters: `users`, `challenges` (what `challenges()` lists for you), `submissions`.
 - `client.challenge_tags(challenge_id)` — creator scope. The tags currently on a challenge.
 - `client.set_challenge_tags(challenge_id, tag_names=None, tag_ids=None)` — creator scope. Replaces the tag set on a challenge you own; pass `[]` to clear all tags.
 
@@ -782,7 +796,7 @@ Everything the console's creator editor does, on the same routes:
 - Env: `client.list_env_files(challenge_id)`, `upload_env_file`, `update_env_file_content`, `delete_env_file(challenge_id, filename)`, `check_env(challenge_id, content)` (the structural check, without saving), `sync_env_from_github`.
 - Benchmark: `client.list_benchmark_files(challenge_id)`, `upload_benchmark_file`, `update_benchmark_file_content`, `delete_benchmark_file(challenge_id, filename)`, `run_benchmark`, `benchmark_status`.
 - Presentation: `client.challenge_markdown(challenge_id)` / `set_challenge_markdown`, `client.challenge_image(challenge_id, dest_dir=".")` / `set_challenge_image` / `delete_challenge_image`.
-- Agent template: `client.update_agent_template(challenge_id, …)`, `client.csv_ground_truth(challenge_id)` (file challenges).
+- Agent template: `client.agent_template(challenge_id)` (the stored template, or the default one), `client.update_agent_template(challenge_id, …)`, `client.csv_ground_truth(challenge_id)` (file challenges).
 - Lifecycle: `client.start_challenge(challenge_id)` (from `draft` or `stopped`) / `stop_challenge(challenge_id)` (from `started` to `stopped`).
 - Participants: `client.creator_runs(challenge_id)` (the last 30 runs with the env's diagnostics), `client.creator_submissions(challenge_id)`, `client.clean_redeploy_submission(challenge_id, submission_id)`, `client.clean_redeploy_all(challenge_id)`, `client.soft_delete_submission(challenge_id, submission_id)`.
 - Assistants: `client.challenge_assistants(challenge_id)`, `client.add_challenge_assistant(challenge_id, username)`, `client.remove_challenge_assistant(challenge_id, user_id)`.

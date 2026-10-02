@@ -110,6 +110,7 @@ READS = [
     ("creator_submissions", (7,), CREATOR + "/submissions"),
     ("challenge_assistants", (7,), CREATOR + "/assistants"),
     ("csv_ground_truth", (7,), CREATOR + "/csv-ground-truth"),
+    ("agent_template", (7,), CREATOR + "/agent-template"),
     ("available_kinds", (), "/creator_challenge/available_kinds"),
     ("copyable_challenges", (), "/creator_challenge/copyable_challenges"),
 ]
@@ -533,6 +534,32 @@ def test_recent_replays_passes_its_limit():
     _expect(rec.last["path"] == "/challenges/7/recent-replays", rec.last["path"])
     _expect(rec.last["params"] == {"limit": 5}, rec.last["params"])
 
+
+
+def test_agent_template_returns_the_served_template():
+    c, rec = make_client(lambda *_: (200, {"agent_template": "class Agent: ..."}))
+    _expect(c.agent_template(7) == {"agent_template": "class Agent: ..."},
+            "reply as served")
+    _expect((rec.last["method"], rec.last["path"])
+            == ("GET", CREATOR + "/agent-template"), rec.last["path"])
+
+
+def test_public_stats_reads_the_landing_counters():
+    stats = {"users": 12, "challenges": 3, "submissions": 40}
+    c, rec = make_client(lambda *_: (200, stats))
+    _expect(c.public_stats() == stats, "reply as served")
+    _expect((rec.last["method"], rec.last["path"]) == ("GET", "/public/stats/"),
+            (rec.last["method"], rec.last["path"]))
+
+
+def test_public_stats_refusal_carries_the_reply():
+    c, _ = make_client(lambda *_: (500, {"error": "boom"}))
+    try:
+        c.public_stats()
+    except MLArenaError as exc:
+        _expect(exc.status_code == 500, exc.status_code)
+    else:
+        raise AssertionError("expected MLArenaError")
 
 def _run_all():
     tests = [v for k, v in sorted(globals().items())

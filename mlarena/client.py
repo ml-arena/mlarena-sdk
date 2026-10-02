@@ -787,6 +787,22 @@ class MLArenaClient:
             raise _failed(MLArenaError, "list_tags", resp)
         return _to_dataframe(resp.json())
 
+    def public_stats(self) -> dict:
+        """The platform's three counters, as the landing page shows them.
+
+        Mirrors `GET /api/public/stats/` (`LandingStatsOut`): returns
+        `{"users": int, "challenges": int, "submissions": int}`. `users` and
+        `submissions` count every row; `challenges` counts what `challenges()`
+        lists for you. A public route; the bearer token travels anyway, as on
+        every read.
+        """
+        resp = self._request("GET", self._url("/public/stats/"),
+                             headers=self._headers(), timeout=30)
+        self._handle_response(resp)
+        if resp.status_code != 200:
+            raise _failed(MLArenaError, "public_stats", resp)
+        return resp.json()
+
     def set_challenge_tags(self, challenge_id: int,
                              tag_names: list[str] | None = None,
                              tag_ids: list[int] | None = None) -> dict:
@@ -1564,6 +1580,21 @@ class MLArenaClient:
         if resp.status_code != 200:
             raise _failed(MLArenaError, "stop_challenge", resp)
         return resp.json()
+
+    def agent_template(self, challenge_id: int) -> dict:
+        """The agent.py template handed to the challenge's participants.
+
+        Mirrors `GET /api/creator_challenge/challenge/{id}/agent-template`
+        (`AgentTemplateOut`): returns `{"agent_template": str}`, the stored
+        template or, when the challenge has none, the platform's default one
+        — what the console's template editor shows. `creator_challenge()
+        ["configuration"]["agent_template"]` is the raw column (null when
+        unset). Raises `ChallengeNotFoundError` for a challenge you cannot
+        edit.
+        """
+        return self._creator_get(
+            challenge_id, "/agent-template", "agent_template"
+        )
 
     def update_agent_template(self, challenge_id: int,
                               agent_template: str) -> dict:
