@@ -292,7 +292,7 @@ def test_tail_logs_does_not_repeat_unchanged_run_lines():
                     {"job_status": "running", "env_error_type": None,
                      "submission_results": [
                          {"submission_id": 11, "agent_nb_steps": 5,
-                          "submission_reward": 1.0, "game_outcome": None,
+                          "score": 1.0, "game_outcome": None,
                           "agent_error_type": None},
                      ]},
                 ]},
@@ -305,7 +305,7 @@ def test_tail_logs_does_not_repeat_unchanged_run_lines():
 
     assert lines == [
         "[deploy_run] running",
-        "  run: job_status=running steps=5 reward=1.0 outcome=None",
+        "  run: job_status=running steps=5 score=1.0 outcome=None",
         "[active] done",
     ], lines
 
@@ -326,7 +326,7 @@ def test_tail_logs_emits_a_run_line_again_when_it_changes():
         elif state["polls"] == 2:
             steps, job_status, agent_error, env_error = 9, "completed", "code_error", None
         elif state["polls"] == 3:
-            steps, job_status, agent_error, env_error = 9, "completed", "code_error", "simulation_error"
+            steps, job_status, agent_error, env_error = 9, "completed", "code_error", "crash"
         else:
             return (200, {"status": "deploy_failed", "last_status_message": "crash",
                           "is_settled": True, "run_info": {"results": []}})
@@ -339,11 +339,11 @@ def test_tail_logs_emits_a_run_line_again_when_it_changes():
                  "env_error_message": None,
                  "submission_results": [
                      {"submission_id": 12, "agent_nb_steps": 3,
-                      "submission_reward": 0.0, "game_outcome": "loser",
-                      "agent_error_type": "pod_crash",
+                      "score": 0.0, "game_outcome": "loser",
+                      "agent_error_type": "oom_killed",
                       "agent_error_message": None},
                      {"submission_id": 11, "agent_nb_steps": steps,
-                      "submission_reward": 1.0, "game_outcome": None,
+                      "score": 1.0, "game_outcome": None,
                       "agent_error_type": agent_error,
                       "agent_error_message": "boom" if agent_error else None},
                  ]},
@@ -355,12 +355,12 @@ def test_tail_logs_emits_a_run_line_again_when_it_changes():
 
     assert lines == [
         "[deploy_run] running",
-        "  run: job_status=running steps=5 reward=1.0 outcome=None",
-        "  run: job_status=completed steps=9 reward=1.0 outcome=None",
+        "  run: job_status=running steps=5 score=1.0 outcome=None",
+        "  run: job_status=completed steps=9 score=1.0 outcome=None",
         "    agent error[code_error]: boom",
-        "  run: job_status=completed steps=9 reward=1.0 outcome=None",
+        "  run: job_status=completed steps=9 score=1.0 outcome=None",
         "    agent error[code_error]: boom",
-        "    env error[simulation_error]",
+        "    env error[crash]",
         "[deploy_failed] crash",
     ], lines
 
@@ -390,7 +390,7 @@ def test_tail_logs_names_the_platforms_cause_on_a_failed_run_only():
                  "env_error_type": None, "env_error_message": None,
                  "submission_results": [
                      {"submission_id": 11, "agent_nb_steps": None,
-                      "submission_reward": None, "game_outcome": "incomplete",
+                      "score": None, "game_outcome": "incomplete",
                       "agent_error_type": None, "agent_error_message": None},
                  ]},
             ]},
@@ -401,8 +401,8 @@ def test_tail_logs_names_the_platforms_cause_on_a_failed_run_only():
 
     assert lines == [
         "[deploy_run] running",
-        "  run: job_status=pending steps=None reward=None outcome=incomplete",
-        "  run: job_status=failed steps=None reward=None outcome=incomplete",
+        "  run: job_status=pending steps=None score=None outcome=incomplete",
+        "  run: job_status=failed steps=None score=None outcome=incomplete",
         "    job error[pod_failed]: ImagePullBackOff",
         "[deploy_failed] lost",
     ], lines
@@ -808,9 +808,7 @@ def test_challenge_admin_and_creator_routes():
         return (201, {"id": 4}) if method == "POST" else (200, {"id": 4})
 
     c, rec = make_client(router, scope="creator")
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", DeprecationWarning)
-        c.update_challenge_configuration(4, machine_id=2)
+    c.update_settings(4, machine_id=2)
     assert (rec.last["method"], rec.last["path"]) == (
         "PUT", "/creator_challenge/challenge/4/settings")
     assert rec.last["json"] == {"machine_id": 2}
@@ -1368,7 +1366,11 @@ def test_the_client_reads_no_retired_payload_key():
                 "mean_reward", "mean_reward2", "reward_ci95", "ranked_order",
                 "mean_metrics_detail", "mean_reward_30d", "is_continuous",
                 # the overview's renamed error pair (the run's column names)
-                "last_error_type", "last_error_message"):
+                "last_error_type", "last_error_message",
+                # 5.0: the per-run columns (R5)
+                "submission_reward", "submission_reward2",
+                "submission_reward_variance", "submission_reward_n_episodes",
+                "metrics_detail"):
         for literal in (f'"{old}"', f"'{old}'"):
             assert literal not in src, literal
 

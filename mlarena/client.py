@@ -1187,39 +1187,6 @@ class MLArenaClient:
             raise _failed(MLArenaError, "update_settings", resp)
         return resp.json()
 
-    def update_challenge_configuration(self, challenge_id: int, **fields) -> dict:
-        """Deprecated alias of :meth:`update_settings` (removed in 5.0.0).
-
-        `PUT /api/challenges/{id}/configuration` is gone: its keys
-        (`docker_image_env_runtime_id`, `render_delay_second`, and the
-        machine that replaced the engine, `machine_id`) are keywords of
-        `update_settings`, and this call forwards every keyword to it after a
-        `DeprecationWarning`. `engine_id` raises `TypeError` pointing at
-        `machine_id`: engines became machines, and a machine id comes from
-        `machines(kernel_version)`, not from an old engine id.
-
-        Two behaviours changed with the route, not only the name: the call
-        returns `update_settings`'s reply (`{"configuration", "evaluation",
-        "environment"}`)
-        instead of the configuration dict, and it needs a `creator`-scope
-        token with ownership (or admin) of the challenge, where 4.0.0 took
-        any key of an admin account.
-        """
-        warnings.warn(
-            "MLArenaClient.update_challenge_configuration() is deprecated, "
-            "use .update_settings() instead",
-            DeprecationWarning,
-            # user → _accepts_legacy_kwargs wrapper → here
-            stacklevel=3,
-        )
-        if "engine_id" in fields:
-            raise TypeError(
-                "update_challenge_configuration() no longer accepts engine_id: "
-                "a challenge runs on a machine — pass machine_id= (see "
-                "machines(kernel_version)) to update_settings()"
-            )
-        return self.update_settings(challenge_id, **fields)
-
     def list_env_files(self, challenge_id: int) -> dict:
         """The challenge's env folder, as the editor lists it (creator scope).
 
@@ -1516,7 +1483,7 @@ class MLArenaClient:
         `failed` or `cancelled`), `job_error_type` (why the platform lost
         the run), `env_error_type` / `env_error_message` / `env_stdout_logs`, the timestamps, and
         `submission_results` — the benchmark submission's row, its score
-        under `submission_reward`. When the run completes cleanly the backend
+        under `score`. When the run completes cleanly the backend
         scores the benchmark submission (`active`, `score`), which is
         what `start_challenge` requires.
         """
@@ -2396,8 +2363,9 @@ class MLArenaClient:
           `created_at_ts`, `simulate_end_time_ts`, `is_test`,
           `is_deployment`, `env_nb_steps`, the env's `step_time_*_sec` /
           `env_metric_*` columns and, when the challenge's own code is why
-          the run ended, `env_error_type` (`code_error` | `simulation_error`
-          | `pod_crash`). `completed` means an outcome arrived: it can carry
+          the run ended, `env_error_type` (`code_error` | `timeout` |
+          `oom_killed` | `crash`; the legacy `simulation_error` |
+          `pod_crash` still appear on older runs). `completed` means an outcome arrived: it can carry
           an `env_error_type`.
           `submission_results` lists one `RunSubmissionResult` per agent in
           the run — **yours is the row whose `submission_id` is this
@@ -2405,14 +2373,14 @@ class MLArenaClient:
           `submission_id`, `submission_name`, `user_name`,
           `submission_status` (that submission's status now, not when the
           run played: `deleted` when it was deleted since),
-          `agent_attached_player_id`, `env_player_name`, `submission_reward`,
-          `submission_reward2`, `submission_reward_variance`,
-          `submission_reward_n_episodes`, `reward_ci95`, `agent_nb_steps`,
+          `agent_attached_player_id`, `env_player_name`, `score`,
+          `score_variance`, `n_episodes`, `score_ci95`, `agent_nb_steps`,
           `game_outcome` and `final_rank` (both None on a solo run, which
           is no game), `score_elo_before`, `score_elo_delta`,
-          `metrics_detail`, `info_message`, the agent's `action_time_*_sec` /
+          `metrics` (the env's per-run keys, plus the optional secondary
+          `score2`), `info_message`, the agent's `action_time_*_sec` /
           `agent_metric_*` columns and, when that agent is why the run ended,
-          `agent_error_type` (the same four values) with
+          `agent_error_type` (the same values) with
           `agent_error_message`. Timestamps are ISO-8601 UTC with a `Z`.
         - `queue_info` — `queue_position`, `queue_total` (numbers, not the
           `"116/127"` string this used to send), `created_at_ts` and
@@ -2556,7 +2524,7 @@ class MLArenaClient:
         Mirrors `GET /api/challenges/{id}/recent-replays`. Each replay
         carries `simulation_id`, `created_at_ts`, `render_delay_second`,
         `signed_url` (replay file) and `participants`; each participant
-        carries `submission_name`, `user_name`, `submission_reward`,
+        carries `submission_name`, `user_name`, `score`,
         `game_outcome` and `final_rank` — the SubmissionResult columns under
         their own names (None on a solo run). Only runs from the last 59
         days are listed: the render bucket deletes blobs after 60 days, so
@@ -2652,7 +2620,7 @@ class MLArenaClient:
                              if row["submission_id"] == submission_id), {})
                 run_line = (f"  run: job_status={run.get('job_status')} "
                             f"steps={mine.get('agent_nb_steps')} "
-                            f"reward={mine.get('submission_reward')} "
+                            f"score={mine.get('score')} "
                             f"outcome={mine.get('game_outcome')}")
                 error_lines = tuple(line for line in (
                     _error_line("agent", mine.get("agent_error_type"),
@@ -3215,7 +3183,7 @@ class MLArenaClient:
         latest turn: `status` `pending` | `running` | `completed` | `failed`,
         `progress` while running; when failed, `error_type` — the cause
         (`llm_unavailable` | `llm_timeout` | `turn_timeout` | `env_error` |
-        `agent_offline` | `platform_error` | `unclassified`; None on a turn
+        `agent_offline` | `platform_error`; None on a turn
         failed before the platform recorded causes) — and `error_message`,
         the raw text behind it, served to the challenge's creator /
         assistants and admins only (None for everyone else); None before the

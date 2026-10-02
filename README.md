@@ -2,9 +2,40 @@
 
 Python SDK for [ML Arena](https://ml-arena.com) — make submissions, manage challenges, manage courses, and read leaderboards from any notebook or IDE.
 
-## 4.2.0 — unreleased
+## 5.0.0 — unreleased (ships with the platform's R5 rollout)
 
-Additive over 4.1.0: two reads the console had and the SDK did not.
+Breaking: the per-run keys follow the platform's per-run columns, and the
+4.1.0 deprecated alias is gone. Use 5.0.0 against a platform that has R5;
+4.x reads `None` for every renamed key there.
+
+- **Per-run keys renamed**, no alias (the keys come straight from the
+  server). A `submission_results` row of a run (`submission_status()
+  ["run_info"]["results"]`, `submission_games()["games"]`, `creator_runs()`,
+  `run_benchmark()`, `benchmark_status()`):
+
+  | 4.x | 5.0 |
+  |---|---|
+  | `submission_reward` | `score` |
+  | `submission_reward_variance` | `score_variance` |
+  | `submission_reward_n_episodes` | `n_episodes` |
+  | `reward_ci95` | `score_ci95` |
+  | `metrics_detail` | `metrics` |
+  | `submission_reward2` | `metrics["score2"]` |
+
+  A `recent_replays()` participant carries `score` (was
+  `submission_reward`). `tail_logs()` / `submit(wait=True)` print a run line
+  as `score=…` (was `reward=…`).
+- **Run error types.** `env_error_type` / `agent_error_type` gain
+  `timeout`, `oom_killed` and `crash` next to `code_error`; the legacy
+  `simulation_error` and `pod_crash` still appear on older runs (until the
+  platform's R6), and `unknown` is gone.
+- **Chat turn error types.** `unclassified` is gone; a failed turn's
+  `error_type` is `llm_unavailable`, `llm_timeout`, `turn_timeout`,
+  `env_error`, `agent_offline` or `platform_error`.
+- **`update_challenge_configuration()` is removed** (deprecated in 4.1.0):
+  call `update_settings(challenge_id, machine_id=…, …)`.
+
+Additive (were 4.2.0, never released):
 
 - `client.agent_template(challenge_id)` — creator scope. `GET
   /api/creator_challenge/challenge/{id}/agent-template`: `{"agent_template":
@@ -700,16 +731,19 @@ if st["is_deployable"]:
 
 `submission_status()["run_info"]["results"]` and `submission_games()["games"]`
 serve the same `RunResult`. A run carries the job's own `job_status`
-(`pending` | `running` | `completed` | `failed` | `cancelled` | `reaped`),
+(`pending` | `running` | `completed` | `failed` | `cancelled`),
 `env_nb_steps`, the env's resource columns and, when the challenge's own code
-is why it ended, `env_error_type` (`code_error` | `simulation_error` |
-`pod_crash` | `unknown`). Its `submission_results` list one row per agent in
+is why it ended, `env_error_type` (`code_error` | `timeout` | `oom_killed` |
+`crash`; the legacy `simulation_error` | `pod_crash` on older runs). Its
+`submission_results` list one row per agent in
 the run — `submission_id`, `submission_name`, `user_name`, `submission_status`
-(`deleted` when that submission was deleted since), `submission_reward`,
+(`deleted` when that submission was deleted since), `score`,
+`score_variance`, `n_episodes`, `score_ci95`,
 `agent_nb_steps`, `game_outcome`, `final_rank` (both `None` on a solo run),
-`score_elo_delta`,
-`metrics_detail`, the agent's resource columns and, when that agent is why the
-run ended, `agent_error_type` (the same four values) with
+`score_elo_before`, `score_elo_delta`,
+`metrics` (the env's per-run keys, plus the optional `score2`), the agent's
+resource columns and, when that agent is why the
+run ended, `agent_error_type` (the same values) with
 `agent_error_message`. Your row is the one whose `submission_id` is yours; the
 others are the opponents:
 
@@ -792,7 +826,6 @@ Everything the console's creator editor does, on the same routes:
 - `client.creator_challenges()` / `client.creator_challenge(challenge_id)` — your challenges, and one of them with its three sibling rows: `configuration`, `evaluation` and `environment`, each under its own column names.
 - `client.update_challenge(challenge_id, name=…, description=…, is_public=…)` — the challenge row.
 - `client.update_settings(challenge_id, …)` — the configuration + evaluation columns, under their own names: `simulation_timeout_sec`, `max_upload_size_bytes`, `max_upload_files`, `max_active_submissions_per_participant`, `submission_filename`, `metrics`, `window_days` (see [Metrics](#metrics)), `is_stop_after_deployment`, `deployment_nb_constraint_run`, `deployment_nb_initial_score_run`, `episode_budget_brackets`, the `elo_*` tunables; admins also `agent_max_time_per_step_second`, `env_max_time_per_step_second`, `simulation_max_steps` (the run limits) and `data_source_enabled`, `data_source_url`, `data_source_asset`, `data_source_filter`, `data_source_history_hours`, `batch_cron` (the continuous data feed). The runtime: `machine_id` (from `machines(kernel_version)`), `env_cpu_request`, `env_cpu_limit`, `env_memory_request`, `env_memory_limit`, the `agent_*` sizing (kinds with `agent_containers`), `number_of_agents` (kinds with `multi_agent`); admins also `env_gpu_count`, `agent_gpu_count`, `gpu_memory_limit`, `docker_image_env_runtime_id`, `render_delay_second`. Answers `{"configuration": …, "evaluation": …, "environment": …}`.
-- `client.update_challenge_configuration(challenge_id, …)` — deprecated alias of `update_settings` (4.1.0; removed at 5.0.0).
 - Env: `client.list_env_files(challenge_id)`, `upload_env_file`, `update_env_file_content`, `delete_env_file(challenge_id, filename)`, `check_env(challenge_id, content)` (the structural check, without saving), `sync_env_from_github`.
 - Benchmark: `client.list_benchmark_files(challenge_id)`, `upload_benchmark_file`, `update_benchmark_file_content`, `delete_benchmark_file(challenge_id, filename)`, `run_benchmark`, `benchmark_status`.
 - Presentation: `client.challenge_markdown(challenge_id)` / `set_challenge_markdown`, `client.challenge_image(challenge_id, dest_dir=".")` / `set_challenge_image` / `delete_challenge_image`.
@@ -922,7 +955,7 @@ A challenge declares what its leaderboard shows as `metrics`, an ordered list of
 |---|---|
 | `key` | `^[a-z][a-z0-9_]{0,31}$`, unique; not `score`, `rank` or `metrics` |
 | `label` | 1..40 characters, the column header |
-| `source` | `"score"` — the env's main score (at most one spec); `"env"` — `metrics_detail[key]` from `env.py`; `"platform"` — `elo`, `action_time_max`, `ram_max`, `vram_max`, `steps` or `n_episodes` |
+| `source` | `"score"` — the env's main score (at most one spec); `"env"` — `metrics_detail[key]` that `env.py` returns per agent (served on the run row as `metrics[key]`); `"platform"` — `elo`, `action_time_max`, `ram_max`, `vram_max`, `steps` or `n_episodes` |
 | `agg` | how runs fold into the submission's value: `"mean"`, `"sum"`, `"max"`, `"min"`, `"last"`, `"rating"` (ELO) |
 | `order` | `"desc"` higher is better, `"asc"` lower is better, `None` not comparable |
 | `format` | `"number"`, `"integer"`, `"percent"` (a fraction, shown ×100), `"seconds"`, `"bytes"`, `"currency"` |

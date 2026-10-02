@@ -164,12 +164,12 @@ def test_benchmark_status_is_the_run_or_none():
     None (a JSON `null`) before the first run."""
     run = {"simulation_result_id": 41, "job_status": "completed",
            "env_error_type": None,
-           "submission_results": [{"submission_id": 3, "submission_reward": 1.5}]}
+           "submission_results": [{"submission_id": 3, "score": 1.5}]}
     c, rec = make_client(lambda *_: (200, run))
     got = c.benchmark_status(7)
     _expect(rec.last["method"] == "GET" and rec.last["path"] == CREATOR + "/benchmark/status",
             rec.last)
-    _expect(got["submission_results"][0]["submission_reward"] == 1.5, got)
+    _expect(got["submission_results"][0]["score"] == 1.5, got)
 
     c, _rec = make_client()
     c._request = lambda *a, **k: _NullJson()
@@ -452,46 +452,21 @@ def test_update_settings_window_days_none_removes_the_window():
     _expect(rec.last["json"] == {"simulation_timeout_sec": 60}, rec.last["json"])
 
 
-def test_update_challenge_configuration_is_a_deprecated_alias_of_update_settings():
-    import warnings
-    c, rec = make_client(lambda *_: (200, {"configuration": {}, "evaluation": {}}))
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        c.update_challenge_configuration(
-            7, machine_id=3, docker_image_env_runtime_id=2, render_delay_second=0.05
-        )
-    _expect(any(issubclass(w.category, DeprecationWarning)
-                and "update_settings" in str(w.message) for w in caught),
-            [str(w.message) for w in caught])
-    _expect(rec.last["method"] == "PUT", rec.last["method"])
-    _expect(rec.last["path"] == CREATOR + "/settings", rec.last["path"])
-    _expect(rec.last["json"] == {
-        "machine_id": 3,
-        "docker_image_env_runtime_id": 2,
-        "render_delay_second": 0.05,
-    }, rec.last["json"])
-
-
-def test_update_challenge_configuration_refuses_engine_id():
-    """Engines became machines: no silent id mapping, a TypeError naming
-    machine_id, before any request."""
-    import warnings
-    c, rec = make_client()
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", DeprecationWarning)
-        try:
-            c.update_challenge_configuration(7, engine_id=3)
-        except TypeError as exc:
-            _expect("machine_id" in str(exc), str(exc))
-        else:
-            raise AssertionError("update_challenge_configuration accepted engine_id")
-    _expect(rec.calls == [], "no request was sent")
+def test_update_settings_refuses_engine_id():
+    """Engines became machines: no silent id mapping."""
+    c, _rec = make_client()
     try:
         c.update_settings(7, engine_id=3)
     except TypeError:
         pass
     else:
         raise AssertionError("update_settings accepts engine_id")
+
+
+def test_update_challenge_configuration_is_gone():
+    """The 4.1.0 deprecated alias was removed at 5.0.0."""
+    _expect(not hasattr(mlarena.client.MLArenaClient, "update_challenge_configuration"),
+            "update_challenge_configuration still defined")
 
 
 def test_machines_lists_the_visible_queues():
