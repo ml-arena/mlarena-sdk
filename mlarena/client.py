@@ -820,10 +820,15 @@ class MLArenaClient:
         machine, call `update_settings(challenge_id, machine_id=…)` with an
         id from `machines(kernel_version)`.
 
+        A copy (`copy_from_challenge_id`) takes its source's env folder,
+        `challenge.toml`, every config key (data feed and participation
+        limits included) and tags; not its datasets.
+
         If `tag_names` is given, each name is resolved against the public
         tag catalog (`GET /api/challenge_tags/tags`) before the create
-        call. Unknown names raise `MLArenaError` (fail fast — the catalog
-        is admin-curated; new tags are not auto-created).
+        call; on a copy they replace the source's tags. Unknown names raise
+        `MLArenaError` (fail fast — the catalog is admin-curated; new tags
+        are not auto-created).
 
         A new challenge is private unless `is_public=True` is passed: hidden
         from public listings, search and direct URLs. Only the owner,
@@ -2454,7 +2459,10 @@ class MLArenaClient:
           (A file upload is one request that ends validated or failed, so
           there is no `uploading` state on the wire.)
         - `phase` — `upload` | `deployment` | `active` | `terminal`.
-        - `last_status_message` — the row's latest message, or None.
+        - `last_status_message` — the row's latest message, or None. None
+          too on someone else's public submission: a failed deploy's message
+          quotes the agent's traceback (the same rule as
+          `latest_deploy.failure_message`).
         - `status_update_ts` — ISO-8601 UTC, or None.
         - `is_uploadable` / `is_deployable` / `is_settled` — the server's own
           answer to "may I upload / deploy / stop polling". Read these instead
