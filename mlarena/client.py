@@ -604,7 +604,7 @@ class MLArenaClient:
         and `owner_username`, whose challenge it is.
 
         `config` is the challenge config as one flat document (the platform's
-        docs/challenge_contract.md): `values` — every config key the kind
+        modelmanager/PROCESS.md "Challenge config"): `values` — every config key the kind
         accepts, as stored (never `llm_api_key`) —, `origin` — per key,
         `"file"` (the applied `challenge.toml` holds it: `update_settings`
         refuses it), `"console"` (set by `update_settings` or the console) or
