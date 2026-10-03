@@ -570,7 +570,8 @@ class MLArenaClient:
         — useful for finding a challenge you created but did not make
         public. Each item carries
         `id`, `name`, `status` (`draft` | `started` | `stopped`), `is_public`,
-        `kind`, `role`.
+        `kernel_version`, `role` and `owner_username` (an admin is served
+        every creator's challenges, each as `"owner"`).
 
         Requires a `creator`-scope token.
         """
@@ -599,7 +600,8 @@ class MLArenaClient:
         `attach_path_files`, `number_of_agents`). The configuration's
         `kernel_version` is the env runtime's kernel. Also `machine_name`,
         `machine` (`{id, name, runtime, vm_health_ok,
-        vm_health_checked_at_ts}`), and `role` — `"owner"` or `"assistant"`.
+        vm_health_checked_at_ts}`), `role` — `"owner"` or `"assistant"` —
+        and `owner_username`, whose challenge it is.
 
         `config` is the challenge config as one flat document (the platform's
         docs/challenge_contract.md): `values` — every config key the kind
@@ -617,7 +619,12 @@ class MLArenaClient:
         `runtime` — the machine's caps, its time cap included —,
         `env_invalid`, `chat_missing`, `llm_not_configured`,
         `ground_truth_missing`, `benchmark_missing`, `benchmark_unscored`);
-        `[]` means ready, None while started. `running_editable_fields` names
+        `[]` means ready, None while started. `start_recommendations` lists,
+        the same way, what participants would miss if it started now — advice
+        `start_challenge` never checks: `description_missing` (no card
+        blurb), `overview_missing` (no overview, or only whitespace),
+        `cover_missing` (no cover image); `[]` when nothing is missing, None
+        while started. `running_editable_fields` names
         what stays editable once started, for you and this kind (among
         `description`, `is_public`, `metrics`, `is_stop_after_deployment`,
         `render_delay_second`, the chat LLM keys and limits, and
@@ -639,10 +646,13 @@ class MLArenaClient:
         Mirrors `GET /api/creator_challenge/config_fields` (`config.py`) — the
         registry the console's Config tab is generated from. Each entry:
         `key` (the column, `update_settings` keyword and `challenge.toml`
-        key), `group` (`evaluation` | `competition` | `data_feed` |
+        key), `group` (`evaluation` | `participation` | `data_feed` |
         `resources` | `chat`), `level` (`basic` | `advanced`), `writer`
         (`creator` | `admin`), `capability` (the `available_kinds()`
         capability a kind needs for it, None = every kind),
+        `fixed_capability` (the capability of the kinds that hold the key
+        fixed: served read-only at the kind's value and refused on every
+        write, None = no kind; `"chat"` on `metrics` and `window_days`),
         `running_editable` (still writable once started), `in_file` (may be
         written in `challenge.toml`) and `help`.
         """
@@ -1856,10 +1866,11 @@ class MLArenaClient:
     # ---- Creator: runs, submissions and assistants (creator scope) ---------
 
     def creator_runs(self, challenge_id: int) -> dict:
-        """The challenge's last 30 runs, with the env side's diagnostics.
+        """The challenge's last runs, with the env side's diagnostics.
 
         Mirrors `GET /api/creator_challenge/challenge/{id}/runs` (`runs.py`).
-        Returns `{"runs": [...]}` — the same `RunResult` rows the submission
+        Returns `{"runs": [...], "limit": 30}`, where `limit` is the route's
+        cap on `runs` — the same `RunResult` rows the submission
         status and the admin runs page serve, but served to the creator with
         the environment's error, its stdout and every agent's row inline.
         Includes benchmark tests, deployment games and participant runs.
@@ -2525,7 +2536,7 @@ class MLArenaClient:
         (`job_status`, `env_error_type`, `env_nb_steps`, and the
         `submission_results` rows — yours is the one whose `submission_id`
         is this submission's, with `agent_error_type` /
-        `agent_error_message`) plus `signed_url`, the replay file (60-day
+        `agent_error_message`) plus `signed_url`, the replay file (365-day
         retention; None when the run wrote none), and `render_delay_second`.
         A crashed run reads as a crash here too; it used to be listed as an
         ordinary lost game, `outcome: "loser"` with a reward of 0.0 and no
@@ -2638,8 +2649,8 @@ class MLArenaClient:
         `signed_url` (replay file) and `participants`; each participant
         carries `submission_name`, `user_name`, `score`,
         `game_outcome` and `final_rank` — the SubmissionResult columns under
-        their own names (None on a solo run). Only runs from the last 59
-        days are listed: the render bucket deletes blobs after 60 days, so
+        their own names (None on a solo run). Only runs from the last 364
+        days are listed: the replay bucket deletes them after 365 days, so
         an older `signed_url` would 404. A run a since-deleted submission
         played in is not listed.
         """
