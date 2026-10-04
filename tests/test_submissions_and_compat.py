@@ -696,8 +696,8 @@ def test_challenge_read_routes():
     assert rec.last["headers"]["Authorization"].startswith("Bearer ")
     c.datasets(4)
     assert rec.last["path"] == "/challenges/4/datasets"
-    c.recent_replays(4)
-    assert rec.last["path"] == "/challenges/4/recent-replays"
+    c.replays(4)
+    assert rec.last["path"] == "/challenges/4/replays"
     c.leaderboard(4)
     assert rec.last["path"] == "/leaderboard/challenge/4"
     # Same: `is_my_submission` is computed from the caller the token names. It
@@ -1259,7 +1259,7 @@ def test_every_http_refusal_carries_status_code_and_body():
 
 def test_exception_classes_follow_their_section():
     """The runtime methods raised `MLArenaError` while every other submission
-    method raises `SubmissionError`; `recent_replays` (a challenge read) raised
+    method raises `SubmissionError`; `replays` (a challenge read) raised
     `SubmissionError`. `SubmissionError` is an `MLArenaError`, so `except
     MLArenaError` around the runtime calls keeps working."""
     c, _ = make_client(lambda *_: (500, {"error": "down"}))
@@ -1272,12 +1272,12 @@ def test_exception_classes_follow_their_section():
         except SubmissionError as exc:
             assert exc.status_code == 500
     try:
-        c.recent_replays(4)
+        c.replays(4)
         raise AssertionError("expected MLArenaError")
     except SubmissionError:
-        raise AssertionError("recent_replays is a challenge read, not a submission error")
+        raise AssertionError("replays is a challenge read, not a submission error")
     except mlarena.MLArenaError as exc:
-        assert str(exc) == "recent_replays failed: down"
+        assert str(exc) == "replays failed: down"
 
 
 def test_create_submission_404_names_the_id_that_is_wrong():

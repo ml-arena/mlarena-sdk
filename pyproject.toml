@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mlarena-sdk"
-version = "4.3.0"
+version = "4.4.0"
 description = "Python SDK for ML Arena - make submissions, manage challenges, courses, and view leaderboards"
 readme = "README.md"
 license = "MIT"
@@ -34,6 +34,9 @@ dependencies = [
 
 [project.optional-dependencies]
 pandas = ["pandas>=1.0.0"]
+# mlarena.local.record_render: replay.mp4 from start_render_video (the
+# platform's H.264 profile) through imageio-ffmpeg's bundled ffmpeg.
+video = ["imageio-ffmpeg>=0.6,<0.7", "pillow>=10.2.0"]
 
 [project.urls]
 Homepage = "https://ml-arena.com"

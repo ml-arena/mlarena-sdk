@@ -16,6 +16,7 @@ import os
 import tempfile
 import time
 import warnings
+from pathlib import Path
 from typing import Iterator
 
 import requests
@@ -1221,7 +1222,9 @@ class MLArenaClient:
                 challenge's own kernel.
 
         Replay (a creator key, editable while started):
-            render_delay_second: replay playback delay between frames (>= 0).
+            render_delay_second: the default frame duration (s, >= 0): how
+                long a replay frame that sets no `duration_s` of its own is
+                shown. Editing it changes the playback of stored replays too.
 
         Requires a `creator`-scope token and ownership (or admin) of the
         target challenge.
@@ -2535,17 +2538,19 @@ class MLArenaClient:
         return resp.json()
 
     def submission_games(self, submission_id: int) -> dict:
-        """Recent games for a submission with signed log URLs.
+        """Recent games for a submission, each with its replay.
 
         Mirrors `GET /api/submissions/submission/{sid}/games`
         (`monitor.py`, `get_submission_games`). Returns `{"games",
-        "challenge_context"}`. Each game is a `SubmissionGame`: the same
-        `RunResult` that `submission_status` serves under `run_info.results`
-        (`job_status`, `env_error_type`, `env_nb_steps`, and the
-        `submission_results` rows — yours is the one whose `submission_id`
-        is this submission's, with `agent_error_type` /
-        `agent_error_message`) plus `signed_url`, the replay file (365-day
-        retention; None when the run wrote none), and `render_delay_second`.
+        "challenge_context"}`. Each game is the `RunResult` that
+        `submission_status` serves under `run_info.results` (`job_status`,
+        `env_error_type`, `env_nb_steps`, and the `submission_results` rows —
+        yours is the one whose `submission_id` is this submission's, with
+        `agent_error_type` / `agent_error_message`) with `replay` =
+        `{render_format, signed_url, render_size_bytes}` (None when the run
+        recorded none or is past the 365-day retention; `download_replay`
+        saves it). `challenge_context` is the `RunsContext` (`metrics`,
+        `number_of_agents`, `render_delay_second`).
         A crashed run reads as a crash here too; it used to be listed as an
         ordinary lost game, `outcome: "loser"` with a reward of 0.0 and no
         error field at all.
@@ -2649,29 +2654,136 @@ class MLArenaClient:
             raise _failed(SubmissionError, "set_submission_visibility", resp)
         return resp.json()
 
-    def recent_replays(self, challenge_id: int, limit: int = 10) -> dict:
-        """List recent completed replays for a challenge.
+    def replays(self, challenge_id: int, limit: int = 12,
+                before_simulation_result_id: int | None = None,
+                mine: bool = False, order: str = "recent") -> dict:
+        """The challenge's runs that recorded a replay, newest first
+        (`order="recent"`) or best first (`order="score"`).
 
-        Mirrors `GET /api/challenges/{id}/recent-replays`. Each replay
-        carries `simulation_id`, `created_at_ts`, `render_delay_second`,
-        `signed_url` (replay file) and `participants`; each participant
-        carries `submission_name`, `user_name`, `score`,
-        `game_outcome` and `final_rank` — the SubmissionResult columns under
-        their own names (None on a solo run). Only runs from the last 364
-        days are listed: the replay bucket deletes them after 365 days, so
-        an older `signed_url` would 404. A run a since-deleted submission
-        played in is not listed.
+        Mirrors `GET /api/challenges/{id}/replays` — the console's Overview
+        "Replays" section. Returns `{"replays", "challenge_context"}`:
+        `replays` are public `ReplayRun` rows, the public subset of the
+        `RunResult` that `submission_games()` and `submission_status()` serve,
+        under the same keys: `simulation_result_id`, `created_at_ts`,
+        `env_nb_steps`, `replay` = `{render_format, signed_url,
+        render_size_bytes}` and `submission_results`, one per seat with
+        `id`, `submission_id`, `submission_name`, `user_name`,
+        `agent_attached_player_id`, `env_player_name`, `score`,
+        `game_outcome` and `final_rank`. No metrics, info messages, error
+        kinds, resource figures or Elo: the gallery is every viewer's, so a
+        run's details stay with its owner (`submission_games()`) and the
+        challenge's staff (`creator_runs()`). `challenge_context`
+        is the `RunsContext` (`metrics`, `number_of_agents`,
+        `render_delay_second`, the default frame duration). Only completed,
+        non-test runs of the last 364 days are listed (the replay bucket
+        deletes objects after 365 days), and none a since-deleted submission
+        played in. A row's participants (`submission_results`) come in seat
+        order (`agent_attached_player_id`).
+
+        `limit` is 1..50. Page with `before_simulation_result_id` = the last
+        row's `simulation_result_id`. `order="score"` ranks the runs of a
+        single-agent challenge by their score, in the direction that wins a
+        run, unscored runs last (the console's "Best"); it is one page of
+        `limit` rows, takes no `before_simulation_result_id`, and a
+        multi-agent challenge answers 400. `mine=True` keeps the runs one of
+        your (or your team's) submissions played in. Pass a row to
+        `download_replay` to save its file.
         """
+        params: dict = {"limit": limit}
+        if before_simulation_result_id is not None:
+            params["before_simulation_result_id"] = before_simulation_result_id
+        if mine:
+            params["mine"] = "true"
+        if order != "recent":
+            params["order"] = order
         resp = self._request("GET",
-            self._url(f"/challenges/{challenge_id}/recent-replays"),
+            self._url(f"/challenges/{challenge_id}/replays"),
             headers=self._headers(),
-            params={"limit": limit},
+            params=params,
             timeout=30,
         )
         self._handle_response(resp)
         if resp.status_code != 200:
-            raise _failed(MLArenaError, "recent_replays", resp)
+            raise _failed(MLArenaError, "replays", resp)
         return resp.json()
+
+    def replay(self, challenge_id: int, simulation_result_id: int) -> dict:
+        """One run of the challenge with its replay, freshly signed.
+
+        Mirrors `GET /api/challenges/{id}/replays/{simulation_result_id}` —
+        the console's `?replay=<id>` deep link. Returns `{"run",
+        "challenge_context"}` (`run` a public `ReplayRun`, the row shape of
+        `replays()`, for the staff too). A test run
+        is served to the challenge's staff only (403 otherwise); a run of
+        another challenge, or one with no replay, is a 404. Call it again
+        for a new `signed_url` once one has expired (6 h).
+        """
+        resp = self._request("GET",
+            self._url(f"/challenges/{challenge_id}/replays/{simulation_result_id}"),
+            headers=self._headers(),
+            timeout=30,
+        )
+        self._handle_response(resp)
+        if resp.status_code != 200:
+            raise _failed(MLArenaError, "replay", resp)
+        return resp.json()
+
+    def download_replay(self, run: dict, dest_dir: str = ".") -> Path:
+        """Save a run's replay file; returns its path.
+
+        `run` is any row carrying `simulation_result_id` and `replay`: a
+        public `ReplayRun` (from `replays()`, `replay()["run"]`) or a
+        `RunResult` (`submission_games()["games"]`,
+        `submission_status()["run_info"]["results"]`, `creator_runs()` or
+        `run_benchmark()`). The file is the stored object, streamed as is to
+        `<dest_dir>/<simulation_result_id><suffix>`, the suffix from
+        `replay.render_format`: `frames_v1` → `.experiment.mp`, `frames_v2`
+        → `.frames.mp` (msgpack frames), `video_mp4` → `.mp4`, `image_png`
+        → `.png`. The console's "Open file". A composition: no endpoint; the
+        signed URL is a pre-authenticated R2 link, fetched without the token.
+
+        Raises:
+            ValueError: the run has no replay (`replay` is None).
+            MLArenaError: the storage refused the URL (403 once it expired:
+                re-read the row with `replay()`), with its status code.
+        """
+        replay = run["replay"]
+        if replay is None:
+            raise ValueError(
+                f"run {run['simulation_result_id']} has no replay"
+            )
+        suffix = _REPLAY_SUFFIXES[replay["render_format"]]
+        os.makedirs(dest_dir, exist_ok=True)
+        out_path = Path(dest_dir) / f"{run['simulation_result_id']}{suffix}"
+        # Presigned R2 URL: no auth header, follow redirects.
+        resp = self._request("GET", replay["signed_url"], allow_redirects=True,
+                             timeout=300, stream=True)
+        if resp.status_code != 200:
+            raise MLArenaError(
+                f"download_replay failed: storage answered {resp.status_code}",
+                status_code=resp.status_code,
+            )
+        tmp_path = out_path.with_name(out_path.name + ".partial")
+        with open(tmp_path, "wb") as fh:
+            for chunk in resp.iter_content(chunk_size=1 << 20):
+                if chunk:
+                    fh.write(chunk)
+        os.replace(tmp_path, out_path)
+        return out_path
+
+    def recent_replays(self, challenge_id: int, limit: int = 12) -> dict:
+        """Deprecated alias of :meth:`replays` (4.4.0).
+
+        The `/recent-replays` route is gone: this calls `replays()` and
+        returns its reply, `RunResult` rows with `replay`, not the old
+        `simulation_id` / `participants` rows.
+        """
+        warnings.warn(
+            "MLArenaClient.recent_replays() is deprecated, use .replays() instead",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.replays(challenge_id, limit=limit)
 
     def tail_logs(self, challenge_id: int, submission_id: int, *,
                   follow: bool = False, poll_sec: float = 5.0,
@@ -2704,13 +2816,11 @@ class MLArenaClient:
         runs out, naming the status the submission was left in. It used to
         return silently, which was indistinguishable from "finished".
 
-        Note: this does NOT stream pod stdout — that's only available via
-        the per-game signed URLs from `submission_games()`. For raw logs of a
-        completed run, do:
-
-            for game in client.submission_games(sid)["games"]:
-                if game["signed_url"]:
-                    print(requests.get(game["signed_url"]).text)
+        Note: this does NOT stream pod stdout. Your agent's stdout of a run
+        is `agent_stdout_logs` on your `submission_results` row (from
+        `submission_status()` / `submission_games()`). A run's `replay`
+        holds its replay (frames, a video or a still), not logs: save it
+        with `download_replay(run, dest_dir)`.
 
         Raises:
             SubmissionError: on `timeout_sec` elapsing.
@@ -4972,6 +5082,15 @@ _LEGACY_KWARGS = {
     "agent_id": "submission_id",
     "copy_from_agent_id": "copy_from_submission_id",
     "max_active_agents_per_participant": "max_active_submissions_per_participant",
+}
+
+# `download_replay`: the file suffix of each `render_format` (the stored
+# object's own key suffix, docs/replay_display.md §4.1).
+_REPLAY_SUFFIXES = {
+    "frames_v1": ".experiment.mp",
+    "frames_v2": ".frames.mp",
+    "video_mp4": ".mp4",
+    "image_png": ".png",
 }
 
 _RENAMED_METHODS = {

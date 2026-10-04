@@ -2,6 +2,44 @@
 
 Python SDK for [ML Arena](https://ml-arena.com) — make submissions, manage challenges, manage courses, and read leaderboards from any notebook or IDE.
 
+## 4.4.0 — replays
+
+Requires a platform with the replay rework (its step 1). A replay is one
+file per run, and `render_format` says what it is: `frames_v2` (msgpack
+frames), `video_mp4`, `image_png`, or the legacy `frames_v1`.
+
+- New: `replays(challenge_id, limit=12, before_simulation_result_id=None,
+  mine=False)` (`GET /api/challenges/{id}/replays`) and
+  `replay(challenge_id, simulation_result_id)`. Rows are the public
+  `ReplayRun`: the subset of `RunResult` a gallery may show, under the same
+  keys (`simulation_result_id`, `created_at_ts`, `env_nb_steps`,
+  `replay = {render_format, signed_url, render_size_bytes}`, and per seat in
+  `submission_results`: `id`, `submission_id`, `submission_name`,
+  `user_name`, `agent_attached_player_id`, `env_player_name`, `score`,
+  `game_outcome`, `final_rank`). No metrics, info messages, error kinds,
+  resource figures or Elo: those stay on `submission_games()` and
+  `creator_runs()`. `challenge_context` is the `RunsContext` (`metrics`,
+  `number_of_agents`, `render_delay_second`).
+- New: `download_replay(run, dest_dir)` saves a row's replay file as
+  `<simulation_result_id>.frames.mp` / `.mp4` / `.png` (`.experiment.mp`
+  for `frames_v1`) and returns its `Path`.
+- **Breaking:** `recent_replays()` is a deprecated alias of `replays()`
+  (`DeprecationWarning`); the platform's `/recent-replays` route is gone, so
+  4.3 and older fail on it. Its rows are `ReplayRun` rows, not the old
+  `simulation_id` / `participants` ones.
+- **Breaking:** `submission_games()` rows carry `replay` instead of
+  `signed_url` and `render_delay_second`; `render_delay_second` is on
+  `challenge_context`.
+- `update_settings(render_delay_second=…)` is the default frame duration: a
+  frame that sets no `duration_s` of its own is shown that long.
+- `mlarena.local`: new `record_render(env, out_dir)` injects the
+  platform's replay API (`save_render`, `save_render_frames`,
+  `save_render_roles`, `start_render_video`, `clear_render`) with its rules
+  and writes `out_dir/replay/`: `frames/*.png` + `frames.json`,
+  `replay.mp4`, or `replay.png`. Video needs the `video` extra
+  (`pip install "mlarena-sdk[video]"`, imageio-ffmpeg + Pillow); frames
+  and stills need Pillow.
+
 ## 4.3.0 — one challenge config, two editors
 
 Requires a platform with the challenge config (step E1_C). The config of a
@@ -804,7 +842,7 @@ state, so the reason a deploy failed is still there once it has failed.
 ## Full participant workflow
 
 ```python
-import mlarena, requests
+import mlarena
 
 c = mlarena.connect("mlk_user_…", base_url="http://localhost:5000")
 
@@ -827,10 +865,10 @@ c.deploy_submission(cid, sid)  # redeploy after edit
 for line in c.tail_logs(cid, sid):
     print(line)
 
-# 5. Pull stdout from completed games via signed URLs (60d retention)
+# 5. Save the replays of completed games (frames, a video or a still; 365-day retention)
 for game in c.submission_games(sid)["games"]:
-    if game["signed_url"]:
-        print(requests.get(game["signed_url"]).text)
+    if game["replay"]:
+        print(c.download_replay(game, "replays/"))
 
 # 6. Read the leaderboard
 print(c.leaderboard(cid).head())
@@ -840,7 +878,7 @@ print(c.leaderboard(cid).head())
 
 - `client.challenges(q=None, tags=None, status="started", page=None, per_page=None)` — public list. `status` is `"started"` (started challenges only) or `"all"` (draft, started and stopped). Each row's `status` is `"draft"`, `"started"` or `"stopped"`.
 - `client.challenge(challenge_id)` — the participant view: the kernel, the limits, the machine and its health.
-- `client.recent_replays(challenge_id, limit=10)` — the challenge's newest replays with signed render URLs.
+- `client.replays(challenge_id, limit=12, before_simulation_result_id=None, mine=False)` — the challenge's newest runs with a replay (public `ReplayRun` rows: who played, how it ended, the replay), paged by `simulation_result_id`; `mine=True` keeps the runs your submissions played in. `client.replay(challenge_id, simulation_result_id)` — one of them, freshly signed. `client.download_replay(run, dest_dir)` — saves a row's replay file. `recent_replays` is a deprecated alias of `replays`.
 - `client.create_challenge(name, kernel_version, description=None, copy_from_challenge_id=None, tag_names=None)` — creator scope. The backend resolves the machine (the kernel's default queue) + default evaluation + default env runtime from `kernel_version`; the reply names it (`machine_name`). Pass `tag_names=["rl", "research"]` to attach tags at creation time; unknown names raise `MLArenaError`.
 - `client.available_kinds()` / `client.copyable_challenges()` — creator scope. What `kernel_version` and `copy_from_challenge_id` accept; each kind's `has_machine`, `runtime_defaults` and `runtime_presets`.
 - `client.machines(kernel_version=None)` — creator or teacher scope. The machines (and their queues) you may run a challenge on.

@@ -561,11 +561,110 @@ def test_no_engine_left_in_the_public_docstrings():
     _expect("machine_name" in cls.creator_challenge.__doc__, "machine_name")
 
 
-def test_recent_replays_passes_its_limit():
+def test_replays_sends_only_the_passed_keys():
+    c, rec = make_client(lambda *_: (200, {"replays": [], "challenge_context": {}}))
+    c.replays(7)
+    _expect(rec.last["path"] == "/challenges/7/replays", rec.last["path"])
+    _expect(rec.last["params"] == {"limit": 12}, rec.last["params"])
+    c.replays(7, limit=5, before_simulation_result_id=900, mine=True)
+    _expect(rec.last["params"] == {"limit": 5, "before_simulation_result_id": 900,
+                                   "mine": "true"}, rec.last["params"])
+    _expect(rec.last["headers"]["Authorization"].startswith("Bearer "), "token")
+    c.replays(7, order="score")
+    _expect(rec.last["params"] == {"limit": 12, "order": "score"}, rec.last["params"])
+
+
+def test_replay_reads_one_run():
+    c, rec = make_client(lambda *_: (200, {"run": {"simulation_result_id": 3}}))
+    _expect(c.replay(7, 3)["run"]["simulation_result_id"] == 3, "as served")
+    _expect((rec.last["method"], rec.last["path"]) == ("GET", "/challenges/7/replays/3"),
+            rec.last["path"])
+
+
+PUBLIC_REPLAY_RUN = {
+    "simulation_result_id": 41,
+    "created_at_ts": "2026-10-04T08:00:00Z",
+    "env_nb_steps": 211,
+    "replay": {"render_format": "video_mp4", "signed_url": "https://r2/z?sig",
+               "render_size_bytes": 5},
+    "submission_results": [{
+        "id": 7, "submission_id": 3, "submission_name": "ppo", "user_name": "alice",
+        "agent_attached_player_id": 0, "env_player_name": "player_0", "score": 0.4,
+        "game_outcome": "winner", "final_rank": 1,
+    }],
+}
+
+
+def test_replays_and_download_replay_take_the_public_row():
+    """The gallery serves the public `ReplayRun` (no metrics or diagnostics):
+    returned as served, and `download_replay` needs nothing more from it."""
+    page = {"replays": [PUBLIC_REPLAY_RUN],
+            "challenge_context": {"metrics": [], "number_of_agents": 2,
+                                  "render_delay_second": 0.1}}
+    c, _ = make_client(lambda *_: (200, page))
+    _expect(c.replays(7) == page, "as served")
+    c._request = lambda *a, **k: FakeResponse(200, content=b"mp4")
+    with tempfile.TemporaryDirectory() as tmp:
+        path = c.download_replay(PUBLIC_REPLAY_RUN, tmp)
+        _expect(path.name == "41.mp4" and path.read_bytes() == b"mp4", path)
+
+
+def test_recent_replays_is_a_deprecated_alias_of_replays():
+    import warnings
     c, rec = make_client(lambda *_: (200, {"replays": []}))
-    c.recent_replays(7, limit=5)
-    _expect(rec.last["path"] == "/challenges/7/recent-replays", rec.last["path"])
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        c.recent_replays(7, limit=5)
+    _expect(any(issubclass(w.category, DeprecationWarning) for w in caught), caught)
+    _expect(rec.last["path"] == "/challenges/7/replays", rec.last["path"])
     _expect(rec.last["params"] == {"limit": 5}, rec.last["params"])
+
+
+def test_download_replay_names_the_file_by_format():
+    calls = []
+
+    def fake_request(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        return FakeResponse(200, content=b"bytes")
+
+    c, _ = make_client()
+    c._request = fake_request
+    with tempfile.TemporaryDirectory() as tmp:
+        for fmt, suffix in (("frames_v1", ".experiment.mp"), ("frames_v2", ".frames.mp"),
+                            ("video_mp4", ".mp4"), ("image_png", ".png")):
+            run = {"simulation_result_id": 41,
+                   "replay": {"render_format": fmt, "signed_url": "https://r2/x?sig",
+                              "render_size_bytes": 5}}
+            path = c.download_replay(run, tmp)
+            _expect(path.name == f"41{suffix}", path)
+            _expect(path.read_bytes() == b"bytes", "streamed as is")
+        _expect(sorted(os.listdir(tmp)) == ["41.experiment.mp", "41.frames.mp",
+                                            "41.mp4", "41.png"], os.listdir(tmp))
+    method, url, kwargs = calls[-1]
+    _expect((method, url) == ("GET", "https://r2/x?sig"), url)
+    _expect("headers" not in kwargs, "no token to the storage")
+
+
+def test_download_replay_refusals():
+    c, _ = make_client()
+    try:
+        c.download_replay({"simulation_result_id": 1, "replay": None}, ".")
+    except ValueError as exc:
+        _expect("has no replay" in str(exc), exc)
+    else:
+        raise AssertionError("expected ValueError")
+    c._request = lambda *a, **k: FakeResponse(403)
+    with tempfile.TemporaryDirectory() as tmp:
+        run = {"simulation_result_id": 2,
+               "replay": {"render_format": "video_mp4", "signed_url": "https://r2/y",
+                          "render_size_bytes": 1}}
+        try:
+            c.download_replay(run, tmp)
+        except MLArenaError as exc:
+            _expect(exc.status_code == 403, exc.status_code)
+        else:
+            raise AssertionError("expected MLArenaError")
+        _expect(os.listdir(tmp) == [], "nothing written")
 
 
 
