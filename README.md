@@ -2,6 +2,17 @@
 
 Python SDK for [ML Arena](https://ml-arena.com) — make submissions, manage challenges, manage courses, and read leaderboards from any notebook or IDE.
 
+## 4.5.0 — no live-data reads
+
+Requires a platform without the `/api/data_sources/*` proxy.
+
+- Removed: `data_source_weather_coverage`, `data_source_weather_series`,
+  `data_source_weather_snapshot`, `data_source_weather_cities`,
+  `data_source_news_volume` and `data_source_news_sources`. The platform no
+  longer serves the collected weather and news feeds; a
+  `data_source_enabled` challenge still reads them in its `env.py`, and
+  `update_settings()` still configures the feed (admins).
+
 ## 4.4.0 — replays
 
 Requires a platform with the replay rework (its step 1). A replay is one

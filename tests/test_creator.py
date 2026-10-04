@@ -458,14 +458,6 @@ def test_update_settings_sends_the_run_limit_fields():
     }, rec.last["json"])
 
 
-def test_data_source_weather_series_sends_the_response_keys():
-    c, rec = make_client(lambda *_: (200, {"city_name": "Paris", "points": []}))
-    c.data_source_weather_series(city_name="Paris", country_code="FR", hours=24)
-    _expect(rec.last["path"] == "/data_sources/weather/series", rec.last["path"])
-    _expect(rec.last["params"] == {"city_name": "Paris", "country_code": "FR", "hours": 24},
-            rec.last["params"])
-
-
 RUNTIME_KWARGS = {
     "machine_id": 3,
     "env_cpu_request": "500m", "env_cpu_limit": "1",

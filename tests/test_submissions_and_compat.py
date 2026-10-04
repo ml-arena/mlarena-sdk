@@ -1393,14 +1393,13 @@ def _every_read(c):
         lambda: c.benchmark_status(4),
         lambda: c.global_ranking(),
         lambda: c.user_global_rank(7),
-        lambda: c.data_source_weather_cities(),
     ]
 
 
 def test_every_read_sends_the_bearer_token():
     """`user_global_rank` is login-required and was sent without the token,
-    so it answered 401 for everyone. `list_tags`, `global_ranking` and the
-    data-source reads are public, but a public route answers differently to
+    so it answered 401 for everyone. `list_tags` and `global_ranking` are
+    public, but a public route answers differently to
     a caller it can identify, and PROCESS.md promises the token on every
     read."""
     def router(method, path, kwargs):

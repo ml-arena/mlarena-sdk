@@ -1,6 +1,6 @@
 # mlarena-sdk — Python SDK
 
-**Purpose**: Python client (`mlarena-sdk` 4.4.0, import `mlarena`) over the public backend REST routes (`/api/*`).
+**Purpose**: Python client (`mlarena-sdk` 4.5.0, import `mlarena`) over the public backend REST routes (`/api/*`).
 
 **Key features**:
 - Bearer-token auth with scope-segmented keys `mlk_<scope>_<lookup>_<secret>` (`user`, `creator`, `teacher`).
@@ -45,7 +45,6 @@ The SDK and the React console are peers over one REST surface; every user-facing
 | `submission_overview` | `/api/submission_result/{cid}/{sid}/overview` | `submissionsApi.ts` |
 | `leaderboard` | `/api/leaderboard/challenge/{id}` | `leaderboardApi.ts` |
 | `global_ranking`, `user_global_rank` | `/api/ranking/`, `/api/ranking/user/{id}` | `leaderboardApi.ts` |
-| `data_source_weather_{coverage,series,snapshot,cities}`, `data_source_news_{volume,sources}` | `/api/data_sources/*` | `dataSourcesApi.ts` |
 | `chat_challenge`, `open_chat_session`, `chat_session`, `send_chat_message`, `close_chat_session`, `export_chat_session` (user); `chat_admin`, `update_chat_settings`, `chat_sessions`, `void_chat_session`, `unvoid_chat_session`, `export_chat_evidence` (creator) | `/api/chat/*` | `chatApi.ts` |
 | `create_course`, `list_courses`, `enrollment_info`, `enroll_in_course` | `/api/academic_courses/`, `/api/academic_courses/enroll/{join_code}` | `coursesApi.ts` |
 | `course_catalog`, `course`, `module_overview`, `lesson`, `mark_lesson_viewed`, `mark_lesson_complete`, `mark_lesson_incomplete`, `my_progress`, `download_lesson_media` | `/api/academic_courses/*` (consumption, assets) | `coursesApi.ts` |
