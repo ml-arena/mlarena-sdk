@@ -141,13 +141,15 @@ def _view(session_id=5, turn=None, messages=(), events=(), total="0.00",
 
 
 def _turn(turn_id, status, assistant_message_id=None, error_type=None,
-          error_message=None):
+          error_message=None, queue_position=None):
+    if status == "pending" and queue_position is None:
+        queue_position = 0
     return {
         "id": turn_id, "status": status, "user_message_id": turn_id * 10,
         "assistant_message_id": assistant_message_id,
         "created_at_ts": "2026-09-18T10:00:01Z",
         "error_type": error_type, "error_message": error_message,
-        "progress": None,
+        "progress": None, "queue_position": queue_position,
     }
 
 
@@ -625,3 +627,34 @@ def test_chat_names_are_exported_at_package_level():
     assert mlarena.ChatSessionNotFoundError is ChatSessionNotFoundError
     assert issubclass(mlarena.ChatSessionNotFoundError, mlarena.NotFoundError)
     assert mlarena.__version__ == "4.4.0"
+
+
+def test_update_chat_settings_sends_max_concurrent_turns(monkeypatch):
+    c, rec = make_client(monkeypatch, scope="creator")
+    c.update_chat_settings(4, max_concurrent_turns=8)
+    assert rec.last["json"] == {"max_concurrent_turns": 8}
+
+
+def test_the_wait_budget_restarts_while_the_turn_moves_up_the_queue(monkeypatch, clock):
+    """timeout=1 with a 0.7 s poll: a turn that waits three polls would time
+    out, but each poll finds it one place closer, so the budget restarts."""
+    views = iter([
+        _view(5, _turn(7, "pending", queue_position=3)),
+        _view(5, _turn(7, "pending", queue_position=2)),
+        _view(5, _turn(7, "pending", queue_position=1)),
+        _view(5, _turn(7, "pending", queue_position=0)),
+        _view(5, _turn(7, "completed", assistant_message_id=71)),
+    ])
+    c, _ = make_client(monkeypatch, lambda m, p, k: (202, {"turn": _turn(7, "pending", queue_position=3),
+                                                            "message": {}})
+                       if m == "POST" else (200, next(views)))
+    final = c.send_chat_message(5, "x", timeout=1)
+    assert final["turn"]["status"] == "completed"
+
+
+def test_a_turn_stuck_at_the_same_place_still_times_out(monkeypatch, clock):
+    c, _ = make_client(monkeypatch, lambda m, p, k: (202, {"turn": _turn(7, "pending", queue_position=2),
+                                                            "message": {}})
+                       if m == "POST" else (200, _view(5, _turn(7, "pending", queue_position=2))))
+    with pytest.raises(MLArenaError, match="still 'pending'"):
+        c.send_chat_message(5, "x", timeout=1)

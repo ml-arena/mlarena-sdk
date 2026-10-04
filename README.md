@@ -40,6 +40,17 @@ frames), `video_mp4`, `image_png`, or the legacy `frames_v1`.
   (`pip install "mlarena-sdk[video]"`, imageio-ffmpeg + Pillow); frames
   and stills need Pillow.
 
+Chat challenges (needs a platform with concurrent chat turns):
+
+- New: `update_chat_settings(..., max_concurrent_turns=N)` (1..16): how many
+  messages the agent answers at once; a team never runs two at once.
+- A pending turn carries `queue_position` (conversations ahead of yours,
+  0 = next) in `chat_session()` and `send_chat_message(wait=False)`.
+  `send_chat_message(wait=True)` restarts its `timeout` each time the turn
+  moves up the queue.
+- `open_chat_session()` and `close_chat_session()` answer 409 while the
+  agent is still answering a message of your open session.
+
 ## 4.3.0 — one challenge config, two editors
 
 Requires a platform with the challenge config (step E1_C). The config of a

@@ -3403,8 +3403,9 @@ class MLArenaClient:
 
         Raises `ChallengeNotFoundError` on a non-chat or hidden challenge, and
         `MLArenaError` with the server's reason when it refuses (409: the
-        challenge is not started, the agent is offline, or
-        `max_sessions_per_participant` is reached).
+        challenge is not started, the agent is offline,
+        `max_sessions_per_participant` is reached, or the agent is still
+        answering a message of your open session — wait for it first).
         """
         return self._chat_call(
             "POST", f"/chat/challenge/{challenge_id}/sessions",
@@ -3422,7 +3423,9 @@ class MLArenaClient:
         `scoring_events` (each breach: `rule_key`, `label`, `amount_eur`; the
         `evidence` blob behind it is in the export), `turn` (the in-flight or
         latest turn: `status` `pending` | `running` | `completed` | `failed`,
-        `progress` while running; when failed, `error_type` — the cause
+        `progress` while running, `queue_position` while pending — how many
+        conversations the agent answers before this one, 0 = next, None in
+        any other status; when failed, `error_type` — the cause
         (`llm_unavailable` | `llm_timeout` | `turn_timeout` | `env_error` |
         `agent_offline` | `platform_error`; None on a turn
         failed before the platform recorded causes) — and `error_message`,
@@ -3455,7 +3458,8 @@ class MLArenaClient:
         Mirrors `POST /api/chat/sessions/{sid}/messages` `{"content": ...}`
        , which answers 202 `{"turn", "message"}` as soon as the
         turn is queued for the agent — `turn` is the `ChatTurnView` the session
-        poll will serve. `content` is 1..4000 characters.
+        poll will serve, with its `queue_position` (0 = the agent takes it
+        next). `content` is 1..4000 characters.
 
         With `wait=True` (default) the call then polls `chat_session()` every
         `poll_interval` seconds — a client-side composition of the two public
@@ -3468,7 +3472,10 @@ class MLArenaClient:
         with its `error_message` appended when the server serves it (to the
         challenge's staff only); the session stays open, so you may send again. Not
         settled after `timeout` seconds raises `MLArenaError` too, naming the
-        state the turn was left in.
+        state the turn was left in. The `timeout` budget restarts each time
+        the turn moves up the queue (`queue_position` decreases): a busy
+        challenge serves the conversations in order, and waiting your place
+        is not the agent being stuck.
 
         With `wait=False` the 202 body is returned as-is.
 
@@ -3495,11 +3502,18 @@ class MLArenaClient:
         """Poll `chat_session` until turn `turn_id` settles (see
         `send_chat_message`). A view whose `turn` is another turn — the
         previous one, still the latest for a moment — is not that turn
-        settling, so it is skipped rather than misread."""
+        settling, so it is skipped rather than misread. The deadline restarts
+        whenever the turn's `queue_position` goes down."""
         deadline = time.monotonic() + timeout
+        last_position = None
         while True:
             view = self.chat_session(session_id)
             turn = view["turn"]
+            if turn is not None and turn["id"] == turn_id and turn["status"] == "pending":
+                position = turn["queue_position"]
+                if last_position is not None and position < last_position:
+                    deadline = time.monotonic() + timeout
+                last_position = position
             if (turn is not None and turn["id"] == turn_id
                     and turn["status"] in ("completed", "failed")):
                 if turn["status"] == "failed":
@@ -3528,7 +3542,9 @@ class MLArenaClient:
         session earned stays banked; open a new one with
         `open_chat_session()`.
 
-        Raises `ChatSessionNotFoundError` when the session is not yours.
+        Raises `ChatSessionNotFoundError` when the session is not yours, and
+        `MLArenaError` (409) while the agent is still answering a message of
+        this session.
         """
         return self._chat_call(
             "POST", f"/chat/sessions/{session_id}/close",
@@ -3612,6 +3628,7 @@ class MLArenaClient:
                              turn_timeout_sec: int | _Unset = _UNSET,
                              max_turns_per_session: int | None | _Unset = _UNSET,
                              max_sessions_per_participant: int | None | _Unset = _UNSET,
+                             max_concurrent_turns: int | _Unset = _UNSET,
                              ) -> dict:
         """Point the challenge at its LLM and set its limits.
 
@@ -3629,6 +3646,12 @@ class MLArenaClient:
         - `turn_timeout_sec` — how long one answer may take.
         - `max_turns_per_session` / `max_sessions_per_participant` — pass
           `None` explicitly to lift a limit (unlimited).
+        - `max_concurrent_turns` — how many participant messages the agent
+          answers at the same time, 1..16 (default 1). A team never has two
+          answers running at once, whatever the value. Above 1, one `Env`
+          instance serves several turns in parallel: env.py must keep
+          per-turn data in `session.state` / `session.participant_state` and
+          treat its own attributes as read-only after `__init__`.
 
         Returns the updated `ChatChallengeAdminView`. Raises `MLArenaError`
         when called with no field at all.
@@ -3640,6 +3663,7 @@ class MLArenaClient:
             "turn_timeout_sec": turn_timeout_sec,
             "max_turns_per_session": max_turns_per_session,
             "max_sessions_per_participant": max_sessions_per_participant,
+            "max_concurrent_turns": max_concurrent_turns,
         }
         body = {key: value for key, value in passed.items() if value is not _UNSET}
         if not body:
