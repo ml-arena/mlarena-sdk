@@ -3302,8 +3302,10 @@ class MLArenaClient:
         `progress` while running, `queue_position` while pending — how many
         conversations the agent answers before this one, 0 = next, None in
         any other status; when failed, `error_type` — the cause
-        (`llm_unavailable` | `llm_timeout` | `turn_timeout` | `env_error` |
-        `agent_offline` | `platform_error`; None on a turn
+        (`llm_unavailable` | `llm_timeout` | `context_full` — the conversation
+        outgrew the model's context window and was closed: open a new one —
+        | `turn_timeout` | `env_error` | `agent_offline` | `platform_error`;
+        None on a turn
         failed before the platform recorded causes) — and `error_message`,
         the raw text behind it, served to the challenge's creator /
         assistants and admins only (None for everyone else); None before the
