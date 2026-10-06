@@ -142,44 +142,105 @@ def test_submission_file_routes():
     assert rec.last["data"] == {"delete_file": "old.py"}
 
 
-def test_submission_deploy_status_delete_games_routes():
+def test_submission_deploy_delete_routes():
     c, rec = make_client()
     c.deploy_submission(4, 11)
     assert (rec.last["method"], rec.last["path"]) == ("PUT", "/submissions/challenge/4/11/deploy")
     c.submission_deploy_status(4, 11)
     assert (rec.last["method"], rec.last["path"]) == ("GET", "/submissions/challenge/4/11/deploy")
-    c.submission_status(4, 11)
-    assert (rec.last["method"], rec.last["path"]) == ("GET", "/submissions/challenge/4/11/status")
-    c.submission_games(11)
-    assert (rec.last["method"], rec.last["path"]) == ("GET", "/submissions/submission/11/games")
     c.delete_submission(4, 11)
     assert (rec.last["method"], rec.last["path"]) == ("DELETE", "/submissions/challenge/4/11")
 
 
-def test_runtime_routes_keep_agent_runtime_segment():
-    c, rec = make_client(lambda m, p, k: (200, [{"id": 3, "language": "python"}])
-                         if "runtime_options" in p else (200, {"id": 3}))
-    c.runtime_options(4)
-    assert rec.last["path"] == "/submissions/runtime_options/4"
-    c.agent_runtime(11)
-    assert (rec.last["method"], rec.last["path"]) == ("GET", "/submissions/agent_runtime/11")
+def test_submission_page_read_routes():
+    """The four routes of the submission's page, keyed by the submission
+    alone (4.6.0)."""
+    c, rec = make_client()
+    c.submission(11)
+    assert (rec.last["method"], rec.last["path"]) == ("GET", "/submissions/submission/11")
+
+    c.submission_runs(11)
+    assert (rec.last["method"], rec.last["path"]) == ("GET", "/submissions/submission/11/runs")
+    # Only the paging is sent by default: no filter key the caller left out.
+    assert rec.last["params"] == {"offset": 0, "limit": 20}
+    c.submission_runs(11, deploy_id=9, is_test=False, offset=20, limit=5)
+    assert rec.last["params"] == {"offset": 20, "limit": 5, "deploy_id": 9,
+                                  "is_test": "false"}
+
+    c.submission_deploys(11)
+    assert (rec.last["method"], rec.last["path"]) == ("GET", "/submissions/submission/11/deploys")
+
+
+def test_update_submission_sends_only_the_keys_passed():
+    c, rec = make_client(lambda *_: (200, {"id": 11, "is_public": True}))
+    out = c.update_submission(11, submission_name="v2", is_public=True)
+    assert (rec.last["method"], rec.last["path"]) == ("PATCH", "/submissions/submission/11")
+    assert rec.last["json"] == {"submission_name": "v2", "is_public": True}
+    assert out == {"id": 11, "is_public": True}
+
+    c.rename_submission(11, "v3")
+    assert (rec.last["method"], rec.last["path"]) == ("PATCH", "/submissions/submission/11")
+    assert rec.last["json"] == {"submission_name": "v3"}
+
+    c.set_submission_visibility(11, False)
+    assert (rec.last["method"], rec.last["path"]) == ("PATCH", "/submissions/submission/11")
+    assert rec.last["json"] == {"is_public": False}
+
+
+def test_a_deleted_submission_cannot_be_updated():
+    c, _ = make_client(lambda *_: (409, {"error": "Cannot change a deleted submission"}))
+    try:
+        c.rename_submission(11, "v2")
+        raise AssertionError("expected SubmissionError")
+    except SubmissionError as exc:
+        assert str(exc) == "update_submission failed: Cannot change a deleted submission"
+        assert exc.status_code == 409
+
+
+def test_a_chat_submission_delete_is_a_409_with_the_kernel():
+    body = {"error": "A chat challenge's submission is the team's score line "
+                     "and cannot be deleted.", "kernel_version": "chat_v1"}
+    c, _ = make_client(lambda *_: (409, body))
+    try:
+        c.delete_submission(4, 11)
+        raise AssertionError("expected SubmissionError")
+    except SubmissionError as exc:
+        assert exc.status_code == 409
+        assert exc.body["kernel_version"] == "chat_v1"
+
+
+def test_runtime_reads_are_the_challenge_and_the_submission():
+    """`runtime_options()` reads the challenge's `runtime_options`,
+    `agent_runtime()` the submission's `agent_runtime`: the two GET routes of
+    their own are gone (4.6.0). The write keeps its route."""
+    def router(m, p, k):
+        if p == "/challenges/4":
+            return (200, {"runtime_options": [{"id": 3, "language": "python"}]})
+        if p == "/submissions/submission/11":
+            return (200, {"agent_runtime": {"id": 3}})
+        return (200, {"message": "ok"})
+    c, rec = make_client(router)
+    opts = c.runtime_options(4)
+    rows = opts.to_dict("records") if hasattr(opts, "to_dict") else opts
+    assert rows == [{"id": 3, "language": "python"}]
+    assert rec.last["path"] == "/challenges/4"
+    assert c.agent_runtime(11) == {"id": 3}
+    assert (rec.last["method"], rec.last["path"]) == ("GET", "/submissions/submission/11")
     c.set_agent_runtime(11, 3)
     assert (rec.last["method"], rec.last["path"]) == ("PUT", "/submissions/agent_runtime/11")
     assert rec.last["json"] == {"docker_image_agent_runtime_id": 3}
 
 
 def test_agent_runtime_is_none_for_a_submission_without_agent_container():
-    # A file_v1 / chat_v1 submission pins no runtime: the route answers null.
-    c, _rec = make_client()
-    null_body = FakeResponse(200)
-    null_body._json = None  # FakeResponse turns a None body into {}
-    c._request = lambda method, url, **kwargs: null_body
+    # A file_v1 / chat_v1 submission pins no runtime: the key is null.
+    c, _rec = make_client(lambda *_: (200, {"agent_runtime": None}))
     assert c.agent_runtime(11) is None
 
 
-def test_submission_file_download_and_docs_routes():
-    """Parity with the console: the download button, the Documentation panel
-    and the "copy an existing submission" picker."""
+def test_submission_file_download_and_copyable_routes():
+    """Parity with the console: the download button and the "copy an
+    existing submission" picker. A report is a plain file of the submission
+    (README.md, *.pdf): there is no docs route or method any more."""
     c, rec = make_client(lambda m, p, k: (200, None, b"\x80weights")
                          if p.endswith("/file/model.pt") else None)
     with tempfile.TemporaryDirectory() as d:
@@ -190,28 +251,12 @@ def test_submission_file_download_and_docs_routes():
         with open(out, "rb") as fh:
             assert fh.read() == b"\x80weights"
 
-        c.upload_submission_docs(4, 11, _tmp_file(d, "README.md", b"# hi\n"))
-    assert (rec.last["method"], rec.last["path"]) == (
-        "PUT", "/submissions/challenge/4/11/docs")
-    assert rec.last["files"]["file"][0] == "README.md"
-
-    c.delete_submission_docs(4, 11, "README.md")
-    assert (rec.last["method"], rec.last["path"]) == (
-        "DELETE", "/submissions/challenge/4/11/docs")
-    assert rec.last["params"] == {"filename": "README.md"}
-
     c.copyable_submissions()
     assert (rec.last["method"], rec.last["path"]) == (
         "GET", "/submissions/copyable_submissions")
 
-
-def test_submission_docs_upload_needs_a_real_file():
-    c, _ = make_client()
-    try:
-        c.upload_submission_docs(4, 11, "/nope/README.md")
-        raise AssertionError("expected SubmissionError")
-    except SubmissionError as exc:
-        assert "File not found" in str(exc)
+    assert not hasattr(MLArenaClient, "upload_submission_docs")
+    assert not hasattr(MLArenaClient, "delete_submission_docs")
 
 
 def test_new_submission_methods_map_errors_like_their_neighbours():
@@ -219,8 +264,11 @@ def test_new_submission_methods_map_errors_like_their_neighbours():
     for label, call in (
         ("download_submission_file",
          lambda: c.download_submission_file(4, 11, "model.pt", dest_dir=tempfile.mkdtemp())),
-        ("delete_submission_docs", lambda: c.delete_submission_docs(4, 11, "a.md")),
         ("copyable_submissions", lambda: c.copyable_submissions()),
+        ("submission", lambda: c.submission(11)),
+        ("update_submission", lambda: c.update_submission(11, is_public=True)),
+        ("submission_runs", lambda: c.submission_runs(11)),
+        ("submission_deploys", lambda: c.submission_deploys(11)),
     ):
         try:
             call()
@@ -258,49 +306,85 @@ def with_fake_clock(fn):
         client_module.time = real
 
 
+_ATTEMPT = {"id": 9, "created_at_ts": None, "status": "running",
+            "finished_at_ts": None, "failure_message": None,
+            "failure_owner": None}
+
+
+def _sub(status, message=None, *, is_settled, latest_deploy=_ATTEMPT, **extra):
+    """A `submission()` reply with the keys `tail_logs` / `submit` read."""
+    return {"id": 11, "challenge_id": 4, "status": status,
+            "last_status_message": message, "is_settled": is_settled,
+            "latest_deploy": latest_deploy,
+            "queue_info": {"queue_position": None, "queue_total": None,
+                           "created_at_ts": None, "in_queue_for_second": None},
+            **extra}
+
+
+def _tail_router(*polls):
+    """Fake backend for `tail_logs`: each poll is `(submission, runs)`, the
+    `submission()` reply and the runs `/runs` answers for that poll (newest
+    first, as the route pages them). The last poll repeats."""
+    state = {"poll": -1}
+
+    def router(method, path, kwargs):
+        if path == "/submissions/submission/11":
+            state["poll"] = min(state["poll"] + 1, len(polls) - 1)
+            return (200, polls[state["poll"]][0])
+        if path == "/submissions/submission/11/runs":
+            # The latest attempt's runs, the page the route allows at most.
+            assert kwargs["params"] == {"offset": 0, "limit": 100, "deploy_id": 9}
+            runs = polls[state["poll"]][1]
+            return (200, {"runs": runs, "total": len(runs),
+                          "retention_days": 365, "challenge_context": {}})
+        raise AssertionError(f"unexpected {method} {path}")
+    return router
+
+
+def _run(simulation_result_id=1, **fields):
+    return {"simulation_result_id": simulation_result_id, **fields}
+
+
 def test_tail_logs_stops_on_is_settled():
-    c, rec = make_client(lambda *_: (200, {"status": "active",
-                                           "last_status_message": "done",
-                                           "is_settled": True}))
+    c, rec = make_client(_tail_router(
+        (_sub("active", "done", is_settled=True, latest_deploy=None), [])))
     lines = list(c.tail_logs(4, 11))
     assert lines == ["[active] done"]
-    assert rec.last["path"] == "/submissions/challenge/4/11/status"
+    assert rec.last["path"] == "/submissions/submission/11"
 
 
 def test_tail_logs_returns_on_a_never_deployed_submission():
     """`created` is settled — nothing is running on the row. Before the server
     answered that, the client's own terminal list did not contain `created`
-    and the loop never ended."""
-    c, rec = make_client(lambda *_: (200, {"status": "created",
-                                           "last_status_message": None,
-                                           "is_settled": True}))
+    and the loop never ended. Without an attempt there are no runs to ask
+    for."""
+    c, rec = make_client(_tail_router(
+        (_sub("created", is_settled=True, latest_deploy=None), [])))
     assert with_fake_clock(lambda: list(c.tail_logs(4, 11))) == ["[created]"]
     assert len(rec.calls) == 1
 
 
+def test_tail_logs_refuses_a_submission_of_another_challenge():
+    c, _ = make_client(_tail_router(
+        (_sub("active", is_settled=True, challenge_id=5), [])))
+    try:
+        list(c.tail_logs(4, 11))
+        raise AssertionError("expected SubmissionError")
+    except SubmissionError as exc:
+        assert str(exc) == "submission 11 belongs to challenge 5, not 4"
+
+
 def test_tail_logs_does_not_repeat_unchanged_run_lines():
-    state = {"polls": 0}
-
-    def router(method, path, kwargs):
-        state["polls"] += 1
-        if state["polls"] <= 3:
-            return (200, {
-                "status": "deploy_run",
-                "last_status_message": "running",
-                "is_settled": False,
-                "run_info": {"results": [
-                    {"job_status": "running", "env_error_type": None,
-                     "submission_results": [
-                         {"submission_id": 11, "agent_nb_steps": 5,
-                          "score": 1.0, "game_outcome": None,
-                          "agent_error_type": None},
-                     ]},
-                ]},
-            })
-        return (200, {"status": "active", "last_status_message": "done",
-                      "is_settled": True, "run_info": {"results": []}})
-
-    c, _ = make_client(router)
+    running = (_sub("deploy_run", "running", is_settled=False), [
+        _run(job_status="running", env_error_type=None, submission_results=[
+            {"submission_id": 11, "agent_nb_steps": 5, "score": 1.0,
+             "game_outcome": None, "agent_error_type": None},
+        ]),
+    ])
+    c, _ = make_client(_tail_router(
+        running, running, running,
+        (_sub("active", "done", is_settled=True), []),
+    ))
     lines = with_fake_clock(lambda: list(c.tail_logs(4, 11)))
 
     assert lines == [
@@ -310,6 +394,23 @@ def test_tail_logs_does_not_repeat_unchanged_run_lines():
     ], lines
 
 
+def test_tail_logs_prints_the_attempts_runs_oldest_first():
+    """The route pages newest first; the log reads in the order they ran."""
+    def run(simulation_result_id, steps):
+        return _run(simulation_result_id, job_status="completed",
+                    env_error_type=None, submission_results=[
+                        {"submission_id": 11, "agent_nb_steps": steps,
+                         "score": 1.0, "game_outcome": None,
+                         "agent_error_type": None}])
+    c, _ = make_client(_tail_router(
+        (_sub("active", "done", is_settled=True), [run(2, 20), run(1, 10)])))
+    assert list(c.tail_logs(4, 11)) == [
+        "[active] done",
+        "  run: job_status=completed steps=10 score=1.0 outcome=None",
+        "  run: job_status=completed steps=20 score=1.0 outcome=None",
+    ]
+
+
 def test_tail_logs_emits_a_run_line_again_when_it_changes():
     """A run is the one `RunResult` model: `job_status` and `env_error_type`
     are the run's, the caller's steps / reward / errors are on *their own*
@@ -317,27 +418,10 @@ def test_tail_logs_emits_a_run_line_again_when_it_changes():
     the first one (here an opponent's, whose failure must not be printed).
     The env's message is the creator's (null on a participant read), so the
     env line has no message."""
-    state = {"polls": 0}
-
-    def router(method, path, kwargs):
-        state["polls"] += 1
-        if state["polls"] == 1:
-            steps, job_status, agent_error, env_error = 5, "running", None, None
-        elif state["polls"] == 2:
-            steps, job_status, agent_error, env_error = 9, "completed", "code_error", None
-        elif state["polls"] == 3:
-            steps, job_status, agent_error, env_error = 9, "completed", "code_error", "crash"
-        else:
-            return (200, {"status": "deploy_failed", "last_status_message": "crash",
-                          "is_settled": True, "run_info": {"results": []}})
-        return (200, {
-            "status": "deploy_run",
-            "last_status_message": "running",
-            "is_settled": False,
-            "run_info": {"results": [
-                {"job_status": job_status, "env_error_type": env_error,
-                 "env_error_message": None,
-                 "submission_results": [
+    def poll(steps, job_status, agent_error, env_error):
+        return (_sub("deploy_run", "running", is_settled=False), [
+            _run(job_status=job_status, env_error_type=env_error,
+                 env_error_message=None, submission_results=[
                      {"submission_id": 12, "agent_nb_steps": 3,
                       "score": 0.0, "game_outcome": "loser",
                       "agent_error_type": "oom_killed",
@@ -346,11 +430,15 @@ def test_tail_logs_emits_a_run_line_again_when_it_changes():
                       "score": 1.0, "game_outcome": None,
                       "agent_error_type": agent_error,
                       "agent_error_message": "boom" if agent_error else None},
-                 ]},
-            ]},
-        })
+                 ]),
+        ])
 
-    c, _ = make_client(router)
+    c, _ = make_client(_tail_router(
+        poll(5, "running", None, None),
+        poll(9, "completed", "code_error", None),
+        poll(9, "completed", "code_error", "crash"),
+        (_sub("deploy_failed", "crash", is_settled=True), []),
+    ))
     lines = with_fake_clock(lambda: list(c.tail_logs(4, 11)))
 
     assert lines == [
@@ -369,34 +457,22 @@ def test_tail_logs_names_the_platforms_cause_on_a_failed_run_only():
     """A run the platform lost says why on the job (`job_error_type`); a
     `pending` retry carries the previous attempt's cause, which is not a
     failure of this run and is not printed."""
-    state = {"polls": 0}
-
-    def router(method, path, kwargs):
-        state["polls"] += 1
-        if state["polls"] == 1:
-            job_status = "pending"
-        elif state["polls"] == 2:
-            job_status = "failed"
-        else:
-            return (200, {"status": "deploy_failed", "last_status_message": "lost",
-                          "is_settled": True, "run_info": {"results": []}})
-        return (200, {
-            "status": "deploy_run",
-            "last_status_message": "running",
-            "is_settled": False,
-            "run_info": {"results": [
-                {"job_status": job_status, "job_error_type": "pod_failed",
-                 "job_error_message": "ImagePullBackOff",
-                 "env_error_type": None, "env_error_message": None,
-                 "submission_results": [
+    def poll(job_status):
+        return (_sub("deploy_run", "running", is_settled=False), [
+            _run(job_status=job_status, job_error_type="pod_failed",
+                 job_error_message="ImagePullBackOff",
+                 env_error_type=None, env_error_message=None,
+                 submission_results=[
                      {"submission_id": 11, "agent_nb_steps": None,
                       "score": None, "game_outcome": "incomplete",
                       "agent_error_type": None, "agent_error_message": None},
-                 ]},
-            ]},
-        })
+                 ]),
+        ])
 
-    c, _ = make_client(router)
+    c, _ = make_client(_tail_router(
+        poll("pending"), poll("failed"),
+        (_sub("deploy_failed", "lost", is_settled=True), []),
+    ))
     lines = with_fake_clock(lambda: list(c.tail_logs(4, 11)))
 
     assert lines == [
@@ -412,12 +488,9 @@ def test_tail_logs_fails_loudly_on_another_run_shape():
     """The 2.x flat run (`error_type` next to `agent_nb_steps`) is gone from
     the server. A backend still serving it — or any run without
     `submission_results` — must raise here, not print `steps=None` forever."""
-    c, _ = make_client(lambda *_: (200, {
-        "status": "deploy_run", "last_status_message": "running",
-        "is_settled": False,
-        "run_info": {"results": [{"job_status": "running", "agent_nb_steps": 5,
-                                  "error_type": None}]},
-    }))
+    c, _ = make_client(_tail_router(
+        (_sub("deploy_run", "running", is_settled=False),
+         [_run(job_status="running", agent_nb_steps=5, error_type=None)])))
     try:
         with_fake_clock(lambda: list(c.tail_logs(4, 11)))
         raise AssertionError("expected KeyError")
@@ -426,10 +499,8 @@ def test_tail_logs_fails_loudly_on_another_run_shape():
 
 
 def test_tail_logs_raises_on_timeout_instead_of_returning_silently():
-    c, _ = make_client(lambda *_: (200, {"status": "deploy_run",
-                                         "last_status_message": "running",
-                                         "is_settled": False,
-                                         "run_info": {"results": []}}))
+    c, _ = make_client(_tail_router(
+        (_sub("deploy_run", "running", is_settled=False), [])))
     try:
         with_fake_clock(lambda: list(
             c.tail_logs(4, 11, poll_sec=5.0, timeout_sec=10.0)))
@@ -437,6 +508,7 @@ def test_tail_logs_raises_on_timeout_instead_of_returning_silently():
     except SubmissionError as exc:
         assert "timed out after 10.0s" in str(exc)
         assert "still 'deploy_run'" in str(exc)
+        assert "submission(11)" in str(exc)
 
 
 # --------------------------------------------------------------------------- #
@@ -445,25 +517,26 @@ def test_tail_logs_raises_on_timeout_instead_of_returning_silently():
 
 
 def _submit_router(is_deployable=True):
-    """Fake backend for submit(): the status route answers with the block."""
+    """Fake backend for submit(): `submission()` answers with the block."""
     def router(method, path, kwargs):
         if method == "POST" and path == "/submissions/challenge/4":
             return (201, {"submission_id": 11, "status": "created"})
-        if path.startswith("/submissions/runtime_options/"):
-            return (200, [{"id": 7, "language": "python", "framework": "torch"}])
+        if path == "/challenges/4":
+            return (200, {"runtime_options": [
+                {"id": 7, "language": "python", "framework": "torch"}]})
         if path.endswith("/file"):
             return (200, {"message": "File operation successful",
                           "validation_message": "bad name"})
-        if path.endswith("/status"):
-            return (200, {
-                "status": "upload_validated" if is_deployable else "upload_failed",
-                "phase": "upload",
-                "last_status_message": "bad name",
-                "status_update_ts": None,
-                "is_uploadable": True,
-                "is_deployable": is_deployable,
-                "is_settled": True,
-            })
+        if path == "/submissions/submission/11":
+            return (200, _sub(
+                "upload_validated" if is_deployable else "upload_failed",
+                "bad name", is_settled=True, latest_deploy=None,
+                phase="upload", status_update_ts=None, is_uploadable=True,
+                is_deployable=is_deployable,
+            ))
+        if path == "/submissions/submission/11/runs":
+            return (200, {"runs": [], "total": 0, "retention_days": 365,
+                          "challenge_context": {}})
         if path.endswith("/deploy"):
             # 202, as the backend answers an accepted deploy.
             return (202, {"message": "queued"})
@@ -487,8 +560,8 @@ _DEPLOY_409 = {
 
 
 def _submit_router_with(deploy=None, after_deploy=None):
-    """`_submit_router` whose deploy route answers `deploy` and whose status
-    route, once the deploy was called, answers `after_deploy`."""
+    """`_submit_router` whose deploy route answers `deploy` and whose
+    `submission()`, once the deploy was called, answers `after_deploy`."""
     base = _submit_router()
     state = {"deployed": False}
 
@@ -496,7 +569,8 @@ def _submit_router_with(deploy=None, after_deploy=None):
         if path.endswith("/deploy"):
             state["deployed"] = True
             return deploy if deploy is not None else base(method, path, kwargs)
-        if path.endswith("/status") and state["deployed"] and after_deploy is not None:
+        if (path == "/submissions/submission/11" and state["deployed"]
+                and after_deploy is not None):
             return (200, after_deploy)
         return base(method, path, kwargs)
     return router
@@ -515,10 +589,10 @@ def test_submit_with_agent_class_returns_submission_id_and_deploy():
     seq = [(call["method"], call["path"]) for call in rec.calls]
     assert seq == [
         ("POST", "/submissions/challenge/4"),
-        ("GET", "/submissions/runtime_options/4"),
+        ("GET", "/challenges/4"),
         ("PUT", "/submissions/agent_runtime/11"),
         ("PUT", "/submissions/challenge/4/11/file"),
-        ("GET", "/submissions/challenge/4/11/status"),
+        ("GET", "/submissions/submission/11"),
         ("PUT", "/submissions/challenge/4/11/deploy"),
     ], seq
     assert rec.calls[0]["json"] == {"submission_name": "MyAgent"}
@@ -526,7 +600,7 @@ def test_submit_with_agent_class_returns_submission_id_and_deploy():
 
     # status() defaults to the last submission.
     c.status()
-    assert rec.last["path"] == "/submissions/challenge/4/11/status"
+    assert rec.last["path"] == "/submissions/submission/11"
 
 
 def test_submit_with_files_uses_submission_name():
@@ -559,7 +633,7 @@ def test_submit_not_deployable_raises_before_deploy():
     # submission found" right after telling the caller which id to delete.
     assert (c._last_submission_id, c._last_challenge) == (11, 4)
     c.status()
-    assert rec.last["path"] == "/submissions/challenge/4/11/status"
+    assert rec.last["path"] == "/submissions/submission/11"
 
 
 def test_submit_propagates_a_refused_deploy_with_the_servers_limits():
@@ -580,16 +654,15 @@ def test_submit_propagates_a_refused_deploy_with_the_servers_limits():
 
 def _deploy_failed_status(failure_message, last_status_message="deploy failed",
                           failure_owner=None):
-    return {
-        "status": "deploy_failed", "phase": "deployment",
-        "last_status_message": last_status_message, "status_update_ts": None,
-        "is_uploadable": True, "is_deployable": True, "is_settled": True,
-        "latest_deploy": {"id": 9, "created_at_ts": None, "status": "failed",
-                          "finished_at_ts": None,
-                          "failure_message": failure_message,
-                          "failure_owner": failure_owner},
-        "run_info": {"results": []}, "queue_info": {},
-    }
+    return _sub(
+        "deploy_failed", last_status_message, is_settled=True,
+        latest_deploy={"id": 9, "created_at_ts": None, "status": "failed",
+                       "finished_at_ts": None,
+                       "failure_message": failure_message,
+                       "failure_owner": failure_owner},
+        phase="deployment", status_update_ts=None, is_uploadable=True,
+        is_deployable=True,
+    )
 
 
 def test_submit_wait_raises_when_the_deploy_fails():
@@ -605,7 +678,7 @@ def test_submit_wait_raises_when_the_deploy_fails():
         assert str(exc) == "Traceback: ModuleNotFoundError: torch"
         assert exc.status_code is None
         assert exc.body == final
-    assert rec.last["path"] == "/submissions/challenge/4/11/status"
+    assert rec.last["path"] == "/submissions/submission/11"
 
 
 def test_submit_wait_names_the_failure_owner_when_the_verdict_says():
@@ -650,20 +723,21 @@ def test_submit_wait_polls_until_settled_and_returns_the_status():
     assert set(out) == {"submission_id", "deploy", "status"}
     assert out["status"]["is_settled"] is True
     # The wait is a client-side composition of the public routes — no new
-    # endpoint: after the deploy it only polls /status again.
+    # endpoint: after the deploy it only reads the submission again.
     paths = [call["path"] for call in rec.calls]
     after_deploy = paths[paths.index("/submissions/challenge/4/11/deploy") + 1:]
-    assert after_deploy == ["/submissions/challenge/4/11/status"] * 2, after_deploy
+    assert after_deploy == ["/submissions/submission/11"] * 2, after_deploy
 
 
 def test_status_requires_ids():
-    c, _ = make_client()
+    c, rec = make_client()
     try:
         c.status()
         raise AssertionError("expected SubmissionError")
     except SubmissionError as exc:
-        assert "submission_id and challenge_id are required" in str(exc)
-    c.status(submission_id=5, challenge_id=2)
+        assert "submission_id is required" in str(exc)
+    c.status(submission_id=5)
+    assert rec.last["path"] == "/submissions/submission/5"
 
 
 # --------------------------------------------------------------------------- #
@@ -713,7 +787,7 @@ _REWARD_SPEC = {
 
 _CHALLENGE_BLOCK = {
     "challenge_id": 4, "metrics": [_REWARD_SPEC], "window_days": None,
-    "has_gpu": False,
+    "has_gpu": False, "kernel_version": "flex_v1",
 }
 
 _ENVELOPE = {
@@ -722,8 +796,9 @@ _ENVELOPE = {
     "leaders": [{"rank": 1, "username": "jo", "submission_id": 11,
                  "score": 0.7, "score_ci95": None,
                  "metrics": {"reward": 0.7}, "metrics_window": None,
-                 "is_my_submission": False, "passed": True}],
+                 "is_my_submission": False, "can_open": True, "passed": True}],
     "me": {"rank": 4, "percentile": 66.7, "row": {}, "neighbors": []},
+    "around": None,
     "matches": [{"rank": 1, "username": "jo"}],
     "course_context": {"course_id": 3, "pass_threshold": 0.5},
 }
@@ -1015,7 +1090,8 @@ def _call_warns(fn, *args, **kwargs):
 
 
 def test_every_renamed_method_is_an_alias_of_a_real_method():
-    for old, new in client_module._RENAMED_METHODS.items():
+    for old, new in {**client_module._RENAMED_METHODS,
+                     **client_module._KEYED_BY_SUBMISSION_METHODS}.items():
         alias = getattr(MLArenaClient, old)
         assert alias.__doc__ == f"Deprecated alias for :meth:`{new}`.", old
         target = getattr(MLArenaClient, new)
@@ -1041,11 +1117,12 @@ def test_old_submission_method_names_forward_to_new_wire():
     assert any("copy_from_agent_id= is deprecated" in m for m in msgs), msgs
 
     _, msgs = _call_warns(c.agent_status, 4, attache_agent_id=11)
-    assert rec.last["path"] == "/submissions/challenge/4/11/status"
+    assert rec.last["path"] == "/submissions/submission/11"
+    assert any("agent_status() is deprecated, use .submission()" in m for m in msgs)
     assert any("attache_agent_id= is deprecated, use submission_id=" in m for m in msgs)
 
     _, msgs = _call_warns(c.agent_games, 11)
-    assert rec.last["path"] == "/submissions/submission/11/games"
+    assert rec.last["path"] == "/submissions/submission/11/runs"
 
     _, msgs = _call_warns(c.deploy_agent, 4, 11)
     assert rec.last["path"] == "/submissions/challenge/4/11/deploy"
@@ -1074,8 +1151,8 @@ def test_old_upload_names_and_status_agent_id():
     _call_warns(c.update_agent_file_content, 4, 11, "agent.py", "x")
     assert rec.last["files"]["file"][0] == "agent.py"
 
-    _, msgs = _call_warns(c.status, agent_id=5, challenge_id=2)
-    assert rec.last["path"] == "/submissions/challenge/2/5/status"
+    _, msgs = _call_warns(c.status, agent_id=5)
+    assert rec.last["path"] == "/submissions/submission/5"
     assert any("agent_id= is deprecated, use submission_id=" in m for m in msgs), msgs
 
 
@@ -1161,9 +1238,10 @@ def test_a_missing_submission_is_a_submission_not_found_error():
     c, _ = make_client(lambda *_: (404, {"error": "Submission not found"}))
 
     for call in (
-        lambda: c.submission_status(4, 11),
-        lambda: c.submission_games(11),
-        lambda: c.submission_overview(4, 11),
+        lambda: c.submission(11),
+        lambda: c.submission_runs(11),
+        lambda: c.submission_deploys(11),
+        lambda: c.update_submission(11, submission_name="v2"),
         lambda: c.submission_deploy_status(4, 11),
         lambda: c.delete_submission(4, 11),
         lambda: c.set_submission_visibility(11, True),
@@ -1226,11 +1304,11 @@ def test_every_http_refusal_carries_status_code_and_body():
         (401, AuthenticationError, "Invalid or missing API credentials."),
         (403, PermissionDeniedError, "Access denied"),
         (404, SubmissionNotFoundError, "Not found"),
-        (500, SubmissionError, "submission_status failed: request failed"),
+        (500, SubmissionError, "submission failed: request failed"),
     ):
         c, _ = make_client(lambda *_, code=code: (code, {}))
         try:
-            c.submission_status(4, 11)
+            c.submission(11)
             raise AssertionError(f"expected {cls.__name__}")
         except cls as exc:
             assert str(exc) == message, (code, str(exc))
@@ -1244,7 +1322,7 @@ def test_every_http_refusal_carries_status_code_and_body():
     c, _ = make_client()
     c._request = lambda *a, **k: NoJson(502)
     try:
-        c.submission_status(4, 11)
+        c.submission(11)
         raise AssertionError("expected SubmissionError")
     except SubmissionError as exc:
         assert exc.status_code == 502
@@ -1261,10 +1339,11 @@ def test_exception_classes_follow_their_section():
     """The runtime methods raised `MLArenaError` while every other submission
     method raises `SubmissionError`; `replays` (a challenge read) raised
     `SubmissionError`. `SubmissionError` is an `MLArenaError`, so `except
-    MLArenaError` around the runtime calls keeps working."""
+    MLArenaError` around the runtime calls keeps working. `runtime_options`
+    is a read of the challenge (4.6.0), so it raises the challenge's
+    error."""
     c, _ = make_client(lambda *_: (500, {"error": "down"}))
-    for call in (lambda: c.runtime_options(4),
-                 lambda: c.agent_runtime(11),
+    for call in (lambda: c.agent_runtime(11),
                  lambda: c.set_agent_runtime(11, 7)):
         try:
             call()
@@ -1278,6 +1357,13 @@ def test_exception_classes_follow_their_section():
         raise AssertionError("replays is a challenge read, not a submission error")
     except mlarena.MLArenaError as exc:
         assert str(exc) == "replays failed: down"
+    try:
+        c.runtime_options(4)
+        raise AssertionError("expected MLArenaError")
+    except SubmissionError:
+        raise AssertionError("runtime_options is a challenge read")
+    except mlarena.MLArenaError as exc:
+        assert str(exc) == "challenge failed: down"
 
 
 def test_create_submission_404_names_the_id_that_is_wrong():
@@ -1320,25 +1406,34 @@ def test_my_submissions_route_and_shape():
     assert out["deployment_limits"]["daily_deploys_remaining"] == 3
 
 
-def test_set_submission_visibility_route_and_body():
-    c, rec = make_client(lambda *_: (200, {"is_public": True}))
+def test_old_submission_reads_forward_to_the_submission():
+    """`submission_status(cid, sid)` and `submission_overview(cid, sid)` read
+    the one submission route (4.6.0): the challenge id is dropped, the reply
+    is the `submission()` shape. `submission_games(sid)` is `submission_runs`."""
+    c, rec = make_client(lambda *_: (200, {"id": 11, "viewer_role": "owner"}))
 
-    out = c.set_submission_visibility(11, True)
+    for old in ("submission_status", "submission_overview"):
+        out, msgs = _call_warns(getattr(c, old), 4, 11)
+        assert out == {"id": 11, "viewer_role": "owner"}
+        assert (rec.last["method"], rec.last["path"]) == ("GET", "/submissions/submission/11")
+        assert any(f"{old}() is deprecated, use .submission()" in m for m in msgs), msgs
+    _call_warns(c.submission_status, challenge_id=4, submission_id=11)
+    assert rec.last["path"] == "/submissions/submission/11"
+    _call_warns(c.submission_overview, competition_id=4, submission_id=11)
+    assert rec.last["path"] == "/submissions/submission/11"
 
-    assert rec.last["method"] == "PUT"
-    assert rec.last["path"] == "/submissions/submission/11/visibility"
-    assert rec.last["json"] == {"is_public": True}
-    assert out == {"is_public": True}
+    _, msgs = _call_warns(c.submission_games, 11)
+    assert rec.last["path"] == "/submissions/submission/11/runs"
+    assert any("submission_games() is deprecated, use .submission_runs()" in m
+               for m in msgs), msgs
 
 
-def test_submission_overview_route():
-    c, rec = make_client(lambda *_: (200, {"rank": 2, "agent_error_type": None}))
-
-    out = c.submission_overview(4, 11)
-
-    assert rec.last["method"] == "GET"
-    assert rec.last["path"] == "/submission_result/4/11/overview"
-    assert out["rank"] == 2
+def test_leaderboard_sends_around_only_when_passed():
+    c, rec = make_client(lambda *_: (200, {**_ENVELOPE, "leaders": []}))
+    c.leaderboard(4)
+    assert "around" not in (rec.last["params"] or {})
+    c.leaderboard(4, around=11)
+    assert rec.last["params"] == {"around": 11}
 
 
 def test_the_client_reads_no_retired_payload_key():

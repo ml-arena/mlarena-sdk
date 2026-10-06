@@ -2,6 +2,65 @@
 
 Python SDK for [ML Arena](https://ml-arena.com) — make submissions, manage challenges, manage courses, and read leaderboards from any notebook or IDE.
 
+## 4.6.0 — the submission's page
+
+Requires a platform with the submission page routes; 4.5.0 and older fail on
+it (`submission_status()`, `submit()`, `tail_logs()` read routes that are
+gone).
+
+- New: `submission(submission_id)` (`GET /api/submissions/submission/{sid}`)
+  — the one read of a submission, for every reader of it: its owner, a
+  teammate, the challenge's staff, the owner's teacher, and anyone signed in
+  when it is public. It carries the status block, `owner`, `team`,
+  `viewer_role` (`owner` | `teammate` | `staff` | `teacher` | `public`),
+  `agent_runtime`, `latest_deploy` (None before the first deploy),
+  `queue_info`, the board numbers under the leaderboard row's names (`score`,
+  `score_ci95`, `metrics`, `metrics_window`, `number_of_runs`,
+  `last_end_run_ts`, `action_time_max_sec`,
+  `agent_metric_total_ram_max_bytes`, `agent_metric_vram_max_bytes`) and
+  `latest_run_failure`.
+- New: `update_submission(submission_id, *, submission_name=None,
+  is_public=None)` (`PATCH`), `rename_submission(submission_id, name)`;
+  `set_submission_visibility()` now calls `update_submission` and returns
+  the submission. Owner only; a deleted submission is a 409.
+- New: `submission_runs(submission_id, *, deploy_id=None, is_test=None,
+  offset=0, limit=20)` → `{runs, total, retention_days, challenge_context}`,
+  and `submission_deploys(submission_id)` → `{deploys}`, every attempt
+  newest first. A run carries `submission_deploy_id`.
+- New: `leaderboard(..., around=<submission_id>)` serves that submission's
+  row with its neighbours under `around`. Rows carry `can_open` (you may
+  read that submission), `is_my_submission` is true on your team's row too,
+  and the `challenge` block carries `kernel_version`.
+- `challenge()` carries `entry_filename`: the one file the challenge runs or
+  scores (`agent.py` on a code challenge, `submission_filename` on a file
+  challenge, None on a chat challenge).
+- Deprecated (`DeprecationWarning`): `submission_status(cid, sid)` and
+  `submission_overview(cid, sid)` forward to `submission(sid)` and return
+  its shape — there is no `run_info` (use `submission_runs(sid,
+  deploy_id=...)`) and no `rank` (use `leaderboard(cid, around=sid)`).
+  `submission_games(sid)` forwards to `submission_runs(sid)`: the rows are
+  under `runs`, not `games`.
+- `list_submission_files()` returns metadata only: `{"files": [{name, size,
+  role, language}]}`, the entry file first, then the reports, then the rest.
+  `role` is `entry`, `report` (a `README.md`, any case, or a `.pdf`) or
+  `other`; read a text file with `get_submission_file_content()`, which
+  answers 400 for a file listed without a `language`.
+- **Removed:** `upload_submission_docs()` and `delete_submission_docs()`. A
+  report is a plain file of the submission: upload a `README.md` or a PDF
+  with `upload_submission_file()` (a file challenge takes it next to its
+  `submission_filename`, and scores only that file).
+- **Breaking:** `status(submission_id=None)` takes no `challenge_id`.
+  `submission_deploy_status()` no longer carries `latest_deploy` (it is
+  `submission()["latest_deploy"]`). `runtime_options(cid)` reads
+  `challenge(cid)["runtime_options"]` and raises the challenge's errors;
+  `agent_runtime(sid)` reads `submission(sid)["agent_runtime"]`.
+- `delete_submission()` on a chat challenge raises `SubmissionError` (409,
+  `kernel_version` on `.body`): the team's submission is its score line.
+- `tail_logs()` polls `submission()` and the latest attempt's runs
+  (`submission_runs(sid, deploy_id=latest_deploy["id"])`), printed oldest
+  first, and raises `SubmissionError` when the submission is not of
+  `challenge_id`.
+
 ## 4.5.0 — no live-data reads
 
 Requires a platform without the `/api/data_sources/*` proxy.
@@ -779,22 +838,21 @@ Create a client. `api_key` must be the full `mlk_<scope>_<lookup>_<secret>` toke
 - `client.copyable_submissions()` — your submissions that can seed a new one (the ids `copy_from_submission_id` takes), across every challenge.
 - `client.upload_submission_file(challenge_id, submission_id, file_path)` — multipart upload from disk. The file is stored under its basename: on a file challenge that name must be `challenge(cid)["submission_filename"]`, which is not always `submission.csv`.
 - `client.update_submission_file_content(challenge_id, submission_id, filename, content)` — upload from a string (template render → upload).
-- `client.list_submission_files(challenge_id, submission_id)` — list files with their content / binary marker.
+- `client.list_submission_files(challenge_id, submission_id)` — the files' metadata: `name`, `size`, `role` (`entry` | `report` | `other`) and `language` (None when the file is not served as text: download it).
 - `client.get_submission_file_content(challenge_id, submission_id, filename)` — fetch one file's text.
 - `client.download_submission_file(challenge_id, submission_id, filename, dest_dir=".")` — write one file to disk byte-for-byte; the only way to get binary files (model weights) back out.
 - `client.delete_submission_file(challenge_id, submission_id, filename)`
-- `client.upload_submission_docs(challenge_id, submission_id, file_path)` — attach a markdown write-up to an **active** submission (`.md` only); does not touch its status.
-- `client.delete_submission_docs(challenge_id, submission_id, filename)`
 - `client.deploy_submission(challenge_id, submission_id)`
-- `client.delete_submission(challenge_id, submission_id)`
+- `client.delete_submission(challenge_id, submission_id)` — a chat challenge's submission cannot be deleted (409).
 - `client.my_submissions()` — every submission you have made, across every challenge, with `deployment_limits`.
-- `client.set_submission_visibility(submission_id, is_public)` — show or hide a submission in public listings.
-- `client.submission_status(challenge_id, submission_id)` — rich status: the status block (see below) plus `submission_name`, `queue_info`, `run_info`, `latest_deploy`.
-- `client.submission_deploy_status(challenge_id, submission_id)` — deploy quotas + last deploy.
-- `client.submission_overview(challenge_id, submission_id)` — aggregate score, rank, last-24h resource use and the newest run's failure.
-- `client.submission_games(submission_id)` — recent games with signed replay file URLs (replays are kept 60 days). Each row's `run` is the same run shape `submission_status` serves.
+- `client.submission(submission_id)` — the submission as its page reads it: the status block (see below), `owner`, `team`, `viewer_role`, `agent_runtime`, `latest_deploy`, `queue_info`, its board numbers and `latest_run_failure`. Readable by its owner, a teammate, the challenge's staff, the owner's teacher, and anyone signed in when it is public.
+- `client.update_submission(submission_id, *, submission_name=None, is_public=None)` — rename it, publish or unpublish it (owner only).
+- `client.rename_submission(submission_id, name)`, `client.set_submission_visibility(submission_id, is_public)` — the two halves of `update_submission`. Public opens its code, runs and replays to anyone signed in.
+- `client.submission_runs(submission_id, *, deploy_id=None, is_test=None, offset=0, limit=20)` — its runs of the last `retention_days` days (364: the replay bucket keeps a replay 365 days), newest first, paged, each with its signed replay URL; `deploy_id` keeps one attempt's runs.
+- `client.submission_deploys(submission_id)` — every deploy attempt, newest first.
+- `client.submission_deploy_status(challenge_id, submission_id)` — your two deploy quotas.
 - `client.tail_logs(challenge_id, submission_id, follow=False, poll_sec=5.0, timeout_sec=None)` — generator of status / run lines; stops on `is_settled`, emits a line only when what it says changed, and raises `SubmissionError` if `timeout_sec` runs out.
-- `client.status(submission_id=None, challenge_id=None)` — defaults to the last submission.
+- `client.status(submission_id=None)` — `submission()`, by default of the last submission.
 
 #### Submission status block
 
@@ -812,15 +870,15 @@ you never have to keep a list of status strings of your own:
 | `is_settled` | nothing is in flight — a poller may stop |
 
 ```python
-st = c.submission_status(cid, sid)
+st = c.submission(sid)
 if st["is_deployable"]:
     c.deploy_submission(cid, sid)
 ```
 
 #### Why a run ended
 
-`submission_status()["run_info"]["results"]` and `submission_games()["games"]`
-serve the same `RunResult`. A run carries the job's own `job_status`
+`submission_runs()["runs"]` (like `creator_runs()`) serves the one
+`RunResult`. A run carries the job's own `job_status`
 (`pending` | `running` | `completed` | `failed` | `cancelled`),
 `env_nb_steps`, the env's resource columns and, when the challenge's own code
 is why it ended, `env_error_type` (`code_error` | `timeout` | `oom_killed` |
@@ -838,7 +896,8 @@ run ended, `agent_error_type` (the same values) with
 others are the opponents:
 
 ```python
-for run in c.submission_status(cid, sid)["run_info"]["results"]:
+latest = c.submission(sid)["latest_deploy"]
+for run in c.submission_runs(sid, deploy_id=latest["id"])["runs"]:
     mine = next(r for r in run["submission_results"] if r["submission_id"] == sid)
     if mine["agent_error_type"]:
         print("my agent:", mine["agent_error_type"], mine["agent_error_message"])
@@ -849,15 +908,15 @@ for run in c.submission_status(cid, sid)["run_info"]["results"]:
 `agent_error_message` and `agent_stdout_logs` are `None` on a row that is not
 yours; a run's `job_error_message` is `None` unless you are the challenge's
 staff. A failed `latest_deploy` names who its verdict blames in
-`failure_owner` (`participant` | `challenge` | `platform`). `run_info` and `latest_deploy` are served in **every** post-deploy
-state, so the reason a deploy failed is still there once it has failed.
-`submission_overview()` summarises the newest run under the same names:
-`agent_error_type` / `agent_error_message`.
+`failure_owner` (`participant` | `challenge` | `platform`); every attempt
+is in `submission_deploys()`, and its runs stay readable once it has failed.
+`submission()["latest_run_failure"]` names the newest scored run's failure
+under the same names: `agent_error_type` / `agent_error_message`.
 
 ### Runners (DockerImageAgentRuntime, user scope)
 
-- `client.runtime_options(challenge_id)` — list runtimes compatible with the challenge.
-- `client.agent_runtime(submission_id)` — read the agent runtime currently pinned to a submission; `None` for a file or chat challenge's submission, which runs no agent container.
+- `client.runtime_options(challenge_id)` — list runtimes compatible with the challenge (`challenge(challenge_id)["runtime_options"]`).
+- `client.agent_runtime(submission_id)` — the agent runtime pinned to a submission (`submission(submission_id)["agent_runtime"]`); `None` for a file or chat challenge's submission, which runs no agent container.
 - `client.set_agent_runtime(submission_id, runtime_id)` — pin a runtime by id.
 - `client.resolve_runtime(challenge_id, language=None, framework=None, framework_version=None)` — resolve a (lang, framework, version) spec to one runtime row.
 
@@ -888,9 +947,9 @@ for line in c.tail_logs(cid, sid):
     print(line)
 
 # 5. Save the replays of completed games (frames, a video or a still; 365-day retention)
-for game in c.submission_games(sid)["games"]:
-    if game["replay"]:
-        print(c.download_replay(game, "replays/"))
+for run in c.submission_runs(sid)["runs"]:
+    if run["replay"]:
+        print(c.download_replay(run, "replays/"))
 
 # 6. Read the leaderboard
 print(c.leaderboard(cid).head())
@@ -1073,7 +1132,7 @@ client.update_settings(challenge_id, metrics=[
 
 - `metrics` replaces the whole list; the server validates it on the merged state (400 names the rule). Once the challenge has started only `label`, `unit`, `precision`, `format` and `visible` may change; `window_days` is frozen.
 - `window_days` (≥ 1) also folds every key over the last `window_days` days: `metrics_window` on the rows, `metrics_window_<key>` in the DataFrame.
-- A submission's values read everywhere as `score` (the ranking spec's value) + `metrics` (`{key: value}`): `leaderboard()`, `submission_overview()`, `creator_submissions()`. Where one object carries both values and the declaration, the declaration sits under `evaluation: {metrics, window_days}` (`submission_overview()`). Course payloads carry `metric` — the ranking spec — and `value`, the best submission's `score`.
+- A submission's values read everywhere as `score` (the ranking spec's value) + `metrics` (`{key: value}`): `leaderboard()`, `submission()`, `creator_submissions()`. The declaration is the board's `challenge` block (`leaderboard()`'s `df.attrs["metrics"]`). Course payloads carry `metric` — the ranking spec — and `value`, the best submission's `score`.
 
 ## Get your API key
 

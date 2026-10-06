@@ -2055,19 +2055,19 @@ class MLArenaClient:
         The file is stored under its basename, so the name matters: a
         ``file_v1`` challenge accepts exactly the file it configured, and
         anything else is rejected with ``"<name> file not found"``. Read the
-        name from ``challenge(challenge_id)["submission_filename"]`` rather
-        than assuming ``submission.csv`` — a challenge may ask for
-        ``pitch.txt`` or ``submission.csv.gz``. (On a ``flex_v1`` challenge the
-        entry point is ``agent.py``, plus any helper files.)
+        name from ``challenge(challenge_id)["entry_filename"]`` rather than
+        assuming ``submission.csv`` — a challenge may ask for ``pitch.txt`` or
+        ``submission.csv.gz``; on a code challenge it is ``agent.py``, plus any
+        helper files.
 
         Returns the server response: ``message``, ``validation_message`` and the
-        status block (see ``submission_status()``).
+        status block (see ``submission()``).
         Note: the file route returns HTTP 200 even when validation *rejects* the
         submission — the file is saved but the whole submission is re-validated and
         may come back ``status == "upload_failed"`` with an actionable
         ``validation_message``. A 2xx here is not proof the submission is deployable;
         read ``is_deployable`` (``submit()`` checks it once, on
-        ``submission_status()``, after every pre-deploy step and before deploying)."""
+        ``submission()``, after every pre-deploy step and before deploying)."""
         if not os.path.isfile(file_path):
             raise SubmissionError(f"File not found: {file_path}")
         with open(file_path, "rb") as fh:
@@ -2114,11 +2114,10 @@ class MLArenaClient:
         return resp.json()
 
     def submission_deploy_status(self, challenge_id: int, submission_id: int) -> dict:
-        """Read the deploy quotas and last deploy of a submission.
+        """Read the two deploy quotas of a submission's owner.
 
         Mirrors `GET /api/submissions/challenge/{cid}/{sid}/deploy`
-        (`deploy.py`). Snake_case, like every other payload — the envelope keys
-        were `deploymentLimits` / `latestDeploy` until 2.1.0.
+        (`deploy.py`).
 
         - `deployment_limits` — `daily_deploy_limit`, `daily_deploys_used`,
           `daily_deploys_remaining`, `next_deploy_available_at`, `can_deploy`.
@@ -2129,15 +2128,9 @@ class MLArenaClient:
           team's) submissions on this challenge that are active *or*
           deploying (`deploy_queue` / `deploy_run`): a deploy in flight
           already holds one of the slots.
-        - `latest_deploy` — the attempt's own outcome: `id`, `created_at_ts`,
-          `status` (`queued` | `running` | `succeeded` | `failed` |
-          `cancelled`), `finished_at_ts`, `failure_message` and
-          `failure_owner` — who a `failed` attempt's verdict blames
-          (`participant`: your code or file; `challenge`: the challenge's
-          env, or the challenge changed under the attempt; `platform`: the
-          runners lost the runs); None unless `failed`, and on a legacy
-          failed attempt whose verdict did not say. All-null when the
-          submission has never deployed.
+
+        The latest attempt is the submission's own:
+        `submission(submission_id)["latest_deploy"]` (4.6.0 moved it there).
         """
         resp = self._request("GET",
             self._url(
@@ -2160,6 +2153,10 @@ class MLArenaClient:
         deploy attempt still open is cancelled — one route, one effect. (The
         console used to have a second delete route of its own that left the
         files behind.)
+
+        A chat challenge's submission cannot be deleted: it is the team's
+        score line, and the backend answers 409 (`SubmissionError`, with
+        `kernel_version` on `.body`).
         """
         resp = self._request("DELETE",
             self._url(
@@ -2178,8 +2175,8 @@ class MLArenaClient:
     def runtime_options(self, challenge_id: int):
         """List runtimes (language × framework × version) compatible with this challenge.
 
-        Mirrors `GET /api/submissions/runtime_options/{cid}`
-        (`runtime.py`, `get_runtime_options`). Each entry: `{id, language,
+        The challenge's own `runtime_options` (`challenge(challenge_id)`,
+        `GET /api/challenges/{id}`). Each entry: `{id, language,
         language_version, framework, framework_version, requirement,
         display_name, packages}` — `display_name` is the runtime's one name
         (`"PyTorch"`, `"scikit-learn · XGBoost · LightGBM"`, `"No
@@ -2187,32 +2184,16 @@ class MLArenaClient:
         (`[]` for no framework); both None only on a runtime no image sync
         has written since the platform added them.
         """
-        resp = self._request("GET",
-            self._url(f"/submissions/runtime_options/{challenge_id}"),
-            headers=self._headers(),
-            timeout=30,
-        )
-        self._handle_response(resp)
-        if resp.status_code != 200:
-            raise _failed(SubmissionError, "runtime_options", resp)
-        return _to_dataframe(resp.json())
+        return _to_dataframe(self.challenge(challenge_id)["runtime_options"])
 
     def agent_runtime(self, submission_id: int) -> dict | None:
         """Agent runtime currently pinned to a submission, or None when it pins
         none: a file or chat challenge's submission runs no agent container.
 
-        Mirrors `GET /api/submissions/agent_runtime/{sid}` (`runtime.py`,
-        `get_agent_runtime`).
+        The submission's own `agent_runtime` (`submission(submission_id)`),
+        the entry shape `runtime_options()` lists.
         """
-        resp = self._request("GET",
-            self._url(f"/submissions/agent_runtime/{submission_id}"),
-            headers=self._headers(),
-            timeout=30,
-        )
-        self._handle_response(resp, not_found=SubmissionNotFoundError)
-        if resp.status_code != 200:
-            raise _failed(SubmissionError, "agent_runtime", resp)
-        return resp.json()
+        return self.submission(submission_id)["agent_runtime"]
 
     def set_agent_runtime(self, submission_id: int, runtime_id: int) -> dict:
         """Pin a `DockerImageAgentRuntime` onto a submission.
@@ -2262,13 +2243,24 @@ class MLArenaClient:
     # ---- File listing / reading / editing / deleting ----
 
     def list_submission_files(self, challenge_id: int, submission_id: int) -> dict:
-        """List files in a submission with their content (or binary marker).
+        """List the files of a submission: metadata only.
 
         Mirrors `GET /api/submissions/challenge/{cid}/{sid}/file` (`file.py`,
-        `get_submission_files`). Returns the raw
-        `{"files": {<name>: {content, language, is_binary, size}}}` payload —
-        keep the wrapper shallow so callers can drill into either the file map
-        or the metadata.
+        `get_submission_files`). Returns `{"files": [{name, size, role,
+        language}, ...]}`, the entry file first, then the reports, then the
+        rest, each group by name:
+
+        - `role` — `entry` (the file the challenge runs or scores: `agent.py`,
+          or a file challenge's `submission_filename`), `report` (a
+          `README.md` in any case, rendered on the submission's page, or any
+          `.pdf`), or `other`.
+        - `language` — how the console highlights it (`python`, `markdown`,
+          `plaintext`, …), or None when the file is not served as text (a
+          binary or PDF, over 1 MB, or not UTF-8): download it with
+          `download_submission_file()`.
+
+        A text file's content is `get_submission_file_content()`. Readable by
+        every reader of the submission (see `submission()`).
         """
         resp = self._request("GET",
             self._url(
@@ -2287,7 +2279,9 @@ class MLArenaClient:
         """Fetch the raw text content of one file in a submission.
 
         Mirrors `GET /api/submissions/challenge/{cid}/{sid}/file/{filename}/content`
-        (`file.py`, `get_file_content`).
+        (`file.py`, `get_file_content`). A file listed with `language: None`
+        is not text: the backend answers 400 (`SubmissionError`); use
+        `download_submission_file()`.
         """
         resp = self._request("GET",
             self._url(
@@ -2354,8 +2348,7 @@ class MLArenaClient:
         this writes the bytes as they are, so it is the only way to get model
         weights (`.pt`, `.pkl`, …) back out of a submission.
 
-        Readable for the owner, for a public submission, and for the teacher
-        of the submitter.
+        Readable by every reader of the submission (see `submission()`).
         """
         os.makedirs(dest_dir, exist_ok=True)
         resp = self._request("GET",
@@ -2375,54 +2368,6 @@ class MLArenaClient:
                 if chunk:
                     fh.write(chunk)
         return out_path
-
-    # ---- Submission documentation (markdown shown on the submission page) ----
-
-    def upload_submission_docs(self, challenge_id: int, submission_id: int,
-                               file_path: str) -> dict:
-        """Attach a markdown write-up to an active submission.
-
-        Mirrors `PUT /api/submissions/challenge/{cid}/{sid}/docs` (`file.py`,
-        `manage_documentation`) — what the console's Documentation panel does.
-        Only `.md` files are accepted, and only while the submission is
-        `active`: the route does not touch its status, so documentation can be
-        added after a deploy without re-validating anything.
-        """
-        if not os.path.isfile(file_path):
-            raise SubmissionError(f"File not found: {file_path}")
-        with open(file_path, "rb") as fh:
-            resp = self._request("PUT",
-                self._url(
-                    f"/submissions/challenge/{challenge_id}/{submission_id}/docs"
-                ),
-                headers=self._headers(),
-                files={"file": (os.path.basename(file_path), fh)},
-                timeout=120,
-            )
-        self._handle_response(resp, not_found=SubmissionNotFoundError)
-        if resp.status_code != 200:
-            raise _failed(SubmissionError, "upload_submission_docs", resp)
-        return resp.json()
-
-    def delete_submission_docs(self, challenge_id: int, submission_id: int,
-                               filename: str) -> dict:
-        """Remove one markdown documentation file from an active submission.
-
-        Mirrors `DELETE /api/submissions/challenge/{cid}/{sid}/docs?filename=`
-        (`file.py`, `manage_documentation`).
-        """
-        resp = self._request("DELETE",
-            self._url(
-                f"/submissions/challenge/{challenge_id}/{submission_id}/docs"
-            ),
-            headers=self._headers(),
-            params={"filename": filename},
-            timeout=30,
-        )
-        self._handle_response(resp, not_found=SubmissionNotFoundError)
-        if resp.status_code != 200:
-            raise _failed(SubmissionError, "delete_submission_docs", resp)
-        return resp.json()
 
     def copyable_submissions(self) -> dict:
         """Your submissions that can seed a new one, across every challenge.
@@ -2444,167 +2389,196 @@ class MLArenaClient:
             raise _failed(SubmissionError, "copyable_submissions", resp)
         return resp.json()
 
-    # ---- Status / logs ----
+    # ---- The submission's page: the submission, its runs, its attempts ----
 
-    def submission_status(self, challenge_id: int, submission_id: int) -> dict:
-        """Rich submission status: the status block, `queue_info`, `run_info`.
+    def submission(self, submission_id: int) -> dict:
+        """The submission, as every reader of its page sees it.
 
-        Mirrors `GET /api/submissions/challenge/{cid}/{sid}/status`
-        (`status.py`). Use this over `submission_deploy_status` when you want
-        to see queue position or per-run errors.
+        Mirrors `GET /api/submissions/submission/{sid}` (`read.py`,
+        `SubmissionOut`). Readable by its owner, a member of the owner's team
+        on the challenge, the challenge's staff (admin, creator, creator
+        assistant), the owner's teacher, and anyone signed in when it is
+        public; a 404 (`SubmissionNotFoundError`) for everyone else.
 
-        Returns `id`, `challenge_id`, `submission_name`, `user_id`,
-        `created_at_ts`, `is_public`, `is_owner`, the three blocks below, and
-        the status block every submission payload carries:
+        Returns `id`, `challenge_id`, `submission_name`, `created_at_ts`,
+        `is_public`, and:
 
-        - `status` — one of `created`, `upload_failed`, `upload_validated`,
-          `deploy_queue`, `deploy_run`, `deploy_failed`, `active`, `deleted`.
-          (A file upload is one request that ends validated or failed, so
-          there is no `uploading` state on the wire.)
-        - `phase` — `upload` | `deployment` | `active` | `terminal`.
-        - `last_status_message` — the row's latest message, or None. None
-          too on someone else's public submission: a failed deploy's message
-          quotes the agent's traceback (the same rule as
-          `latest_deploy.failure_message`).
-        - `status_update_ts` — ISO-8601 UTC, or None.
-        - `is_uploadable` / `is_deployable` / `is_settled` — the server's own
-          answer to "may I upload / deploy / stop polling". Read these instead
-          of comparing `status` against a set of your own.
+        - the status block every submission payload carries: `status` (one
+          of `created`, `upload_failed`, `upload_validated`, `deploy_queue`,
+          `deploy_run`, `deploy_failed`, `active`, `deleted`), `phase`
+          (`upload` | `deployment` | `active` | `terminal`),
+          `last_status_message`, `status_update_ts`, and `is_uploadable` /
+          `is_deployable` / `is_settled` — the server's own answer to "may I
+          upload / deploy / stop polling". Read these instead of comparing
+          `status` against a set of your own.
+        - `owner` — `{user_id, username, avatar_key}`; `team` — the owner's
+          team on the challenge, `{id, name, members: [{id, username,
+          avatar_key}]}`, or None.
+        - `viewer_role` — your standing on it: `owner` | `teammate` | `staff`
+          | `teacher` | `public`. Only the owner writes (`update_submission`,
+          uploads, deploy, delete).
+        - `agent_runtime` — the pinned runtime (the `runtime_options()` entry
+          shape), None on a kernel without agent containers.
+        - `latest_deploy` — the newest attempt (`submission_deploys()` row:
+          `id`, `created_at_ts`, `status` — `queued` | `running` |
+          `succeeded` | `failed` | `cancelled` —, `finished_at_ts`,
+          `failure_message`, `failure_owner`), None before the first deploy.
+          `failure_owner` says who a `failed` attempt's verdict blames:
+          `participant` (your code or file), `challenge` (the challenge's
+          env, or the challenge changed under the attempt) or `platform`
+          (the runners lost the runs).
+        - `queue_info` — `queue_position`, `queue_total`, `created_at_ts`,
+          `in_queue_for_second`; all-null when nothing is queued.
+        - the numbers of its board line, under the leaderboard row's names:
+          `score`, `score_ci95`, `metrics`, `metrics_window`,
+          `number_of_runs`, `last_end_run_ts`, `action_time_max_sec`,
+          `agent_metric_total_ram_max_bytes`, `agent_metric_vram_max_bytes`.
+          Its rank is the board's: `leaderboard(cid, around=submission_id)`.
+        - `latest_run_failure` — the newest scored run when it failed
+          (`simulation_result_id`, `created_at_ts`, `job_status`,
+          `job_error_type`, `env_error_type`, `agent_error_type`,
+          `agent_error_message`), else None.
 
-        The three blocks have the same keys in *every* state — they used to
-        appear only inside their own phase, so the reason a deploy failed
-        vanished the moment it failed:
+        `last_status_message`, `latest_deploy.failure_message` and
+        `latest_run_failure.agent_error_message` quote the agent's own
+        traceback: they are None for a `public` reader.
+        """
+        resp = self._request("GET",
+            self._url(f"/submissions/submission/{submission_id}"),
+            headers=self._headers(),
+            timeout=30,
+        )
+        self._handle_response(resp, not_found=SubmissionNotFoundError)
+        if resp.status_code != 200:
+            raise _failed(SubmissionError, "submission", resp)
+        return resp.json()
 
-        - `latest_deploy` — the most recent attempt: `id`, `created_at_ts`,
-          `status`, `finished_at_ts`, `failure_message`, `failure_owner`
-          (`participant` | `challenge` | `platform`, see
-          `submission_deploy_status`; None unless `failed`). All-null before
-          the first deploy.
-        - `run_info` — `submission_deploy_id`, `number_of_agents`, `has_gpu`,
-          `metrics` (the challenge's MetricSpec declaration; None before the
-          first deploy) and `results`, that attempt's runs.
-          Each run is a `RunResult`, the one run model every run list on the
-          API serves (`submission_games` too): the job's own `job_status`
-          (`pending` | `running` | `completed` | `failed` | `cancelled`),
-          `job_started_at_ts`, `job_completed_at_ts`, `job_error_type`
-          (the platform's cause, set on a `failed` run and on a `pending`
-          retry for its last lost attempt: `pod_failed` | `pod_deadline` |
-          `worker_error` | `worker_shutdown` | `wire_mismatch` |
-          `spec_error` | `lost`) + `job_error_message` (the platform's
-          detail behind it, served to the challenge's staff — admin,
-          creator, creator assistant — only; None for a participant),
-          `job_retry_count`,
-          `created_at_ts`, `simulate_end_time_ts`, `is_test`,
-          `is_deployment`, `env_nb_steps`, the env's `step_time_*_sec` /
-          `env_metric_*` columns and, when the challenge's own code is why
-          the run ended, `env_error_type` (`code_error` | `timeout` |
-          `oom_killed` | `crash`; the legacy `simulation_error` |
-          `pod_crash` still appear on older runs). `completed` means an outcome arrived: it can carry
-          an `env_error_type`.
-          `submission_results` lists one `RunSubmissionResult` per agent in
-          the run — **yours is the row whose `submission_id` is this
-          submission's**, the others are the opponents. A row carries
-          `submission_id`, `submission_name`, `user_name`,
-          `submission_status` (that submission's status now, not when the
-          run played: `deleted` when it was deleted since),
+    def update_submission(self, submission_id: int, *,
+                          submission_name: str | None = None,
+                          is_public: bool | None = None) -> dict:
+        """Rename your submission, publish or unpublish it, or both.
+
+        Mirrors `PATCH /api/submissions/submission/{sid}` (`read.py`). Only
+        the keywords passed are sent; passing neither is a 400. A name is 1 to
+        40 characters on one line, without `<` or `>`. `is_public=True` opens
+        every read of the submission — its code, runs and replays — to
+        anyone signed in; its error messages stay yours. Returns the updated
+        submission (the `submission()` shape).
+
+        Owner only: anyone else gets a 404 (`SubmissionNotFoundError`). A
+        deleted submission cannot be changed (409, `SubmissionError`).
+        """
+        body: dict = {}
+        if submission_name is not None:
+            body["submission_name"] = submission_name
+        if is_public is not None:
+            body["is_public"] = is_public
+        resp = self._request("PATCH",
+            self._url(f"/submissions/submission/{submission_id}"),
+            headers=self._headers(json_body=True),
+            json=body,
+            timeout=30,
+        )
+        self._handle_response(resp, not_found=SubmissionNotFoundError)
+        if resp.status_code != 200:
+            raise _failed(SubmissionError, "update_submission", resp)
+        return resp.json()
+
+    def rename_submission(self, submission_id: int, name: str) -> dict:
+        """Rename your submission: `update_submission(submission_id,
+        submission_name=name)`."""
+        return self.update_submission(submission_id, submission_name=name)
+
+    def submission_runs(self, submission_id: int, *,
+                        deploy_id: int | None = None,
+                        is_test: bool | None = None,
+                        offset: int = 0, limit: int = 20) -> dict:
+        """The submission's runs, newest first, one page at a time.
+
+        Mirrors `GET /api/submissions/submission/{sid}/runs` (`read.py`).
+        Returns `{"runs", "total", "retention_days", "challenge_context"}`:
+
+        - `runs` — the page (`offset`, `limit` 1..100) of the runs that
+          match, `total` the count of every run that matches. Both cover the
+          last `retention_days` days only (the replay bucket's retention).
+        - `deploy_id` keeps one deploy attempt's runs (its validation and
+          first scored runs; the ids are `submission_deploys()`'s); an
+          attempt of another submission is a 404. `is_test=True` keeps the
+          validation runs, `False` the others.
+        - Each run is a `RunResult`, the one run model every run list on the
+          API serves: the job's own `job_status` (`pending` | `running` |
+          `completed` | `failed` | `cancelled`), `job_started_at_ts`,
+          `job_completed_at_ts`, `job_error_type` (the platform's cause, set
+          on a `failed` run and on a `pending` retry for its last lost
+          attempt: `pod_failed` | `pod_deadline` | `worker_error` |
+          `worker_shutdown` | `wire_mismatch` | `spec_error` | `lost`) +
+          `job_error_message` (served to the challenge's staff only),
+          `job_retry_count`, `simulation_result_id`, `submission_deploy_id`
+          (the attempt that queued it), `created_at_ts`,
+          `simulate_end_time_ts`, `is_test`, `is_deployment`,
+          `env_nb_steps`, the env's `step_time_*_sec` / `env_metric_*`
+          columns and, when the challenge's own code is why the run ended,
+          `env_error_type` (`code_error` | `timeout` | `oom_killed` |
+          `crash`; the legacy `simulation_error` | `pod_crash` on older
+          runs). `completed` means an outcome arrived: it can carry an
+          `env_error_type`. `replay` = `{render_format, signed_url,
+          render_size_bytes}` (None when the run recorded none;
+          `download_replay` saves it).
+        - `submission_results` lists one `RunSubmissionResult` per agent in
+          the run — **this submission's is the row whose `submission_id` is
+          its id**, the others are the opponents: `submission_id`,
+          `submission_name`, `user_name`, `submission_status` (that
+          submission's status now: `deleted` when it was deleted since),
           `agent_attached_player_id`, `env_player_name`, `score`,
           `score_variance`, `n_episodes`, `score_ci95`, `agent_nb_steps`,
-          `game_outcome` and `final_rank` (both None on a solo run, which
-          is no game), `score_elo_before`, `score_elo_delta`,
-          `metrics` (the env's per-run keys, plus the optional secondary
-          `score2`), `info_message`, the agent's `action_time_*_sec` /
-          `agent_metric_*` columns and, when that agent is why the run ended,
-          `agent_error_type` (the same values) with
-          `agent_error_message`. Timestamps are ISO-8601 UTC with a `Z`.
-        - `queue_info` — `queue_position`, `queue_total` (numbers, not the
-          `"116/127"` string this used to send), `created_at_ts` and
-          `in_queue_for_second`. All-null when nothing is queued.
+          `game_outcome` and `final_rank` (both None on a solo run),
+          `score_elo_before`, `score_elo_delta`, `metrics` (the env's
+          per-run keys, plus the optional secondary `score2`),
+          `info_message`, the agent's `action_time_*_sec` /
+          `agent_metric_*` columns and, when that agent is why the run
+          ended, `agent_error_type` with `agent_error_message`.
+        - `challenge_context` — the `RunsContext` (`metrics`,
+          `number_of_agents`, `render_delay_second`).
 
-        `agent_error_message`, `agent_stdout_logs` and `failure_message` are
-        None on a row that is not yours: they quote the owner's own traceback
-        and stdout. `env_error_message` and `env_stdout_logs` belong to the
-        challenge's creator and are None here.
+        `agent_error_message` and `agent_stdout_logs` are None on a row that
+        is not this submission's, and for a `public` reader: they quote the
+        owner's own traceback and stdout. `env_error_message` and
+        `env_stdout_logs` belong to the challenge's creator and are None
+        here. Timestamps are ISO-8601 UTC with a `Z`.
         """
+        params: dict = {"offset": offset, "limit": limit}
+        if deploy_id is not None:
+            params["deploy_id"] = deploy_id
+        if is_test is not None:
+            params["is_test"] = "true" if is_test else "false"
         resp = self._request("GET",
-            self._url(
-                f"/submissions/challenge/{challenge_id}/{submission_id}/status"
-            ),
+            self._url(f"/submissions/submission/{submission_id}/runs"),
             headers=self._headers(),
+            params=params,
             timeout=30,
         )
         self._handle_response(resp, not_found=SubmissionNotFoundError)
         if resp.status_code != 200:
-            raise _failed(SubmissionError, "submission_status", resp)
+            raise _failed(SubmissionError, "submission_runs", resp)
         return resp.json()
 
-    def submission_games(self, submission_id: int) -> dict:
-        """Recent games for a submission, each with its replay.
+    def submission_deploys(self, submission_id: int) -> dict:
+        """Every deploy attempt of the submission, newest first.
 
-        Mirrors `GET /api/submissions/submission/{sid}/games`
-        (`monitor.py`, `get_submission_games`). Returns `{"games",
-        "challenge_context"}`. Each game is the `RunResult` that
-        `submission_status` serves under `run_info.results` (`job_status`,
-        `env_error_type`, `env_nb_steps`, and the `submission_results` rows —
-        yours is the one whose `submission_id` is this submission's, with
-        `agent_error_type` / `agent_error_message`) with `replay` =
-        `{render_format, signed_url, render_size_bytes}` (None when the run
-        recorded none or is past the 365-day retention; `download_replay`
-        saves it). `challenge_context` is the `RunsContext` (`metrics`,
-        `number_of_agents`, `render_delay_second`).
-        A crashed run reads as a crash here too; it used to be listed as an
-        ordinary lost game, `outcome: "loser"` with a reward of 0.0 and no
-        error field at all.
+        Mirrors `GET /api/submissions/submission/{sid}/deploys` (`read.py`).
+        Returns `{"deploys": [...]}`, each row the `latest_deploy` shape of
+        `submission()` (`id`, `created_at_ts`, `status`, `finished_at_ts`,
+        `failure_message`, `failure_owner`). An attempt's runs are
+        `submission_runs(submission_id, deploy_id=row["id"])`.
         """
         resp = self._request("GET",
-            self._url(f"/submissions/submission/{submission_id}/games"),
+            self._url(f"/submissions/submission/{submission_id}/deploys"),
             headers=self._headers(),
             timeout=30,
         )
         self._handle_response(resp, not_found=SubmissionNotFoundError)
         if resp.status_code != 200:
-            raise _failed(SubmissionError, "submission_games", resp)
-        return resp.json()
-
-    def submission_overview(self, challenge_id: int, submission_id: int) -> dict:
-        """The submission's aggregate numbers and its place on the board.
-
-        Mirrors `GET /api/submission_result/{cid}/{sid}/overview`
-        (`submission_result.py`) — what the console's Dashboard tab shows.
-
-        Returns `created_at_ts`, `score` (the ranking value — the rating on
-        a rated board), `metrics` (`{key: value}` for every declared key),
-        `number_of_runs`, `last_end_run_ts`, the last-24h resource
-        aggregates (`max_ram_usage`, `avg_cpu_usage`, `avg_steps`,
-        `runs_last_24h`, `max_vram_bytes`), `submissions_in_queue`, and the
-        challenge context for reading them (`rank`, `evaluation` —
-        `{"metrics": [MetricSpec, ...], "window_days"}`, the declaration
-        whose ranking spec gives `score` its label, format and direction —
-        and `has_gpu`). `rank` is the place of the submission's row on the challenge
-        leaderboard, one row per participant (the team's or your best active
-        submission, as `leaderboard()` ranks it by default); None for a
-        submission that has no row there.
-
-        The warm-up counterparts (`warmup_mean_reward`, `warmup_number_of_runs`,
-        `warmup_elo_score`) that older backends served are gone: nothing had
-        written them a real value since the Celery deploy path was removed, so
-        they were always null. A backend still serving them is simply older —
-        this method returns the body verbatim either way.
-
-        `job_status`, `job_error_type`, `env_error_type`, `agent_error_type`
-        and `agent_error_message` are the newest run's causes, one per owner
-        (the platform, the challenge, your agent), under the run's own column
-        names (the keys every run payload uses); all None before the first
-        run. The agent message is None unless the submission is yours: it is
-        your agent's traceback.
-        """
-        resp = self._request("GET",
-            self._url(f"/submission_result/{challenge_id}/{submission_id}/overview"),
-            headers=self._headers(),
-            timeout=30,
-        )
-        self._handle_response(resp, not_found=SubmissionNotFoundError)
-        if resp.status_code != 200:
-            raise _failed(SubmissionError, "submission_overview", resp)
+            raise _failed(SubmissionError, "submission_deploys", resp)
         return resp.json()
 
     def my_submissions(self) -> dict:
@@ -2636,23 +2610,9 @@ class MLArenaClient:
         return resp.json()
 
     def set_submission_visibility(self, submission_id: int, is_public: bool) -> dict:
-        """Show or hide a submission in public listings.
-
-        Mirrors `PUT /api/submissions/submission/{sid}/visibility`
-        (`monitor.py`). A public submission's results and runs are readable by
-        anyone; its error *messages* stay yours. A deleted submission cannot be
-        made public again (409).
-        """
-        resp = self._request("PUT",
-            self._url(f"/submissions/submission/{submission_id}/visibility"),
-            headers=self._headers(json_body=True),
-            json={"is_public": is_public},
-            timeout=30,
-        )
-        self._handle_response(resp, not_found=SubmissionNotFoundError)
-        if resp.status_code != 200:
-            raise _failed(SubmissionError, "set_submission_visibility", resp)
-        return resp.json()
+        """Publish or unpublish your submission: `update_submission(
+        submission_id, is_public=is_public)`, which says what public opens."""
+        return self.update_submission(submission_id, is_public=is_public)
 
     def replays(self, challenge_id: int, limit: int = 12,
                 before_simulation_result_id: int | None = None,
@@ -2663,7 +2623,7 @@ class MLArenaClient:
         Mirrors `GET /api/challenges/{id}/replays` — the console's Overview
         "Replays" section. Returns `{"replays", "challenge_context"}`:
         `replays` are public `ReplayRun` rows, the public subset of the
-        `RunResult` that `submission_games()` and `submission_status()` serve,
+        `RunResult` that `submission_runs()` serves,
         under the same keys: `simulation_result_id`, `created_at_ts`,
         `env_nb_steps`, `replay` = `{render_format, signed_url,
         render_size_bytes}` and `submission_results`, one per seat with
@@ -2671,7 +2631,7 @@ class MLArenaClient:
         `agent_attached_player_id`, `env_player_name`, `score`,
         `game_outcome` and `final_rank`. No metrics, info messages, error
         kinds, resource figures or Elo: the gallery is every viewer's, so a
-        run's details stay with its owner (`submission_games()`) and the
+        run's details stay with its owner (`submission_runs()`) and the
         challenge's staff (`creator_runs()`). `challenge_context`
         is the `RunsContext` (`metrics`, `number_of_agents`,
         `render_delay_second`, the default frame duration). Only completed,
@@ -2733,8 +2693,7 @@ class MLArenaClient:
 
         `run` is any row carrying `simulation_result_id` and `replay`: a
         public `ReplayRun` (from `replays()`, `replay()["run"]`) or a
-        `RunResult` (`submission_games()["games"]`,
-        `submission_status()["run_info"]["results"]`, `creator_runs()` or
+        `RunResult` (`submission_runs()["runs"]`, `creator_runs()` or
         `run_benchmark()`). The file is the stored object, streamed as is to
         `<dest_dir>/<simulation_result_id><suffix>`, the suffix from
         `replay.render_format`: `frames_v1` → `.experiment.mp`, `frames_v2`
@@ -2785,14 +2744,17 @@ class MLArenaClient:
         )
         return self.replays(challenge_id, limit=limit)
 
+    # ---- Status / logs ----
+
     def tail_logs(self, challenge_id: int, submission_id: int, *,
                   follow: bool = False, poll_sec: float = 5.0,
                   timeout_sec: float | None = None) -> Iterator[str]:
         """Yield human-readable status / log lines for a submission.
 
-        Polls `submission_status` and emits one line per status transition,
+        Polls `submission()` and emits one line per status transition,
         including queue position for `deploy_queue` and, for each run of the
-        attempt, the job's `job_status` with the steps / reward / outcome of
+        latest deploy attempt (`submission_runs(submission_id,
+        deploy_id=latest_deploy["id"])`, oldest first), the job's `job_status` with the steps / reward / outcome of
         **your own row** of that run (the `submission_results` entry whose
         `submission_id` is this submission's), then an
         `agent error[<agent_error_type>]: <agent_error_message>` line when
@@ -2815,25 +2777,34 @@ class MLArenaClient:
         `timeout_sec` caps the total wait and raises `SubmissionError` when it
         runs out, naming the status the submission was left in. It used to
         return silently, which was indistinguishable from "finished".
+        A `submission_id` of another challenge than `challenge_id` raises
+        `SubmissionError` on the first poll.
 
         Note: this does NOT stream pod stdout. Your agent's stdout of a run
         is `agent_stdout_logs` on your `submission_results` row (from
-        `submission_status()` / `submission_games()`). A run's `replay`
+        `submission_runs()`). A run's `replay`
         holds its replay (frames, a video or a still), not logs: save it
         with `download_replay(run, dest_dir)`.
 
         Raises:
-            SubmissionError: on `timeout_sec` elapsing.
+            SubmissionError: on `timeout_sec` elapsing, or on a submission
+                of another challenge.
         """
         last_signature = None
         last_queue_line = None
-        # Per run index: the last line emitted for it. A run's line repeats
-        # across polls until its steps / reward / outcome move.
+        # Per run: the last line emitted for it. A run's line repeats across
+        # polls until its steps / reward / outcome move.
         last_run_lines: dict[int, tuple] = {}
         deadline = (time.monotonic() + timeout_sec) if timeout_sec else None
 
         while True:
-            status = self.submission_status(challenge_id, submission_id)
+            status = self.submission(submission_id)
+            if status["challenge_id"] != challenge_id:
+                raise SubmissionError(
+                    f"submission {submission_id} belongs to challenge "
+                    f"{status['challenge_id']}, not {challenge_id}",
+                    body=status,
+                )
             sig = (status.get("status"), status.get("last_status_message"))
             if sig != last_signature:
                 yield f"[{status.get('status')}] {status.get('last_status_message') or ''}".rstrip()
@@ -2849,10 +2820,13 @@ class MLArenaClient:
                         yield queue_line
                         last_queue_line = queue_line
 
-            # `run_info` is served in every post-deploy state now, so the runs
-            # of a failed attempt are still here to print.
-            ri = status.get("run_info") or {}
-            for index, run in enumerate(ri.get("results") or []):
+            # The latest attempt's runs, in every post-deploy state: the runs
+            # of a failed attempt are still there to print. The route pages
+            # newest first; they are printed oldest first.
+            latest = status["latest_deploy"]
+            attempt_runs = [] if latest is None else self.submission_runs(
+                submission_id, deploy_id=latest["id"], limit=100)["runs"]
+            for run in reversed(attempt_runs):
                 # A run lists every agent's row under `submission_results`;
                 # ours is the row whose `submission_id` is this submission's.
                 # Direct key access on the shape: a backend serving another
@@ -2872,9 +2846,10 @@ class MLArenaClient:
                                 run.get("job_error_message"))
                     if run.get("job_status") == "failed" else None,
                 ) if line is not None)
-                if last_run_lines.get(index) == (run_line, error_lines):
+                run_id = run["simulation_result_id"]
+                if last_run_lines.get(run_id) == (run_line, error_lines):
                     continue
-                last_run_lines[index] = (run_line, error_lines)
+                last_run_lines[run_id] = (run_line, error_lines)
                 yield run_line
                 yield from error_lines
 
@@ -2887,8 +2862,8 @@ class MLArenaClient:
                 raise SubmissionError(
                     f"tail_logs timed out after {timeout_sec}s: submission "
                     f"{submission_id} is still {status.get('status')!r}. Poll "
-                    f"again with submission_status({challenge_id}, "
-                    f"{submission_id}) or raise timeout_sec."
+                    f"again with submission({submission_id}) or raise "
+                    f"timeout_sec."
                 )
 
             time.sleep(poll_sec)
@@ -2918,7 +2893,7 @@ class MLArenaClient:
         backend's challenge-default runtime is kept.
 
         After the uploads, the submission's `is_deployable` is checked (one
-        `submission_status` call) and a `SubmissionError` carrying the
+        `submission()` call) and a `SubmissionError` carrying the
         server's `last_status_message` (and, on `.body`, that status payload)
         is raised rather than deploying files the backend already rejected.
 
@@ -2986,7 +2961,7 @@ class MLArenaClient:
             # deploy — that is the same fact the Deploy button reads, and it is
             # asked after every file is on disk, so a legitimately transient
             # mid-sequence failure (multi-file upload) isn't misreported.
-            status = self.submission_status(challenge_id, submission_id)
+            status = self.submission(submission_id)
             if not status["is_deployable"]:
                 raise SubmissionError(
                     f"Submission {submission_id} did not pass upload validation: "
@@ -3008,11 +2983,13 @@ class MLArenaClient:
                                         poll_sec=poll_sec,
                                         timeout_sec=timeout_sec):
                     pass
-                final = self.submission_status(challenge_id, submission_id)
+                final = self.submission(submission_id)
                 if final["status"] == "deploy_failed":
                     # Same contract as the rejected upload above: the server's
                     # reason is the message, the payload rides on `.body`.
-                    latest = final.get("latest_deploy") or {}
+                    # A deploy_failed submission has deployed: the attempt is
+                    # there.
+                    latest = final["latest_deploy"]
                     reason = (latest.get("failure_message")
                               or final.get("last_status_message")
                               or f"Submission {submission_id} ended in "
@@ -3030,37 +3007,30 @@ class MLArenaClient:
                 import shutil
                 shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    def status(self, submission_id: int | None = None,
-               challenge_id: int | None = None) -> dict:
-        """Return the rich status of a previously-made submission.
-
-        Defaults to the last submission made through this client. Both
-        submission_id and challenge_id are required by the backend route, so
-        callers using a non-default submission_id must also pass challenge_id.
-        Returns the same payload as `submission_status` (the status block,
-        `queue_info`, `run_info`, `latest_deploy`), which is more informative
-        than `submission_deploy_status`.
-        """
+    def status(self, submission_id: int | None = None) -> dict:
+        """The submission (`submission()`), by default the last one made
+        through this client (`submit()`, which remembers it as soon as it is
+        created)."""
         submission_id = submission_id or self._last_submission_id
-        challenge_id = challenge_id or self._last_challenge
-        if submission_id is None or challenge_id is None:
+        if submission_id is None:
             raise SubmissionError(
-                "submission_id and challenge_id are required (no previous submission found)"
+                "submission_id is required (no previous submission found)"
             )
-        return self.submission_status(challenge_id, submission_id)
+        return self.submission(submission_id)
 
     # ---- Leaderboard (public read) ----
 
     def leaderboard(self, challenge_id: int | None = None, top: int | None = None, *,
                     aggregate: str | None = None, course_id: int | None = None,
                     me: bool = False, q: str | None = None,
-                    window: int | None = None, offset: int | None = None):
+                    window: int | None = None, offset: int | None = None,
+                    around: int | None = None):
         """Get the leaderboard for a challenge.
 
         Mirrors `GET /api/leaderboard/challenge/{id}` (`leaderboard.py`) with
         the query keys the console sends — `limit` (here `top`), `offset`,
-        `aggregate`, `course_id`, `me`, `q`, `window` — each sent only when
-        passed.
+        `aggregate`, `course_id`, `me`, `around`, `q`, `window` — each sent
+        only when passed.
 
         - ``aggregate="user"`` (the default, as on the console): one row per
           participant — their best active submission, a team's best for a
@@ -3077,12 +3047,16 @@ class MLArenaClient:
           ``me=True`` adds your own row with `rank`, `position` (its
           1-based place in board order; ties share a rank, not a position),
           `percentile` and its
-          ``window`` neighbours (default 3, at most 25) under `me`; ``q``
+          ``window`` neighbours (default 3, at most 25) under `me`;
+          ``around=<submission_id>`` adds that submission's row, in the same
+          shape, under `around` (None when the submission has no row at this
+          ``aggregate``: not active, or shadowed by its owner's better
+          submission on the per-participant board); ``q``
           adds the rows whose username contains it under `matches` (at most
           50).
 
         **Shape.** The backend serves one envelope: `challenge`, `total`,
-        `leaders`, `me`, `matches` and, with ``course_id``,
+        `leaders`, `me`, `around`, `matches` and, with ``course_id``,
         `course_context`. With pandas, the call returns `leaders` as a
         DataFrame and every other envelope key on ``df.attrs``
         (``df.attrs["challenge"]["window_days"]``, ``df.attrs["me"]``, …),
@@ -3092,7 +3066,7 @@ class MLArenaClient:
         **The `challenge` block** — what every row shares, served once:
         `challenge_id`, `metrics` (the MetricSpec declaration, see the README
         "Metrics" section), `window_days` (None unless the board also folds
-        a rolling window) and `has_gpu`. The spec with `is_ranking` is what
+        a rolling window), `has_gpu` and `kernel_version`. The spec with `is_ranking` is what
         the board ranks on; its ``order`` says which way (``"desc"``: higher
         is better, ``"asc"``: lower is better).
 
@@ -3101,7 +3075,9 @@ class MLArenaClient:
         `submission_name`, `score` (the ranking spec's value; None =
         unranked), `score_ci95`, `n_episodes_total`, `elo_variance`,
         `number_of_runs`, `created_at_ts` and `last_end_run_ts` (ISO-8601
-        UTC with a `Z`), `is_my_submission`, `team_id`, `team_name`,
+        UTC with a `Z`), `is_my_submission` (your row: your submission or
+        your team's), `can_open` (whether you may read the row's submission
+        with `submission()`), `team_id`, `team_name`,
         `team_members`, `action_time_max_sec`,
         `agent_metric_total_ram_max_bytes`, `agent_metric_vram_max_bytes`,
         `is_public` (None when the row is not yours to know) and, through a
@@ -3127,6 +3103,8 @@ class MLArenaClient:
             params["window"] = window
         if me:
             params["me"] = "true"
+        if around is not None:
+            params["around"] = around
         if q:
             params["q"] = q
         params = params or None
@@ -5039,8 +5017,18 @@ _RENAMED_METHODS = {
     "get_agent_file_content": "get_submission_file_content",
     "update_agent_file_content": "update_submission_file_content",
     "delete_agent_file": "delete_submission_file",
-    "agent_status": "submission_status",
-    "agent_games": "submission_games",
+    "agent_games": "submission_runs",
+    # 4.6.0: the submission's page routes replaced the games route.
+    "submission_games": "submission_runs",
+}
+
+# Old methods that took `(challenge_id, submission_id)` where their
+# replacement takes the submission alone (4.6.0: one read of the submission,
+# `GET /api/submissions/submission/{sid}`). The alias drops the challenge id.
+_KEYED_BY_SUBMISSION_METHODS = {
+    "agent_status": "submission",
+    "submission_status": "submission",
+    "submission_overview": "submission",
 }
 
 
@@ -5065,7 +5053,7 @@ def _accepts_legacy_kwargs(fn):
     return wrapper
 
 
-def _deprecated_alias(old_name, new_name):
+def _deprecated_alias(old_name, new_name, *, drops_challenge_id=False):
     def alias(self, *args, **kwargs):
         warnings.warn(
             f"MLArenaClient.{old_name}() is deprecated, "
@@ -5073,6 +5061,11 @@ def _deprecated_alias(old_name, new_name):
             DeprecationWarning,
             stacklevel=2,
         )
+        if drops_challenge_id:
+            if args:
+                args = args[1:]
+            else:
+                del kwargs["challenge_id"]
         return getattr(self, new_name)(*args, **kwargs)
     alias.__name__ = old_name
     alias.__qualname__ = f"MLArenaClient.{old_name}"
@@ -5090,3 +5083,13 @@ for _old, _new in _RENAMED_METHODS.items():
             f"compat map is stale: MLArenaClient has no .{_new}()"
         )
     setattr(MLArenaClient, _old, _deprecated_alias(_old, _new))
+
+for _old, _new in _KEYED_BY_SUBMISSION_METHODS.items():
+    if not hasattr(MLArenaClient, _new):
+        raise AttributeError(
+            f"compat map is stale: MLArenaClient has no .{_new}()"
+        )
+    # Wrapped so an old keyword (`competition_id=`) is renamed before the
+    # challenge id is dropped.
+    setattr(MLArenaClient, _old, _accepts_legacy_kwargs(
+        _deprecated_alias(_old, _new, drops_challenge_id=True)))
