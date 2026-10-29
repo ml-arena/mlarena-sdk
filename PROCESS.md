@@ -34,7 +34,7 @@ The SDK and the React console are peers over one REST surface; every user-facing
 |---|---|---|
 | `me` | `/api/auth/current_user` | `context/AuthContext.tsx` |
 | `profile`, `update_profile` | `/api/profile/`, `/api/profile/update` | `apiService.ts` |
-| `challenge_team`, `create_team`, `update_team`, `delete_team`, `leave_team`, `remove_team_member`, `search_teams`, `invite_to_team`, `pending_invitations`, `received_invitations`, `respond_to_invitation`, `cancel_invitation` | `/api/teams/*` | `teamsApi.ts` |
+| `challenge_team`, `create_team`, `update_team`, `delete_team`, `leave_team`, `remove_team_member`, `search_teams`, `invite_to_team`, `pending_invitations`, `received_invitations`, `respond_to_invitation`, `cancel_invitation`, `link_datagouv_reuse`, `unlink_datagouv_reuse` | `/api/teams/*` | `teamsApi.ts` |
 | `challenges`, `challenge`, `datasets`; `runtime_options` reads `challenge()["runtime_options"]` | `/api/challenges/*` | `apiService.ts` |
 | `replays`, `replay` (`recent_replays` = deprecated alias of `replays`) | `GET /api/challenges/{id}/replays`, `GET /api/challenges/{id}/replays/{simulation_result_id}` | `apiService.ts`, `runTypes.ts` |
 | `machines` | `GET /api/machines` | `machinesApi.ts` |

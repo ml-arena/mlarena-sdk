@@ -242,7 +242,9 @@ class MLArenaClient:
     # `user_id`, `username`, `avatar_key`, `role`) and `my_role`, your own
     # role on it ("leader", "member" or None). An invitation carries `id`,
     # `team_id`, `team_name`, `user_id`, `username`, `sender_id`,
-    # `sender_username`, `status` and `created_at_ts`.
+    # `sender_username`, `status` and `created_at_ts`. A team also carries
+    # `datagouv_reuse`: the data.gouv.fr reuse it linked (a dict, see
+    # `link_datagouv_reuse`) or None.
 
     def challenge_team(self, challenge_id: int) -> dict | None:
         """Your team for a challenge, or None when you are on no team for it.
@@ -414,6 +416,43 @@ class MLArenaClient:
         self._handle_response(resp)
         if resp.status_code != 200:
             raise _failed(MLArenaError, "cancel_invitation", resp)
+        return resp.json()
+
+    def link_datagouv_reuse(self, team_id: int, url: str) -> dict:
+        """Link your team's data.gouv.fr reuse to the challenge (leader only).
+
+        Mirrors ``PUT /api/teams/{team_id}/datagouv_reuse``. ``url`` is the
+        reuse's data.gouv.fr page (``https://www.data.gouv.fr/.../reuses/<slug>/``).
+        Replaces the team's previous link. Returns the link: ``datagouv_reuse_id``,
+        ``title``, ``page_url``, ``owner_name``, ``status`` (``"published"`` |
+        ``"validated"`` | ``"unavailable"``), ``linked_at_ts`` and
+        ``checked_at_ts``.
+
+        400 when the challenge has no data.gouv.fr partnership, the URL is not
+        a data.gouv.fr reuse, or the reuse is not public / uses no dataset;
+        403 (``PermissionDeniedError``) when you do not lead the team; 409
+        when another team already linked that reuse; 502 when data.gouv.fr
+        does not answer.
+        """
+        resp = self._request("PUT", self._url(f"/teams/{team_id}/datagouv_reuse"),
+                             headers=self._headers(json_body=True),
+                             json={"url": url})
+        self._handle_response(resp)
+        if resp.status_code != 200:
+            raise _failed(MLArenaError, "link_datagouv_reuse", resp)
+        return resp.json()
+
+    def unlink_datagouv_reuse(self, team_id: int) -> dict:
+        """Remove your team's data.gouv.fr reuse link (leader only).
+
+        Mirrors ``DELETE /api/teams/{team_id}/datagouv_reuse``. 404 when the
+        team has no link.
+        """
+        resp = self._request("DELETE", self._url(f"/teams/{team_id}/datagouv_reuse"),
+                             headers=self._headers())
+        self._handle_response(resp)
+        if resp.status_code != 200:
+            raise _failed(MLArenaError, "unlink_datagouv_reuse", resp)
         return resp.json()
 
     # ---- Challenges (public read; create/update via creator scope) ----
@@ -1045,6 +1084,7 @@ class MLArenaClient:
                         data_source_filter: dict[str, str] | None | _Unset = _UNSET,
                         data_source_history_hours: int | _Unset = _UNSET,
                         batch_cron: str | _Unset = _UNSET,
+                        datagouv_topic_id: str | None | _Unset = _UNSET,
                         machine_id: int | None = None,
                         env_cpu_request: str | None = None,
                         env_cpu_limit: str | None = None,
@@ -1079,7 +1119,8 @@ class MLArenaClient:
         the challenge has started only the fields that cannot rescore an
         existing run still apply — the presentation fields of `metrics`
         (`label`, `unit`, `precision`, `format`, `visible`) and
-        `is_stop_after_deployment` (and `machine_id` for an admin); everything
+        `is_stop_after_deployment` (and `machine_id` and `datagouv_topic_id`
+        for an admin); everything
         else is rejected with 400 until the challenge is stopped.
 
         SDK 4.0.0 removed the keywords `metric`, `metric2`, `is_elo_score`,
@@ -1193,6 +1234,13 @@ class MLArenaClient:
             data_source_history_hours: hours of history per batch (1..9600).
             batch_cron: the UTC cron schedule of fetches and runs.
 
+        data.gouv.fr partnership (admin only — anyone else gets
+        `PermissionDeniedError`, 403; editable while the challenge runs,
+        sent only when passed):
+            datagouv_topic_id: the 24-hex id of the data.gouv.fr topic of
+                the challenge's défi; teams may then link a reuse
+                (`link_datagouv_reuse`). None clears it.
+
         Runtime (the Runtime section of the console; frozen while the
         challenge runs, except `machine_id` for an admin — pending jobs move
         with it, running ones finish where they are). Quantities are K8s
@@ -1278,6 +1326,7 @@ class MLArenaClient:
             "data_source_filter": data_source_filter,
             "data_source_history_hours": data_source_history_hours,
             "batch_cron": batch_cron,
+            "datagouv_topic_id": datagouv_topic_id,
             "gpu_memory_limit": gpu_memory_limit,
         }
         body.update({key: value for key, value in nullable.items() if value is not _UNSET})
@@ -3078,7 +3127,8 @@ class MLArenaClient:
         UTC with a `Z`), `is_my_submission` (your row: your submission or
         your team's), `can_open` (whether you may read the row's submission
         with `submission()`), `team_id`, `team_name`,
-        `team_members`, `action_time_max_sec`,
+        `team_members`, `datagouv_reuse` (the team's linked data.gouv.fr
+        reuse, see `link_datagouv_reuse`, or None), `action_time_max_sec`,
         `agent_metric_total_ram_max_bytes`, `agent_metric_vram_max_bytes`,
         `is_public` (None when the row is not yours to know) and, through a
         course with a bar, `passed`. With pandas, each row's `metrics`

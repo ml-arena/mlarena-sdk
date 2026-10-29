@@ -347,6 +347,17 @@ def test_update_settings_sends_the_column_names():
     }, rec.last["json"])
 
 
+def test_update_settings_sends_datagouv_topic_id_only_when_passed():
+    c, rec = make_client(lambda *_: (200, {"configuration": {}, "evaluation": {}}))
+    c.update_settings(7, datagouv_topic_id="5f1e2d3c4b5a69788796a5b4")
+    _expect(rec.last["json"] == {"datagouv_topic_id": "5f1e2d3c4b5a69788796a5b4"},
+            rec.last["json"])
+    c.update_settings(7, datagouv_topic_id=None)
+    _expect(rec.last["json"] == {"datagouv_topic_id": None}, rec.last["json"])
+    c.update_settings(7, max_upload_files=4)
+    _expect("datagouv_topic_id" not in rec.last["json"], rec.last["json"])
+
+
 def test_update_settings_removed_score_kwargs_raise_naming_metrics():
     """SDK 4.0.0 (D5): the six legacy score keywords are gone, no alias. Each
     raises a TypeError that points at `metrics`, before any request."""

@@ -2,6 +2,29 @@
 
 Python SDK for [ML Arena](https://ml-arena.com) — make submissions, manage challenges, manage courses, and read leaderboards from any notebook or IDE.
 
+## 4.7.0 — 2026-10-29
+
+Requires a platform with the data.gouv.fr reuse routes; on an older one the
+two new methods fail with a 404.
+
+- New: `link_datagouv_reuse(team_id, url)` (`PUT
+  /api/teams/{team_id}/datagouv_reuse`) — a team leader links the team's
+  data.gouv.fr reuse to a challenge partnered with a défi of
+  defis.data.gouv.fr, replacing any previous link. Returns
+  `{datagouv_reuse_id, title, page_url, owner_name, status, linked_at_ts,
+  checked_at_ts}`; `status` is `published`, `validated` (the reuse is in the
+  défi's topic) or `unavailable`. 400 when the challenge has no partnership,
+  the URL is not a reuse or the reuse is not public / uses no dataset, 403
+  for a non-leader, 409 when another team holds the reuse, 502 when
+  data.gouv.fr is down.
+- New: `unlink_datagouv_reuse(team_id)` (`DELETE`, leader only; 404 when
+  the team has no link).
+- `challenge_team()` and the `leaderboard()` rows carry `datagouv_reuse`:
+  the team's link in the shape above, or None.
+- Admin: `update_settings(cid, datagouv_topic_id="<24-hex>")` sets the
+  data.gouv.fr topic of the challenge's défi (None clears it); editable while
+  the challenge runs.
+
 ## 4.6.0 — the submission's page
 
 Requires a platform with the submission page routes; 4.5.0 and older fail on

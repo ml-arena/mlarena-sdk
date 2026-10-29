@@ -842,7 +842,7 @@ def test_leaderboard_is_one_shape_whatever_the_parameters():
             assert out.to_dict("records") == [{
                 "rank": 1, "username": "jo", "submission_id": 11,
                 "score": 0.7, "score_ci95": None, "is_my_submission": False,
-                "passed": True, "reward": 0.7,
+                "can_open": True, "passed": True, "reward": 0.7,
             }], kwargs
             assert out.attrs == {
                 **{k: v for k, v in _ENVELOPE.items() if k != "leaders"},

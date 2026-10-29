@@ -332,3 +332,63 @@ def test_user_global_rank_is_flat():
     c, rec = make_client(lambda *_: (200, flat))
     assert c.user_global_rank(2) == flat
     assert rec.last["path"] == "/ranking/user/2"
+
+
+# --------------------------------------------------------------------------- #
+# data.gouv.fr reuse link (4.7.0)
+# --------------------------------------------------------------------------- #
+
+
+REUSE = {
+    "datagouv_reuse_id": "5f1e2d3c4b5a69788796a5b4",
+    "title": "Carte des pluies",
+    "page_url": "https://www.data.gouv.fr/fr/reuses/carte-des-pluies/",
+    "owner_name": "Team A",
+    "status": "published",
+    "linked_at_ts": "2026-10-29T10:00:00Z",
+    "checked_at_ts": "2026-10-29T10:00:00Z",
+}
+
+
+def test_link_datagouv_reuse_route_and_body():
+    c, rec = make_client(lambda *_: (200, REUSE))
+    assert c.link_datagouv_reuse(3, REUSE["page_url"]) == REUSE
+    assert rec.last["method"] == "PUT"
+    assert rec.last["path"] == "/teams/3/datagouv_reuse"
+    assert rec.last["json"] == {"url": REUSE["page_url"]}
+    assert rec.last["headers"]["Authorization"].startswith("Bearer ")
+
+
+def test_link_datagouv_reuse_409_when_another_team_holds_it():
+    body = {"error": "This reuse is already linked by another team"}
+    c, _ = make_client(lambda *_: (409, body))
+    try:
+        c.link_datagouv_reuse(3, REUSE["page_url"])
+        raise AssertionError("expected MLArenaError")
+    except MLArenaError as exc:
+        assert exc.status_code == 409
+        assert "another team" in str(exc)
+
+
+def test_link_datagouv_reuse_403_for_a_non_leader():
+    c, _ = make_client(lambda *_: (403, {"error": "Only team leaders can link a reuse"}))
+    try:
+        c.link_datagouv_reuse(3, REUSE["page_url"])
+        raise AssertionError("expected PermissionDeniedError")
+    except PermissionDeniedError as exc:
+        assert exc.status_code == 403
+
+
+def test_unlink_datagouv_reuse_route():
+    c, rec = make_client(lambda *_: (200, {"message": "Reuse unlinked"}))
+    assert c.unlink_datagouv_reuse(3) == {"message": "Reuse unlinked"}
+    assert (rec.last["method"], rec.last["path"]) == ("DELETE", "/teams/3/datagouv_reuse")
+
+
+def test_unlink_datagouv_reuse_403_for_a_non_leader():
+    c, _ = make_client(lambda *_: (403, {"error": "Only team leaders can unlink a reuse"}))
+    try:
+        c.unlink_datagouv_reuse(3)
+        raise AssertionError("expected PermissionDeniedError")
+    except PermissionDeniedError as exc:
+        assert exc.status_code == 403
