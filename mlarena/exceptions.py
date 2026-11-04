@@ -86,6 +86,17 @@ class ChatSessionNotFoundError(NotFoundError):
     pass
 
 
+class ExerciseAttemptNotFoundError(NotFoundError):
+    """Raised when an exercise attempt is not found, or is not yours to read.
+
+    An attempt is readable by its group (the user, or their team), the
+    challenge's creator / assistants, admins and the student's teachers;
+    anyone else gets the same 404 as for an id that does not exist (see
+    `SubmissionNotFoundError`).
+    """
+    pass
+
+
 # Deprecated spelling, kept so `except CompetitionNotFoundError` in existing
 # notebooks still catches the same error. It is the same class, not a subclass,
 # so isinstance checks against either name behave identically.

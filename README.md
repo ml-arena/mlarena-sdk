@@ -2,6 +2,52 @@
 
 Python SDK for [ML Arena](https://ml-arena.com) — make submissions, manage challenges, manage courses, and read leaderboards from any notebook or IDE.
 
+## 4.10.0 — exercise challenges
+
+Requires a platform with the `exercise_v1` kernel; on an older one every new
+method raises `ChallengeNotFoundError` (the routes' 404) and the four new
+`update_settings` keywords a 400.
+
+- **Exercise challenges** (`exercise_v1`) hold the short Python exercises of a
+  course module. You send code (or a short answer); the challenge's resident
+  checker runs the creator's hidden checks and answers in about a second. The
+  score is the percentage of points solved. Nothing to upload or deploy: your
+  group's submission is created on your first attempt. See *Exercise
+  challenges* below.
+- New: `exercise_challenge(cid)`, `submit_exercise(cid, key, code=… |
+  answer=…, wait=True, timeout=60)` (returns the settled attempt: `passed` or
+  `failed` with its `error_type` and `feedback`; an attempt the platform could
+  not grade raises), `exercise_attempt(aid)`, `exercise_attempts(cid,
+  user_id=None, key=None)` (a teacher reads their students' code), and for
+  creators `exercise_admin(cid)`.
+- New: `check(cid, key, obj)` — send a function's or a class's source (or a
+  str of code) from a notebook, wait, print the verdict line, return the
+  attempt. A client-side composition, like `submit()`.
+- `update_settings` takes the exercise limits `time_limit_sec`,
+  `memory_limit_mb`, `max_concurrent_attempts`, `max_attempts_per_minute`.
+- **`ExerciseAttemptNotFoundError`** (a `NotFoundError`) for an attempt that
+  is not there or not yours; challenge-scoped exercise routes raise
+  `ChallengeNotFoundError`. `available_kinds()` capabilities gain `exercises` and
+  `leaderboard` (False for an exercise set: it has no public board).
+
+## 4.9.0 — ended challenges and scheduled ends
+
+Requires a platform with the `ended` challenge status; on an older one
+`end_challenge()` raises (the route's 404), `update_challenge(end_date_ts=…)`
+and `challenges(status="ended")` a 400.
+
+- A challenge has a fourth status, `"ended"`: finished, its leaderboard final,
+  and listed with the past challenges. `"stopped"` keeps its meaning (paused or
+  withdrawn, listed nowhere). Both restart with `start_challenge()`.
+- New: `end_challenge(cid)` (`PUT /api/creator_challenge/challenge/{id}/end`):
+  started → ended now.
+- `update_challenge(cid, end_date_ts="2026-12-01T18:00:00Z")` schedules the
+  end (in the future; the platform ends it within a minute of the date);
+  `end_date_ts=None` removes it. Challenge rows (`challenges()`,
+  `challenge()`, `creator_challenge()`) carry `end_date_ts`.
+- `challenges(status="ended")` lists the past challenges, most recently ended
+  first. A chat session's `can_send_reason` can be `challenge_ended`.
+
 ## 4.8.0 — each challenge chooses its agent runtimes; challenge slugs
 
 Requires a platform with the per-challenge agent runtime set and challenge
@@ -1095,6 +1141,29 @@ chat.reset()                                            # close it and start a f
 - `client.send_chat_message(session_id, content, wait=True, timeout=180, poll_interval=0.7)` — sends, then polls `chat_session` until that turn is `completed` (returns the final view) or `failed` (raises `MLArenaError` naming the turn's `error_type`, plus its `error_message` when served — to the challenge's staff only). `wait=False` returns the 202 `{"turn", "message"}` (the turn as the session view serves it).
 - `client.chat_session(session_id)` (`participant.total_amount_eur` + `scoreboard`, `can_send` with `can_send_reason`), `client.close_chat_session(session_id)`, `client.export_chat_session(session_id, format="json"|"md")` — the evidence: transcript, tool log, scoring events with their `evidence` blobs, turn timings, totals.
 - Creator: `client.chat_admin(challenge_id)`, `client.update_chat_settings(challenge_id, llm_base_url=…, llm_model=…, llm_api_key=…, turn_timeout_sec=…, max_turns_per_session=…, max_sessions_per_participant=…)` (only the keywords you pass are sent; `None` lifts a limit, `llm_api_key=""` clears the key), `client.chat_sessions(challenge_id, status=None)`, `client.void_chat_session(session_id, reason)` / `unvoid_chat_session(session_id)`, `client.export_chat_evidence(challenge_id)`.
+
+### Exercise challenges (user scope; `exercise_admin` needs creator scope)
+
+An exercise challenge is a set of short Python exercises, usually embedded in
+the lessons of a course module. Each exercise has a `key`, a `kind` (`code`,
+`text` — "what does this print?" — or `choice`) and `points` (0 = practice:
+checked, never scored). The score is `100 × points solved / points available`;
+solving an exercise once is enough, retries cost nothing.
+
+```python
+def calculer_imc(poids_kg, taille_m):
+    return round(poids_kg / taille_m ** 2, 1)
+
+client.check(42, "imc", calculer_imc)          # prints "imc: passed (8 ms)", returns the attempt
+client.submit_exercise(42, "division-entiere", answer="2 15")   # a text exercise
+client.exercise_challenge(42)["score"]          # 25.0 — your group's percentage
+```
+
+- `client.exercise_challenge(challenge_id)` — `env_status` (`ready` once the checker loaded the set), `checker_online` (a set idle for 30 min sleeps; the next attempt wakes it in 10–20 s), `time_limit_sec`, your group's `submission_id` / `score` / `points_earned` / `points_available`, and `exercises` (each: `key`, `kind`, `title`, `points`, `starter_code`, `examples`, `choices`, `solved`, `attempt_count`, `last_attempt`).
+- `client.submit_exercise(challenge_id, key, code=None, answer=None, wait=True, timeout=60, poll_interval=0.4)` — exactly one of `code` / `answer`. With `wait=True` it polls `exercise_attempt` until the attempt is `passed` or `failed` and returns it: `error_type` is `failed` (an assertion: `feedback["assertion"]`), `syntax_error` / `runtime_error` (`feedback["line"]`, `feedback["traceback"]`), `timeout`, `memory` or `output_limit`; `feedback["stdout"]` is what your code printed. An attempt the platform could not grade (`status="error"`: `grader_error`, `worker_offline`) raises `MLArenaError` with the attempt as `.body`. Refusals: 409 while an attempt of that exercise is in flight or when the set is not started / closed, 429 over the per-minute cap.
+- `client.check(challenge_id, key, obj, timeout=60, echo=True)` — `obj` is a function, a class or a str of code; only the object's own source is sent (`inspect.getsource`), so pass a str for helpers or imports.
+- `client.exercise_attempt(attempt_id)` and `client.exercise_attempts(challenge_id, user_id=None, key=None)` — attempts with their `code` / `answer`, `status`, `error_type`, `message`, `feedback`, `duration_ms`. Readable by the group, the set's staff and the student's teachers (`ExerciseAttemptNotFoundError` otherwise).
+- Creator: `client.exercise_admin(challenge_id)` — the checker's health (`env_status_message` names the exercise whose self-test failed), the limits, and every exercise with `is_active`, `attempt_count`, `solved_count`. The limits are config keys: `client.update_settings(challenge_id, time_limit_sec=…, memory_limit_mb=…, max_concurrent_attempts=…, max_attempts_per_minute=…)`.
 
 ### Datasets (file challenges)
 

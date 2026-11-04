@@ -23,10 +23,12 @@ from urllib.parse import quote
 import requests
 
 from mlarena.chat import ChatConversation
+from mlarena.exercise import format_attempt, source_of
 from mlarena.exceptions import (
     AuthenticationError,
     ChallengeNotFoundError,
     ChatSessionNotFoundError,
+    ExerciseAttemptNotFoundError,
     MaintenanceError,
     MLArenaError,
     NotFoundError,
@@ -477,13 +479,15 @@ class MLArenaClient:
         With no args, returns all matching challenges as a DataFrame
         (auto-paginates internally). Pass ``page``/``per_page`` to fetch a
         single page; pass ``q``/``tags``/``status`` to filter server-side.
-        ``status`` is ``"started"`` (only started challenges, the default) or
-        ``"all"`` (draft, started and stopped) — the route knows no other
-        value and answers 400.
+        ``status`` is ``"started"`` (the open challenges, the default),
+        ``"ended"`` (the past ones, most recently ended first) or ``"all"``
+        (every status) — the route knows no other value and answers 400.
 
         Each row carries ``id``, ``name``, ``description``, ``miniature``
         (the image route, None when the challenge has no miniature),
-        ``status`` (``"draft"`` | ``"started"`` | ``"stopped"``),
+        ``status`` (``"draft"`` | ``"started"`` | ``"stopped"`` |
+        ``"ended"``), ``end_date_ts`` (the scheduled end while started, the
+        date it ended once ended; None = open-ended),
         ``is_award_points``, ``number_of_agents``, ``tags``,
         ``statistics`` (``running_submissions`` and
         ``unique_participants``: a team counts once, a user in no team
@@ -635,7 +639,7 @@ class MLArenaClient:
         this includes the caller's **hidden** (`is_public=False`) challenges
         — useful for finding a challenge you created but did not make
         public. Each item carries
-        `id`, `name`, `status` (`draft` | `started` | `stopped`), `is_public`,
+        `id`, `name`, `status` (`draft` | `started` | `stopped` | `ended`), `is_public`,
         `kernel_version`, `role` and `owner_username` (an admin is served
         every creator's challenges, each as `"owner"`).
 
@@ -1048,7 +1052,8 @@ class MLArenaClient:
     def update_challenge(self, challenge_id: int, *,
                            name: str | None = None,
                            description: str | None = None,
-                           is_public: bool | None = None) -> dict:
+                           is_public: bool | None = None,
+                           end_date_ts: str | None | _Unset = _UNSET) -> dict:
         """Patch top-level challenge fields (creator scope).
 
         Mirrors `PUT /api/creator_challenge/challenge/{id}`. Only fields
@@ -1060,6 +1065,13 @@ class MLArenaClient:
         blurb or hide a started challenge without stopping it. When
         ``is_public=False``, only the owner, creator assistants, admins, and
         the members (students, teachers, TAs) of a course that teaches it can view or interact with the challenge.
+
+        ``end_date_ts`` schedules the end: an ISO-8601 instant in the future
+        (``"2026-12-01T18:00:00Z"``; an offset is converted to UTC, a bare
+        value is taken as UTC). The platform moves the started challenge to
+        ``"ended"`` within a minute of it. ``end_date_ts=None`` removes the
+        schedule. Editable while the challenge runs; 400 for a past date and on
+        an ended challenge (its end date is the date it ended).
         """
         body: dict = {}
         if name is not None:
@@ -1068,6 +1080,8 @@ class MLArenaClient:
             body["description"] = description
         if is_public is not None:
             body["is_public"] = is_public
+        if end_date_ts is not _UNSET:
+            body["end_date_ts"] = end_date_ts
         if not body:
             raise MLArenaError("update_challenge requires at least one field")
         resp = self._request("PUT",
@@ -1129,6 +1143,10 @@ class MLArenaClient:
                         agent_runtime_ids: list[int] | None = None,
                         default_agent_runtime_id: int | None = None,
                         render_delay_second: float | None = None,
+                        time_limit_sec: int | None = None,
+                        memory_limit_mb: int | None = None,
+                        max_concurrent_attempts: int | None = None,
+                        max_attempts_per_minute: int | None = None,
                         ) -> dict:
         """Update challenge settings + evaluation parameters.
 
@@ -1164,8 +1182,9 @@ class MLArenaClient:
         `submission_filename`, `elo` (a `metrics` spec with
         `agg: "rating"`, elo_*),
         `episode_budget_brackets`, `run_limits`, `agent_containers`
-        (the agent_* sizing, agent_gpu_count) and `multi_agent`
-        (number_of_agents). The others apply to every kind, the runtime
+        (the agent_* sizing, agent_gpu_count), `multi_agent`
+        (number_of_agents) and `exercises` (time_limit_sec, memory_limit_mb,
+        max_concurrent_attempts, max_attempts_per_minute). The others apply to every kind, the runtime
         included (machine_id, the env_* sizing, env_gpu_count,
         gpu_memory_limit).
 
@@ -1318,6 +1337,17 @@ class MLArenaClient:
                 long a replay frame that sets no `duration_s` of its own is
                 shown. Editing it changes the playback of stored replays too.
 
+        Exercise limits (creator keys, kinds with `exercises`; editable while
+        the challenge runs except `memory_limit_mb`, which sizes the checker):
+            time_limit_sec: the CPU time one attempt may use, 1..30 s
+                (default 5); past it the attempt fails `timeout`.
+            memory_limit_mb: the memory of one attempt, 64..2048 MB (default
+                512); past it the attempt fails `memory`.
+            max_concurrent_attempts: attempts the checker grades at once,
+                1..16 (default 8).
+            max_attempts_per_minute: attempts one group may send per minute,
+                1..600 (default 20); past it `submit_exercise` gets a 429.
+
         Requires a `creator`-scope token and ownership (or admin) of the
         target challenge.
         """
@@ -1360,6 +1390,10 @@ class MLArenaClient:
             "agent_runtime_ids": agent_runtime_ids,
             "default_agent_runtime_id": default_agent_runtime_id,
             "render_delay_second": render_delay_second,
+            "time_limit_sec": time_limit_sec,
+            "memory_limit_mb": memory_limit_mb,
+            "max_concurrent_attempts": max_concurrent_attempts,
+            "max_attempts_per_minute": max_attempts_per_minute,
         }
         body = {key: value for key, value in sent.items() if value is not None}
         # Keys whose None is an explicit null (the backend clears the
@@ -1728,8 +1762,10 @@ class MLArenaClient:
         """Move a creator challenge to ``status="started"``.
 
         Mirrors `PUT /api/creator_challenge/challenge/{id}/start`. Accepted
-        from ``draft`` or ``stopped`` (400 when already started). The first
-        start sets ``start_date_ts``; a restart from ``stopped`` keeps it.
+        from ``draft``, ``stopped`` or ``ended`` (400 when already started).
+        The first start sets ``start_date_ts``; a restart keeps it, and clears
+        an ``end_date_ts`` already past (the restarted challenge is open-ended
+        until `update_challenge(end_date_ts=…)` sets a new end).
         Backend gates this behind: env.py uploaded, benchmark submission
         ACTIVE with a non-null `score`, and the runtime gate (the machine
         is enabled and usable by the owner, the sizing fits it, the seat
@@ -1771,6 +1807,29 @@ class MLArenaClient:
         self._handle_response(resp)
         if resp.status_code != 200:
             raise _failed(MLArenaError, "stop_challenge", resp)
+        return resp.json()
+
+    def end_challenge(self, challenge_id: int) -> dict:
+        """Move a started creator challenge to ``status="ended"`` now.
+
+        Mirrors `PUT /api/creator_challenge/challenge/{id}/end`. Accepted only
+        from ``started`` (400 otherwise). Submissions close, the leaderboard
+        is final, ``end_date_ts`` becomes now, and the challenge is listed
+        with the past ones (`challenges(status="ended")`). Unlike
+        `stop_challenge()` (paused or withdrawn, listed nowhere), an ended
+        challenge stays on show. `start_challenge()` reopens it. To end at a
+        set date instead, `update_challenge(cid, end_date_ts=…)`.
+        """
+        resp = self._request("PUT",
+            self._url(
+                f"/creator_challenge/challenge/{challenge_id}/end"
+            ),
+            headers=self._headers(),
+            timeout=30,
+        )
+        self._handle_response(resp)
+        if resp.status_code != 200:
+            raise _failed(MLArenaError, "end_challenge", resp)
         return resp.json()
 
     def agent_template(self, challenge_id: int) -> dict:
@@ -3406,7 +3465,7 @@ class MLArenaClient:
         """The participant view of a chat challenge — `ChatChallengeView`.
 
         Mirrors `GET /api/chat/challenge/{cid}` (`backend/app/views/chat/`). Returns `challenge_id`, `challenge_name`, `status`
-        (`draft` | `started` | `stopped`),
+        (`draft` | `started` | `stopped` | `ended`),
         `manifest` (what the agent registered: `bot_name`, `tagline`,
         `welcome_message`, `charter_md`, `rules_public_md`, the public
         `scoring_rules`, its `tools`; None until the ChatPod is up),
@@ -3482,7 +3541,7 @@ class MLArenaClient:
         `scoreboard`, the same keys `chat_challenge()` serves) and `can_send`
         with `can_send_reason` (`session_voided` | `session_closed` |
         `turn_in_flight` | `challenge_not_started` | `challenge_stopped` |
-        `agent_offline` |
+        `challenge_ended` | `agent_offline` |
         `turn_limit_reached`, None exactly when `can_send` is true). Readable
         by the session's user, their teammates, the challenge's creator /
         assistants and admins.
@@ -3781,6 +3840,247 @@ class MLArenaClient:
             "GET", f"/chat/challenge/{challenge_id}/export",
             error_label="export_chat_evidence", timeout=120,
         ).json()
+
+    # ---- Exercise challenges (`exercise_v1`) ---------------------------------
+
+    def _exercise_call(self, method: str, path: str, *,
+                       json_body: dict | None = None,
+                       params: dict | None = None,
+                       ok: tuple[int, ...] = (200,),
+                       error_label: str,
+                       not_found: type = ChallengeNotFoundError) -> dict:
+        """Single chokepoint for the `/api/exercise/*` routes (`_chat_call`'s
+        sibling). `not_found` names the class a 404 raises:
+        `ChallengeNotFoundError` on a challenge-scoped route (an unknown or
+        inactive exercise key included), `ExerciseAttemptNotFoundError` on an
+        attempt-scoped one. Any other non-`ok` status — 409 (an attempt of
+        this exercise is still in flight, the challenge is not started), 429
+        (over the per-minute attempt cap), 400 — raises `MLArenaError` with
+        the server's reason, `status_code` and `body`."""
+        resp = self._request(
+            method, self._url(path),
+            headers=self._headers(json_body=json_body is not None),
+            json=json_body, params=params, timeout=30,
+        )
+        self._handle_response(resp, not_found=not_found)
+        if resp.status_code not in ok:
+            raise _failed(MLArenaError, error_label, resp)
+        return resp.json()
+
+    def exercise_challenge(self, challenge_id: int) -> dict:
+        """An exercise challenge and your progress on it — `ExerciseChallengeOut`.
+
+        Mirrors `GET /api/exercise/challenge/{cid}` (`backend/app/views/exercise/`).
+        Returns `challenge_id`, `env_status` (`unknown` | `loading` | `ready`
+        | `error`: the checker's load of the creator's `env.py`, self-test
+        included), `checker_online` (the resident checker claimed work within
+        the last 30 s; a set idle for 30 min sleeps and wakes on the next
+        attempt, which then takes 10–20 s), `time_limit_sec`, your group's
+        `submission_id` (None before your first attempt), `score` (the
+        percentage of points solved, None before your first attempt),
+        `points_earned`, `points_available`, and `exercises` in order — each
+        `ExerciseOut`: `key`, `position`, `kind` (`code` | `text` |
+        `choice`), `title`, `points` (0 = practice: checked, never scored),
+        `starter_code`, `examples`, `choices` (the options of a `choice`
+        exercise, else None), and your state: `solved` (a passed attempt
+        exists), `attempt_count`, `last_attempt` (`ExerciseAttemptOut` or
+        None).
+
+        Readable by anyone who may view the challenge; the per-exercise state
+        is yours (your team's on a team challenge).
+
+        Raises `ChallengeNotFoundError` when the challenge is not an exercise
+        challenge or is hidden from you.
+        """
+        return self._exercise_call(
+            "GET", f"/exercise/challenge/{challenge_id}",
+            error_label="exercise_challenge",
+        )
+
+    def submit_exercise(self, challenge_id: int, key: str,
+                        code: str | None = None, answer: str | None = None, *,
+                        wait: bool = True, timeout: float = 60,
+                        poll_interval: float = 0.4) -> dict:
+        """Send one attempt at exercise `key` and, by default, wait for the verdict.
+
+        Mirrors `POST /api/exercise/challenge/{cid}/exercises/{key}/attempts`
+        (`CreateExerciseAttemptRequest`): `code` for a `code` exercise,
+        `answer` for a `text` or `choice` one (a `choice` answer is one of
+        the exercise's `choices`) — exactly one of the two, at most 64 KiB.
+        The server answers 202 with the `pending` `ExerciseAttemptOut` as
+        soon as the attempt is queued for the checker. Your group's
+        submission is created on its first attempt (born active: nothing to
+        upload or deploy).
+
+        With `wait=True` (default) the call then polls `exercise_attempt()`
+        every `poll_interval` seconds — a client-side composition of the two
+        public routes, the console's own cadence; there is no wait endpoint —
+        until the attempt is settled, and returns it:
+
+        - `status="passed"`: solved (`error_type` None).
+        - `status="failed"`: the verdict on your code or answer, with
+          `error_type` `failed` (an assertion: its message is
+          `feedback["assertion"]`), `syntax_error` / `runtime_error`
+          (`feedback["line"]` is the line in your code, `traceback` the
+          trimmed traceback), `timeout`, `memory` or `output_limit`;
+          `feedback["stdout"]` is what your code printed.
+
+        An attempt that ends `status="error"` is not a verdict on your code
+        (`grader_error`: the checker failed, the creator was told;
+        `worker_offline`: no checker picked it up) and raises `MLArenaError`
+        carrying the attempt as `.body` — send it again later. Not settled
+        after `timeout` seconds raises `MLArenaError` naming the state the
+        attempt was left in (the first attempt on a sleeping set waits for
+        the checker to start).
+
+        With `wait=False` the 202 body is returned as-is.
+
+        Raises `MLArenaError` before any request unless exactly one of
+        `code` / `answer` is given; `ChallengeNotFoundError` for an unknown or
+        inactive key or a hidden challenge; `MLArenaError` with the server's
+        reason on a refusal — 409 while an attempt of this exercise is still
+        in flight for your group (`.body["attempt_id"]` names it), when the
+        challenge is a draft (not started) or closed (stopped or ended); 429
+        over the challenge's per-minute attempt cap (`.body
+        ["max_attempts_per_minute"]`, per group, last 60 s); 400 for `code`
+        on a text / choice exercise, `answer` on a code one, or a `choice`
+        answer that is not one of its `choices`.
+        """
+        if (code is None) == (answer is None):
+            raise MLArenaError(
+                "submit_exercise takes exactly one of code= (a code exercise) "
+                "or answer= (a text or choice exercise)"
+            )
+        accepted = self._exercise_call(
+            "POST", f"/exercise/challenge/{challenge_id}/exercises/{quote(key, safe='')}/attempts",
+            json_body={"code": code, "answer": answer}, ok=(202,),
+            error_label="submit_exercise",
+        )
+        if not wait:
+            return accepted
+        return self._wait_for_exercise_attempt(
+            accepted["id"], timeout=timeout, poll_interval=poll_interval,
+        )
+
+    def _wait_for_exercise_attempt(self, attempt_id: int, *, timeout: float,
+                                   poll_interval: float) -> dict:
+        """Poll `exercise_attempt` until it settles (see `submit_exercise`)."""
+        deadline = time.monotonic() + timeout
+        while True:
+            attempt = self.exercise_attempt(attempt_id)
+            status = attempt["status"]
+            if status in ("passed", "failed"):
+                return attempt
+            if status == "error":
+                reason = f"exercise attempt {attempt_id} errored ({attempt['error_type']})"
+                if attempt["message"]:
+                    reason += f": {attempt['message']}"
+                raise MLArenaError(reason, body=attempt)
+            if time.monotonic() > deadline:
+                raise MLArenaError(
+                    f"submit_exercise timed out after {timeout}s: attempt "
+                    f"{attempt_id} is still {status!r}. Poll "
+                    f"exercise_attempt({attempt_id}) or raise timeout.",
+                    body=attempt,
+                )
+            time.sleep(poll_interval)
+
+    def exercise_attempt(self, attempt_id: int) -> dict:
+        """One attempt — `ExerciseAttemptOut`.
+
+        Mirrors `GET /api/exercise/attempts/{aid}`. Returns `id`,
+        `challenge_id`, `exercise_key`, `user_id` (who sent it), `status`
+        (`pending` | `running` | `passed` | `failed` | `error`), `error_type`
+        (None unless failed or error; see `submit_exercise`), `message`,
+        `feedback` (`ExerciseFeedback`: `assertion`, `traceback`, `stdout`,
+        `line`, `expected_hint`; None until settled), `duration_ms`, the
+        `code` or `answer` sent (the other is None), `created_at_ts` and
+        `completed_at_ts`. The `message` of a `grader_error` is the
+        checker's own text for the challenge's staff and a fixed sentence for
+        everyone else.
+
+        Readable by the attempt's group, the challenge's creator / assistants,
+        admins and the student's teachers. Cheap enough to poll —
+        `submit_exercise(wait=True)` does.
+
+        Raises `ExerciseAttemptNotFoundError` when the attempt does not exist
+        or is not yours to read.
+        """
+        return self._exercise_call(
+            "GET", f"/exercise/attempts/{attempt_id}",
+            error_label="exercise_attempt", not_found=ExerciseAttemptNotFoundError,
+        )
+
+    def exercise_attempts(self, challenge_id: int, user_id: int | None = None,
+                          key: str | None = None) -> dict:
+        """The attempts of an exercise challenge — `ExerciseAttemptListResponse`.
+
+        Mirrors `GET /api/exercise/challenge/{cid}/attempts?user_id=&key=`.
+        Returns `{"attempts": [ExerciseAttemptOut, ...]}`, the submitted
+        `code` / `answer` included. A participant reads their own group's;
+        the challenge's creator / assistants, admins and the teachers of a
+        course the student is enrolled in read a student's (`user_id`).
+        `key` keeps one exercise's. Only the filters passed are sent.
+        """
+        params = {name: value for name, value in (("user_id", user_id), ("key", key))
+                  if value is not None}
+        return self._exercise_call(
+            "GET", f"/exercise/challenge/{challenge_id}/attempts",
+            params=params or None, error_label="exercise_attempts",
+        )
+
+    def exercise_admin(self, challenge_id: int) -> dict:
+        """The creator view of an exercise set — `ExerciseChallengeAdminOut`.
+
+        Mirrors `GET /api/exercise/challenge/{cid}/admin`. Returns the
+        checker's health (`env_status`, `env_status_message` — the load or
+        self-test error, naming the exercise whose `solution` failed or whose
+        `wrong` passed —, `env_status_at_ts`, `manifest_at_ts`,
+        `checker_online`, `worker_ref`), the four limits (`time_limit_sec`,
+        `memory_limit_mb`, `max_concurrent_attempts`,
+        `max_attempts_per_minute`; written with `update_settings`) and
+        `exercises`, every exercise the manifest ever posted — `key`,
+        `position`, `kind`, `title`, `points`, `is_active` (False once a key
+        left env.py; its attempts are kept), `attempt_count`, `solved_count`.
+
+        Readable by the challenge's creator / assistants and admins; anyone
+        else gets `ChallengeNotFoundError` (404), as for a non-exercise
+        challenge.
+        """
+        return self._exercise_call(
+            "GET", f"/exercise/challenge/{challenge_id}/admin",
+            error_label="exercise_admin",
+        )
+
+    def check(self, challenge_id: int, key: str, obj, *, timeout: float = 60,
+              echo: bool = True) -> dict:
+        """Check a function, a class or a str of code against a `code` exercise.
+
+        A client-side composition — no endpoint of its own (the `submit()`
+        idiom): sends `source_of(obj)` — the object's source through
+        `inspect.getsource`, or the `str` as it is — with
+        `submit_exercise(challenge_id, key, code=…, wait=True)`, prints the
+        verdict line (`format_attempt`: `imc: passed (8 ms)`, or the status,
+        the assertion, the line and the output) unless `echo=False`, and
+        returns the settled `ExerciseAttemptOut`:
+
+            def calculer_imc(poids_kg, taille_m):
+                return round(poids_kg / taille_m ** 2, 1)
+
+            client.check(42, "imc", calculer_imc)
+            client.check(42, "patients", "import math\\n\\ndef ...")
+
+        Only the object's own definition is sent: helpers it calls and the
+        imports it relies on go in a `str`. A `text` or `choice` exercise
+        takes `submit_exercise(…, answer=…)`. Raises as `submit_exercise`
+        does.
+        """
+        attempt = self.submit_exercise(
+            challenge_id, key, code=source_of(obj), wait=True, timeout=timeout,
+        )
+        if echo:
+            print(format_attempt(attempt))
+        return attempt
 
     # ---- Course content: shared JSON-call helper ----------------------------
 
