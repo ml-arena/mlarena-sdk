@@ -2,6 +2,42 @@
 
 Python SDK for [ML Arena](https://ml-arena.com) — make submissions, manage challenges, manage courses, and read leaderboards from any notebook or IDE.
 
+## 4.8.0 — each challenge chooses its agent runtimes; challenge slugs
+
+Requires a platform with the per-challenge agent runtime set and challenge
+slugs; on an older one `agent_runtimes()` and `challenge_by_slug()` raise
+`ChallengeNotFoundError` (the routes' 404) and the two `update_settings`
+keywords a 400.
+
+- New: `challenge_by_slug(slug)` (`GET /api/challenges/slug/{slug}`) — the
+  `challenge()` detail looked up by the `<slug>` of
+  `https://ml-arena.com/challenges/<slug>`. Challenge rows (detail, catalogue,
+  `my_submissions`, course and run payloads) carry the slug, which follows the
+  challenge's name.
+
+- A code challenge now offers an explicit set of agent runtime images and
+  names its default; until now every image of the kernel was offered and the
+  default was arbitrary. `challenge(cid)["runtime_options"]` (and
+  `runtime_options(cid)`) is that set, ordered by id;
+  `challenge(cid)["default_agent_runtime_id"]` is the runtime a new
+  submission gets (None for a file or chat challenge).
+- New: `agent_runtimes(kernel_version="flex_v1")` (`GET
+  /api/agent-runtimes?kernel_version=`, creator scope) — the kernel's
+  catalogue of agent runtime images, the rows a creator picks the set from,
+  as a DataFrame.
+- `update_settings(cid, agent_runtime_ids=[…], default_agent_runtime_id=…)`
+  (creator keys, editable while the challenge runs) replaces the set and the
+  default. 400 on an id of another kernel, an empty set or a default outside
+  the set.
+- `set_agent_runtime()` refuses a runtime the challenge does not offer (400).
+  A submission keeps the image it already pins when the creator removes it
+  from the set; its next deploy is refused (409) until it picks an offered
+  runtime. A newly synced image joins no challenge until a creator adds it.
+- Every runtime row (`runtime_options`, `agent_runtimes`,
+  `agent_runtime(sid)`) gains `custom_pkg`: "none" on a generic image, an env
+  family's name (e.g. "v1kart") on one built for that family. The benchmark
+  runs on the challenge's default runtime.
+
 ## 4.7.1 — 2026-11-04
 
 No new method; the docstrings follow the platform's 2026-11-03 payloads.
@@ -956,9 +992,10 @@ under the same names: `agent_error_type` / `agent_error_message`.
 
 ### Runners (DockerImageAgentRuntime, user scope)
 
-- `client.runtime_options(challenge_id)` — list runtimes compatible with the challenge (`challenge(challenge_id)["runtime_options"]`).
+- `client.runtime_options(challenge_id)` — the runtimes the challenge offers (`challenge(challenge_id)["runtime_options"]`), the set its creator chose; a new submission gets `challenge(challenge_id)["default_agent_runtime_id"]`.
 - `client.agent_runtime(submission_id)` — the agent runtime pinned to a submission (`submission(submission_id)["agent_runtime"]`); `None` for a file or chat challenge's submission, which runs no agent container.
-- `client.set_agent_runtime(submission_id, runtime_id)` — pin a runtime by id.
+- `client.set_agent_runtime(submission_id, runtime_id)` — pin a runtime by id; one the challenge does not offer is refused (400).
+- `client.agent_runtimes(kernel_version="flex_v1")` — creator scope: the kernel's catalogue of agent runtime images, to pick a challenge's set from with `update_settings(challenge_id, agent_runtime_ids=[…], default_agent_runtime_id=…)`.
 - `client.resolve_runtime(challenge_id, language=None, framework=None, framework_version=None)` — resolve a (lang, framework, version) spec to one runtime row.
 
 ## Full participant workflow
@@ -1000,6 +1037,7 @@ print(c.leaderboard(cid).head())
 
 - `client.challenges(q=None, tags=None, status="started", page=None, per_page=None)` — public list. `status` is `"started"` (started challenges only) or `"all"` (draft, started and stopped). Each row's `status` is `"draft"`, `"started"` or `"stopped"`.
 - `client.challenge(challenge_id)` — the participant view: the kernel, the limits, the machine and its health.
+- `client.challenge_by_slug(slug)` — the same detail, looked up by the `<slug>` of `https://ml-arena.com/challenges/<slug>`; its `id` is what the other methods take.
 - `client.replays(challenge_id, limit=12, before_simulation_result_id=None, mine=False)` — the challenge's newest runs with a replay (public `ReplayRun` rows: who played, how it ended, the replay), paged by `simulation_result_id`; `mine=True` keeps the runs your submissions played in. `client.replay(challenge_id, simulation_result_id)` — one of them, freshly signed. `client.download_replay(run, dest_dir)` — saves a row's replay file. `recent_replays` is a deprecated alias of `replays`.
 - `client.create_challenge(name, kernel_version, description=None, copy_from_challenge_id=None, tag_names=None)` — creator scope. The backend resolves the machine (the kernel's default queue) + default evaluation + default env runtime from `kernel_version`; the reply names it (`machine_name`). Pass `tag_names=["rl", "research"]` to attach tags at creation time; unknown names raise `MLArenaError`.
 - `client.available_kinds()` / `client.copyable_challenges()` — creator scope. What `kernel_version` and `copy_from_challenge_id` accept; each kind's `has_machine`, `runtime_defaults` and `runtime_presets`.

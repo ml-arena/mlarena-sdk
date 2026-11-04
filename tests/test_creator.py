@@ -551,6 +551,43 @@ def test_machines_refusal_carries_the_reply():
         raise AssertionError("expected MLArenaError")
 
 
+def test_update_settings_sends_the_agent_runtime_set_and_default():
+    """docs/agent_runtime_choice.md: the offered set and the default go
+    through PUT /settings under their config-key names; None is not sent."""
+    c, rec = make_client(lambda *_: (200, {"configuration": {}, "evaluation": {}}))
+    c.update_settings(7, agent_runtime_ids=[3, 5], default_agent_runtime_id=5)
+    _expect(rec.last["path"] == CREATOR + "/settings", rec.last["path"])
+    _expect(rec.last["json"] == {"agent_runtime_ids": [3, 5], "default_agent_runtime_id": 5},
+            rec.last["json"])
+    c.update_settings(7, default_agent_runtime_id=3)
+    _expect(rec.last["json"] == {"default_agent_runtime_id": 3}, rec.last["json"])
+
+
+def test_agent_runtimes_lists_the_kernel_catalogue():
+    rows = [{"id": 3, "language": "python", "language_version": "3.12", "framework": "none",
+             "framework_version": "none", "custom_pkg": "none", "requirement": "", "display_name": "No framework",
+             "packages": []}]
+    c, rec = make_client(lambda *_: (200, rows))
+    got = c.agent_runtimes()
+    got = got.to_dict("records") if hasattr(got, "to_dict") else got
+    _expect(got == rows, got)
+    _expect((rec.last["method"], rec.last["path"]) == ("GET", "/agent-runtimes"),
+            (rec.last["method"], rec.last["path"]))
+    _expect(rec.last["params"] == {"kernel_version": "flex_v1"}, rec.last["params"])
+    c.agent_runtimes(kernel_version="file_v1")
+    _expect(rec.last["params"] == {"kernel_version": "file_v1"}, rec.last["params"])
+
+
+def test_agent_runtimes_refusal_carries_the_reply():
+    c, _ = make_client(lambda *_: (400, {"error": "Unknown kernel_version 'x'"}))
+    try:
+        c.agent_runtimes(kernel_version="x")
+    except MLArenaError as exc:
+        _expect(exc.status_code == 400, exc.status_code)
+    else:
+        raise AssertionError("expected MLArenaError")
+
+
 def test_no_engine_left_in_the_public_docstrings():
     """engine → machine (machine_model): the kinds, challenge and creator
     docstrings name the served keys."""

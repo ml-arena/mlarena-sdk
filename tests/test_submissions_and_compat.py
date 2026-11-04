@@ -18,6 +18,8 @@ import sys
 import tempfile
 import warnings
 
+import pytest
+
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import mlarena
@@ -1540,3 +1542,17 @@ def test_no_api_call_ends_on_raise_for_status():
     # in `download_dataset`: an R2 reply, not an API one (no `error` body).
     with open(os.path.join(SDK_ROOT, "mlarena", "client.py"), encoding="utf-8") as fh:
         assert fh.read().count(".raise_for_status()") == 1
+
+
+def test_challenge_by_slug_gets_the_slug_route():
+    detail = {"id": 8, "name": "1 Minute Permuted MNIST", "slug": "1-minute-permuted-mnist"}
+    c, rec = make_client(lambda *_: (200, detail))
+    assert c.challenge_by_slug("1-minute-permuted-mnist") == detail
+    assert rec.last["method"] == "GET"
+    assert rec.last["path"] == "/challenges/slug/1-minute-permuted-mnist"
+
+
+def test_challenge_by_slug_raises_on_404():
+    c, _ = make_client(lambda *_: (404, {"error": "Not found"}))
+    with pytest.raises(ChallengeNotFoundError):
+        c.challenge_by_slug("no-such-board")

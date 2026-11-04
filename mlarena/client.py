@@ -18,6 +18,7 @@ import time
 import warnings
 from pathlib import Path
 from typing import Iterator
+from urllib.parse import quote
 
 import requests
 
@@ -557,6 +558,12 @@ class MLArenaClient:
         unknown) — read from the creator's ground truth; None for any other
         kind, a non-CSV submission file, or before a `y_test.csv` is parsed.
         `miniature` is None when the challenge has no miniature.
+
+        `runtime_options` is the set of agent runtime images the challenge
+        offers (ordered by id; `[]` for a file or chat challenge) and
+        `default_agent_runtime_id` the one a new submission gets (None for a
+        file or chat challenge) — both written by the creator
+        (`update_settings(agent_runtime_ids=…, default_agent_runtime_id=…)`).
         """
         # Public route, but a non-public course challenge is only visible to a
         # caller the backend can identify: send the token.
@@ -565,6 +572,23 @@ class MLArenaClient:
         self._handle_response(resp)
         if resp.status_code != 200:
             raise _failed(MLArenaError, "challenge", resp)
+        return resp.json()
+
+    def challenge_by_slug(self, slug: str) -> dict:
+        """`challenge()`, looked up by the challenge's URL slug: the
+        `<slug>` of `https://ml-arena.com/challenges/<slug>`.
+
+        Returns the same detail (its `id` is what every other method takes).
+        A hidden challenge raises like a missing one. Mirrors
+        `GET /api/challenges/slug/{slug}` (`challenges.py`,
+        `get_challenge_by_slug`). The slug follows the challenge's name: a
+        rename (allowed only while the challenge is not started) changes it.
+        """
+        resp = self._request("GET", self._url(f"/challenges/slug/{quote(slug, safe='')}"),
+                             headers=self._headers(), timeout=30)
+        self._handle_response(resp)
+        if resp.status_code != 200:
+            raise _failed(MLArenaError, "challenge_by_slug", resp)
         return resp.json()
 
     def machines(self, kernel_version: str | None = None) -> list:
@@ -1102,6 +1126,8 @@ class MLArenaClient:
                         gpu_memory_limit: str | None | _Unset = _UNSET,
                         number_of_agents: int | None = None,
                         docker_image_env_runtime_id: int | None = None,
+                        agent_runtime_ids: list[int] | None = None,
+                        default_agent_runtime_id: int | None = None,
                         render_delay_second: float | None = None,
                         ) -> dict:
         """Update challenge settings + evaluation parameters.
@@ -1271,6 +1297,22 @@ class MLArenaClient:
             docker_image_env_runtime_id: the env runtime image, of the
                 challenge's own kernel.
 
+        Agent runtimes (creator keys, kinds with `agent_containers`;
+        editable while the challenge runs — an offer changes no score):
+            agent_runtime_ids: the agent runtime images participants may pick,
+                the whole set (it replaces the stored one): non-empty, unique
+                ids from `agent_runtimes(kernel_version)`. A submission keeps
+                the image it already pins when that image leaves the set; its
+                next deploy is refused (409) until its owner picks an offered
+                runtime (`set_agent_runtime`).
+            default_agent_runtime_id: the runtime a new submission gets, one
+                of the set. Removing the current default from the set needs a
+                new default in the same call.
+            The backend checks the merged pair and answers 400 naming the
+            rule: an id of another kernel, an empty set, a default outside
+            the set. `challenge(id)["runtime_options"]` /
+            `["default_agent_runtime_id"]` serve them back.
+
         Replay (a creator key, editable while started):
             render_delay_second: the default frame duration (s, >= 0): how
                 long a replay frame that sets no `duration_s` of its own is
@@ -1315,6 +1357,8 @@ class MLArenaClient:
             "agent_gpu_count": agent_gpu_count,
             "number_of_agents": number_of_agents,
             "docker_image_env_runtime_id": docker_image_env_runtime_id,
+            "agent_runtime_ids": agent_runtime_ids,
+            "default_agent_runtime_id": default_agent_runtime_id,
             "render_delay_second": render_delay_second,
         }
         body = {key: value for key, value in sent.items() if value is not None}
@@ -2071,8 +2115,9 @@ class MLArenaClient:
         """Create a new submission for `challenge_id`.
 
         Mirrors `POST /api/submissions/challenge/{cid}` (`create_delete.py`).
-        With `copy_from_submission_id`, the files (and a compatible runtime) of
-        one of your existing submissions are copied into the new one. Returns
+        With `copy_from_submission_id`, the files of one of your existing
+        submissions are copied into the new one, with its agent runtime when
+        this challenge offers it (else the challenge's default). Returns
         `{"message", "submission_id", "status", "validation_message",
         "template_source", ...}`.
 
@@ -2223,12 +2268,41 @@ class MLArenaClient:
 
     # ---- Runner / runtime selection (DockerImageAgentRuntime) ----
 
+    def agent_runtimes(self, kernel_version: str = "flex_v1"):
+        """The agent runtime images of a kernel: the catalogue a creator picks
+        a challenge's offered set from (`update_settings(agent_runtime_ids=…,
+        default_agent_runtime_id=…)`).
+
+        Mirrors `GET /api/agent-runtimes?kernel_version=` — the list behind
+        the console's Agent runtimes setting. One row per image, the entry
+        shape `runtime_options()` lists: `{id, language, language_version,
+        framework, framework_version, custom_pkg, requirement, display_name,
+        packages}` (`custom_pkg` is "none" on a generic image, an env family's
+        name such as "v1kart" on one built for that family),
+        as a DataFrame when pandas is installed (a list of dicts otherwise).
+        A runtime synced after the challenge was created is offered only once
+        a creator adds it to the set. An unknown kernel answers 400.
+
+        Requires a `creator`-scope token.
+        """
+        resp = self._request("GET", self._url("/agent-runtimes"),
+                             params={"kernel_version": kernel_version},
+                             headers=self._headers(), timeout=30)
+        self._handle_response(resp)
+        if resp.status_code != 200:
+            raise _failed(MLArenaError, "agent_runtimes", resp)
+        return _to_dataframe(resp.json())
+
     def runtime_options(self, challenge_id: int):
-        """List runtimes (language × framework × version) compatible with this challenge.
+        """The agent runtimes (language × framework × version) this challenge offers.
 
         The challenge's own `runtime_options` (`challenge(challenge_id)`,
-        `GET /api/challenges/{id}`). Each entry: `{id, language,
-        language_version, framework, framework_version, requirement,
+        `GET /api/challenges/{id}`): the set its creator chose
+        (`update_settings(agent_runtime_ids=…)`), ordered by id — the only
+        runtimes `set_agent_runtime` accepts on it. The one a new submission
+        gets is `challenge(challenge_id)["default_agent_runtime_id"]`. Each
+        entry: `{id, language,
+        language_version, framework, framework_version, custom_pkg, requirement,
         display_name, packages}` — `display_name` is the runtime's one name
         (`"PyTorch"`, `"scikit-learn · XGBoost · LightGBM"`, `"No
         framework"`), `packages` its headline packages as `{name, version}`
@@ -2250,9 +2324,10 @@ class MLArenaClient:
         """Pin a `DockerImageAgentRuntime` onto a submission.
 
         Mirrors `PUT /api/submissions/agent_runtime/{sid}` (`runtime.py`,
-        `update_agent_runtime`). The backend rejects runtimes whose
-        `docker_image_worker_envagent_id` does not match the worker image of
-        the challenge's env runtime (its kernel).
+        `update_agent_runtime`). The runtime must be one the challenge offers
+        (`runtime_options(challenge_id)`): any other is refused with
+        `SubmissionError` (400); an unknown id is `SubmissionNotFoundError`
+        (404). Only while the submission is uploadable (409 after a deploy).
         """
         resp = self._request("PUT",
             self._url(f"/submissions/agent_runtime/{submission_id}"),
