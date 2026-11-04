@@ -15,6 +15,14 @@ keywords a 400.
   `my_submissions`, course and run payloads) carry the slug, which follows the
   challenge's name.
 
+- **Pick a runtime by name:** `submit(cid, files=[...], runtime="sklearn")`.
+  Every runtime row carries `name` (`"python"` for numpy + pandas,
+  `"sklearn"`, `"torch"`, `"tensorflow"`, `"jax"`, `"torch-kart"`), distinct
+  on a challenge and listed on its page; `resolve_runtime(cid, "sklearn")`
+  returns the row and an unknown name raises `MLArenaError` listing the
+  offered ones. Without `runtime`, a submission runs on the challenge's
+  default. `runtime={"framework": …}` and `resolve_runtime(cid, language=…,
+  framework=…)` still work but are deprecated (`DeprecationWarning`).
 - A code challenge now offers an explicit set of agent runtime images and
   names its default; until now every image of the kernel was offered and the
   default was arbitrary. `challenge(cid)["runtime_options"]` (and
@@ -992,11 +1000,11 @@ under the same names: `agent_error_type` / `agent_error_message`.
 
 ### Runners (DockerImageAgentRuntime, user scope)
 
-- `client.runtime_options(challenge_id)` — the runtimes the challenge offers (`challenge(challenge_id)["runtime_options"]`), the set its creator chose; a new submission gets `challenge(challenge_id)["default_agent_runtime_id"]`.
+- `client.runtime_options(challenge_id)` — the runtimes the challenge offers (`challenge(challenge_id)["runtime_options"]`), the set its creator chose, each with its `name` (`"python"`, `"sklearn"`, `"torch"`, …); a new submission gets `challenge(challenge_id)["default_agent_runtime_id"]`.
 - `client.agent_runtime(submission_id)` — the agent runtime pinned to a submission (`submission(submission_id)["agent_runtime"]`); `None` for a file or chat challenge's submission, which runs no agent container.
 - `client.set_agent_runtime(submission_id, runtime_id)` — pin a runtime by id; one the challenge does not offer is refused (400).
 - `client.agent_runtimes(kernel_version="flex_v1")` — creator scope: the kernel's catalogue of agent runtime images, to pick a challenge's set from with `update_settings(challenge_id, agent_runtime_ids=[…], default_agent_runtime_id=…)`.
-- `client.resolve_runtime(challenge_id, language=None, framework=None, framework_version=None)` — resolve a (lang, framework, version) spec to one runtime row.
+- `client.resolve_runtime(challenge_id, name)` — the challenge's runtime of that name (what `submit(..., runtime=name)` uses); an unknown name raises `MLArenaError` listing the offered names. The keyword form (`language=`, `framework=`, `framework_version=`) is deprecated.
 
 ## Full participant workflow
 
@@ -1007,12 +1015,12 @@ c = mlarena.connect("mlk_user_…", base_url="http://localhost:5000")
 
 cid = 42  # challenge id
 
-# 1. Pick a runner (language × framework)
-runtimes = c.runtime_options(cid)
-py_gym = c.resolve_runtime(cid, language="python", framework="gymnasium")
+# 1. The runtimes the challenge offers, by name: python, sklearn, torch, ...
+print(c.runtime_options(cid)[["name", "display_name"]])
 
-# 2. Create the submission + pin runner + upload files + deploy in one call
-sub = c.submit(cid, files=["agent.py", "model.pkl"], runtime_id=py_gym["id"])
+# 2. Create the submission + pin the runtime + upload files + deploy in one call
+#    (without runtime=, it runs on the challenge's default runtime)
+sub = c.submit(cid, files=["agent.py", "model.pkl"], runtime="sklearn")
 sid = sub["submission_id"]
 
 # 3. Inspect / edit a file in place after the initial upload

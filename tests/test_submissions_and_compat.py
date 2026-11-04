@@ -29,6 +29,7 @@ from mlarena.exceptions import (
     AuthenticationError,
     ChallengeNotFoundError,
     CompetitionNotFoundError,
+    MLArenaError,
     NotFoundError,
     PermissionDeniedError,
     SubmissionError,
@@ -525,7 +526,8 @@ def _submit_router(is_deployable=True):
             return (201, {"submission_id": 11, "status": "created"})
         if path == "/challenges/4":
             return (200, {"runtime_options": [
-                {"id": 7, "language": "python", "framework": "torch"}]})
+                {"id": 6, "name": "python", "language": "python", "framework": "none"},
+                {"id": 7, "name": "torch", "language": "python", "framework": "torch"}]})
         if path.endswith("/file"):
             return (200, {"message": "File operation successful",
                           "validation_message": "bad name"})
@@ -585,8 +587,9 @@ class MyAgent:
 
 def test_submit_with_agent_class_returns_submission_id_and_deploy():
     c, rec = make_client(_submit_router())
-    out = c.submit(4, agent=MyAgent, runtime={"framework": "torch"})
+    out = c.submit(4, agent=MyAgent, runtime="torch")
     assert out == {"submission_id": 11, "deploy": {"message": "queued"}}
+    assert rec.calls[2]["json"] == {"docker_image_agent_runtime_id": 7}
 
     seq = [(call["method"], call["path"]) for call in rec.calls]
     assert seq == [
@@ -603,6 +606,21 @@ def test_submit_with_agent_class_returns_submission_id_and_deploy():
     # status() defaults to the last submission.
     c.status()
     assert rec.last["path"] == "/submissions/submission/11"
+
+
+def test_submit_with_an_unknown_runtime_name_lists_the_offered_ones():
+    c, rec = make_client(_submit_router())
+    with pytest.raises(MLArenaError, match="no runtime named 'sklearn'; its runtimes: python, torch"):
+        c.submit(4, agent=MyAgent, runtime="sklearn")
+    assert not any(call["path"].endswith("/deploy") for call in rec.calls)
+
+
+def test_submit_with_a_runtime_dict_still_works_but_warns():
+    c, rec = make_client(_submit_router())
+    with pytest.warns(DeprecationWarning, match='runtime=\"sklearn\"') as caught:
+        c.submit(4, agent=MyAgent, runtime={"framework": "torch"})
+    assert len(caught) == 1
+    assert rec.calls[2]["json"] == {"docker_image_agent_runtime_id": 7}
 
 
 def test_submit_with_files_uses_submission_name():

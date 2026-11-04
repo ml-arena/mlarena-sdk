@@ -2275,7 +2275,7 @@ class MLArenaClient:
 
         Mirrors `GET /api/agent-runtimes?kernel_version=` — the list behind
         the console's Agent runtimes setting. One row per image, the entry
-        shape `runtime_options()` lists: `{id, language, language_version,
+        shape `runtime_options()` lists: `{id, name, language, language_version,
         framework, framework_version, custom_pkg, requirement, display_name,
         packages}` (`custom_pkg` is "none" on a generic image, an env family's
         name such as "v1kart" on one built for that family),
@@ -2301,9 +2301,11 @@ class MLArenaClient:
         (`update_settings(agent_runtime_ids=…)`), ordered by id — the only
         runtimes `set_agent_runtime` accepts on it. The one a new submission
         gets is `challenge(challenge_id)["default_agent_runtime_id"]`. Each
-        entry: `{id, language,
+        entry: `{id, name, language,
         language_version, framework, framework_version, custom_pkg, requirement,
-        display_name, packages}` — `display_name` is the runtime's one name
+        display_name, packages}` — `name` is what `submit(..., runtime=...)`
+        takes (`"python"`, `"sklearn"`, `"torch"`; distinct on a challenge),
+        `display_name` how it reads
         (`"PyTorch"`, `"scikit-learn · XGBoost · LightGBM"`, `"No
         framework"`), `packages` its headline packages as `{name, version}`
         (`[]` for no framework); both None only on a runtime no image sync
@@ -2340,19 +2342,37 @@ class MLArenaClient:
             raise _failed(SubmissionError, "set_agent_runtime", resp)
         return resp.json()
 
-    def resolve_runtime(self, challenge_id: int, *,
+    def resolve_runtime(self, challenge_id: int, name: str | None = None, *,
                         language: str | None = None,
                         framework: str | None = None,
                         framework_version: str | None = None) -> dict:
-        """Find one runtime matching the given language/framework on this challenge.
+        """The runtime of this challenge named `name` ("python", "sklearn",
+        "torch", ...): a challenge's offered runtimes have distinct names.
 
-        Convenience wrapper over `runtime_options`. Returns the first match,
-        or raises `MLArenaError` if none. Used internally by `submit()` when
-        the caller passes `runtime={"language": ...}` instead of a numeric id.
+        Convenience over `runtime_options`; raises `MLArenaError` listing the
+        offered names when none matches. What `submit(..., runtime="sklearn")`
+        calls. The keyword form (`language=` / `framework=` /
+        `framework_version=`, first match) is deprecated (4.8.0).
         """
         opts = self.runtime_options(challenge_id)
         # Normalize back to list[dict] in case pandas converted it.
         rows = opts.to_dict("records") if hasattr(opts, "to_dict") else list(opts)
+        if name is not None:
+            if (language, framework, framework_version) != (None, None, None):
+                raise MLArenaError("Pass a runtime name or the deprecated keywords, not both")
+            for r in rows:
+                if r["name"] == name:
+                    return r
+            raise MLArenaError(
+                f"Challenge {challenge_id} offers no runtime named {name!r}; "
+                f"its runtimes: {', '.join(sorted(r['name'] for r in rows))}"
+            )
+        warnings.warn(
+            "resolve_runtime(language=, framework=, framework_version=) is deprecated, "
+            "pass the runtime's name: resolve_runtime(challenge_id, \"sklearn\")",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         for r in rows:
             if language is not None and r.get("language") != language:
                 continue
@@ -3008,7 +3028,7 @@ class MLArenaClient:
     def submit(self, challenge_id: int, agent=None, files=None,
                submission_name: str | None = None,
                runtime_id: int | None = None,
-               runtime: dict | None = None,
+               runtime: str | dict | None = None,
                wait: bool = False,
                timeout_sec: float | None = None,
                poll_sec: float = 5.0) -> dict:
@@ -3020,12 +3040,15 @@ class MLArenaClient:
         base name without extension.
 
         Optional runner selection (between create and deploy):
-            runtime_id: numeric `DockerImageAgentRuntime.id`.
-            runtime:    dict spec resolved via `resolve_runtime()`, e.g.
-                        `{"language": "python", "framework": "torch"}`. The
-                        first runtime matching every supplied key is used.
+            runtime:    the runtime's name, one the challenge offers
+                        (`runtime_options(challenge_id)["name"]`, listed on the
+                        challenge page): "python", "sklearn", "torch", ...
+                        Resolved by `resolve_runtime()`. A dict spec
+                        (`{"framework": "torch"}`) is deprecated (4.8.0).
+            runtime_id: the runtime's numeric id.
         Pass at most one of `runtime_id` / `runtime`. With neither, the
-        backend's challenge-default runtime is kept.
+        submission runs on the challenge's default runtime
+        (`challenge(challenge_id)["default_agent_runtime_id"]`).
 
         After the uploads, the submission's `is_deployable` is checked (one
         `submission()` call) and a `SubmissionError` carrying the
@@ -3070,8 +3093,18 @@ class MLArenaClient:
         self._last_challenge = challenge_id
 
         # Pin runner before deploy so the JobPod uses the right image.
-        if runtime is not None:
-            runtime_id = self.resolve_runtime(challenge_id, **runtime)["id"]
+        if isinstance(runtime, dict):
+            warnings.warn(
+                "submit(runtime={...}) is deprecated, pass the runtime's name: "
+                "runtime=\"sklearn\" (runtime_options(challenge_id) lists them)",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            with warnings.catch_warnings():  # warned once, just above
+                warnings.simplefilter("ignore", DeprecationWarning)
+                runtime_id = self.resolve_runtime(challenge_id, **runtime)["id"]
+        elif runtime is not None:
+            runtime_id = self.resolve_runtime(challenge_id, runtime)["id"]
         if runtime_id is not None:
             self.set_agent_runtime(submission_id, runtime_id)
 
