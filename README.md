@@ -2,6 +2,24 @@
 
 Python SDK for [ML Arena](https://ml-arena.com) — make submissions, manage challenges, manage courses, and read leaderboards from any notebook or IDE.
 
+## 4.7.1 — 2026-11-04
+
+No new method; the docstrings follow the platform's 2026-11-03 payloads.
+
+- `my_submissions()` also lists your teammates' submissions on a challenge
+  where you are in a team; each row carries `owner` (`{user_id, username,
+  avatar_key}`) and `viewer_role` (`owner` | `teammate`).
+  `started_submissions_count` stays the count of your own `active`
+  submissions.
+- Deploy attempts (`submission_deploys()` rows, `submission()["latest_deploy"]`)
+  carry `initiated_by`: `participant` | `staff` | `operator`. Only your own
+  (`participant`) deploys spend the daily deploy quota; a creator's clean
+  redeploy no longer does.
+- `challenges()` / `challenge()` `statistics`: `unique_participants` counts a
+  team once and a user in no team once; `team_count` is gone.
+- API keys: the platform accepts only keys with a 16-hex lookup
+  (`mlk_<scope>_<16-hex>_<32-hex>`), the format every key has been issued in.
+
 ## 4.7.0 — 2026-10-29
 
 Requires a platform with the data.gouv.fr reuse routes; on an older one the
@@ -816,7 +834,7 @@ import mlarena
 
 # Connect with your API key (Profile page → "API Keys"). The token is the full
 # string starting with `mlk_…`, not a `key_id:key_pass` pair.
-client = mlarena.connect(api_key="mlk_user_a1b2c3d4_<32-hex-secret>")
+client = mlarena.connect(api_key="mlk_user_a1b2c3d4e5f60718_<32-hex-secret>")
 
 # List challenges (public, no auth)
 client.challenges()

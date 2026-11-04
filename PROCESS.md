@@ -1,6 +1,6 @@
 # mlarena-sdk — Python SDK
 
-**Purpose**: Python client (`mlarena-sdk` 4.6.0, import `mlarena`) over the public backend REST routes (`/api/*`).
+**Purpose**: Python client (`mlarena-sdk` 4.7.1, import `mlarena`) over the public backend REST routes (`/api/*`).
 
 **Key features**:
 - Bearer-token auth with scope-segmented keys `mlk_<scope>_<lookup>_<secret>` (`user`, `creator`, `teacher`).
@@ -59,7 +59,7 @@ When this table drifts from `client.py`, fix the code, not the table.
 
 ### Parity gaps (frontend-only routes, no SDK method)
 
-- The public overview markdown / miniature reads (`GET /api/challenge_asset/*`) have no participant method; creators read them through `challenge_markdown` / `challenge_image`. `GET /api/challenges/<id>/configuration` (read by the console's creator editor) has no method: creators get the same row as `creator_challenge()["configuration"]`. Every other participant, creator and teacher route has its method (table above).
+- The public overview markdown / miniature reads (`GET /api/challenge_asset/*`) have no participant method; creators read them through `challenge_markdown` / `challenge_image`. Creators read the challenge configuration as `creator_challenge()["configuration"]`. Every other participant, creator and teacher route has its method (table above).
 - The env-runtime image list (`GET /api/docker-kernel-version/`, the picker behind `update_settings(docker_image_env_runtime_id=…)`) has no method: the route is `auth_required("admin")`, which takes no API key, so an SDK method would only raise 403. `env_runtimes()` (machine_model §3.5) waits for that route to accept a bearer caller, or for a public read.
 - By design console-only: admin cluster-ops (machines and their queues and grants — D8 —, maintenance, data-quality, admin runs, tag CRUD), the admin challenge delete (`DELETE /api/challenges/<id>`, listed in the platform CLAUDE.md), and **API-key management**. `GET /api/auth/api_keys` and `POST /api/auth/api_keys/{scope}/rotate` are `session_auth_required`: they answer 403 to a bearer caller, so that a leaked `mlk_user_…` key cannot mint a `mlk_creator_…` one for the same account. An SDK method would only ever raise 403, so there is none — `me()` covers "who am I", and keys are rotated from the console's Profile page. This is the auth axis of the parity rule, not a gap.
 

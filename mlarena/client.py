@@ -484,7 +484,9 @@ class MLArenaClient:
         (the image route, None when the challenge has no miniature),
         ``status`` (``"draft"`` | ``"started"`` | ``"stopped"``),
         ``is_award_points``, ``number_of_agents``, ``tags``,
-        ``statistics``, ``kernel_version`` and ``kind_label`` (the kind and
+        ``statistics`` (``running_submissions`` and
+        ``unique_participants``: a team counts once, a user in no team
+        once), ``kernel_version`` and ``kind_label`` (the kind and
         its one label, ``"Code challenge"`` | ``"File challenge"`` |
         ``"Chat challenge"``; None without a configuration), ``my_rank``
         (your participant's rank on the challenge's board; None when
@@ -2471,7 +2473,11 @@ class MLArenaClient:
         - `latest_deploy` — the newest attempt (`submission_deploys()` row:
           `id`, `created_at_ts`, `status` — `queued` | `running` |
           `succeeded` | `failed` | `cancelled` —, `finished_at_ts`,
-          `failure_message`, `failure_owner`), None before the first deploy.
+          `failure_message`, `failure_owner`, `initiated_by`), None before the
+          first deploy. `initiated_by` says who started it: `participant`
+          (you, `deploy_submission`), `staff` (a creator's
+          `clean_redeploy_submission`) or `operator`; only `participant`
+          attempts spend your daily deploy quota.
           `failure_owner` says who a `failed` attempt's verdict blames:
           `participant` (your code or file), `challenge` (the challenge's
           env, or the challenge changed under the attempt) or `platform`
@@ -2617,7 +2623,7 @@ class MLArenaClient:
         Mirrors `GET /api/submissions/submission/{sid}/deploys` (`read.py`).
         Returns `{"deploys": [...]}`, each row the `latest_deploy` shape of
         `submission()` (`id`, `created_at_ts`, `status`, `finished_at_ts`,
-        `failure_message`, `failure_owner`). An attempt's runs are
+        `failure_message`, `failure_owner`, `initiated_by`). An attempt's runs are
         `submission_runs(submission_id, deploy_id=row["id"])`.
         """
         resp = self._request("GET",
@@ -2636,13 +2642,18 @@ class MLArenaClient:
         Mirrors `GET /api/submissions/mine` (`my_submissions.py`) — what the
         console's My Submissions page lists.
 
-        Returns `submissions`, `started_submissions_count` and
+        Lists your own submissions and, on a challenge where you are in a
+        team, your teammates' (a team is one participant). Returns
+        `submissions`, `started_submissions_count` (how many of *your own*
+        submissions are `active`; a teammate's is not counted) and
         `deployment_limits` (the same quota block `submission_deploy_status`
         serves). Each row carries `id`, `submission_name`, `challenge_id`,
         `challenge_name`, `rank`, `created_at_ts`, `challenge_start_date_ts`
-        (the challenge's own `start_date_ts` column), `last_end_run_ts` and the
-        status block. Deleted submissions are not
-        listed: a row you deleted is gone from here, as from the console.
+        (the challenge's own `start_date_ts` column), `last_end_run_ts`,
+        `owner` (`{user_id, username, avatar_key}`), `viewer_role` (`owner` |
+        `teammate`: only the owner writes) and the status block. Deleted
+        submissions are not listed: a row you deleted is gone from here, as
+        from the console.
         `rank` is the place of the submission's row on the challenge
         leaderboard, one row per participant (the team's or your best active
         submission, as `leaderboard()` ranks it by default); None for a
