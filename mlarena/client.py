@@ -495,10 +495,11 @@ class MLArenaClient:
         its one label, ``"Code challenge"`` | ``"File challenge"`` |
         ``"Chat challenge"``; None without a configuration), ``my_rank``
         (your participant's rank on the challenge's board; None when
-        anonymous or with nothing on the board) and ``course`` (always null
-        on these rows: only the console's "My Courses" grouping,
-        ``course_challenges``, nests the course). Call ``challenge(id)`` for
-        the machine and the limits.
+        anonymous or with nothing on the board) and ``course``
+        (``{id, name, code}`` of the course you are enrolled in that holds
+        the challenge, None otherwise; those rows are listed first, and
+        ``q`` also matches them on the course's name or code). Call
+        ``challenge(id)`` for the machine and the limits.
         """
         base_params: dict = {}
         if q:
@@ -3480,7 +3481,9 @@ class MLArenaClient:
         `number_of_runs` —, `rank` — the group's place on `leaderboard()`,
         whose `score` is the same euro total under the fixed `loot` spec,
         `format: "currency"`, `unit: "€"`), `sessions` (yours and your teammates',
-        newest first) and `open_session_id` (your open session, or None).
+        newest first, without those closed before their first message;
+        `session_count` still counts them) and `open_session_id` (your open
+        session, or None).
 
         Raises `ChallengeNotFoundError` when the challenge is not a chat
         challenge or is hidden from you.
@@ -4248,7 +4251,9 @@ class MLArenaClient:
         challenge. Each row carries `is_enrolled` for the caller. A private or
         unlisted course is listed only to its members and managers, and
         `join_code` is set only on the courses the caller belongs to or manages
-        (None elsewhere). Returns a
+        (None elsewhere). An enrolled row also carries the caller's
+        `progress`, `next_lesson`, `progress_state` and `last_active_at_ts`
+        (None on the others). Returns a
         DataFrame if pandas is installed, else a list of dicts.
         """
         params: dict = {}
@@ -4365,11 +4370,14 @@ class MLArenaClient:
         )
 
     def my_progress(self, course_id: int) -> dict:
-        """Own progress across a course: content % + next lesson + challenge
-        results.
+        """Own progress across a course: content % + next lesson + progress
+        state + challenge results.
 
         Mirrors `GET /api/academic_courses/{course_id}/progress/me`. Requires
-        enrollment (or manage rights). Each challenge cell carries `value`,
+        enrollment (or manage rights). `progress_state` is `not_started`,
+        `in_progress` (a lesson opened, the course not done) or `done` (every
+        published lesson completed) — the same value `list_courses()` serves
+        on the caller's enrolled row. Each challenge cell carries `value`,
         `pass_threshold`, `passed` (null when there is nothing to judge) and
         `metric`, the challenge's ranking MetricSpec (its `order` "desc":
         `passed` means value >= bar, "asc": <=; its `label`, `format` and

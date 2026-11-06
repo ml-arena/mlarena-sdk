@@ -1224,7 +1224,7 @@ for module in landing["modules"]:
         print(page["body_md"])                           # full markdown body
         student.mark_lesson_complete(toc["id"])
 
-print(student.my_progress(landing["id"]))                # content % + next lesson
+print(student.my_progress(landing["id"]))                # content % + next lesson + progress_state
 ```
 
 ### Course authoring (teacher scope)

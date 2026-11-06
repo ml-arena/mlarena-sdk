@@ -753,7 +753,7 @@ def test_update_challenge_end_date_ts_is_sent_only_when_passed_and_none_clears_i
 def test_challenges_passes_the_ended_status():
     c, rec = make_client(lambda *_: (200, {"items": [], "metadata": {
         "page": 1, "per_page": 24, "total": 0, "total_pages": 0,
-        "has_next": False, "has_prev": False}, "course_challenges": []}))
+        "has_next": False, "has_prev": False}}))
     c.challenges(status="ended", page=1)
     _expect(rec.last["params"]["status"] == "ended", rec.last["params"])
 
