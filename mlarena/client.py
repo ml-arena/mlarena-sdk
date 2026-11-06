@@ -1965,7 +1965,7 @@ class MLArenaClient:
 
         PUT to `/api/creator_challenge/challenge/{id}/datasets/{dataset_id}`
         (`datasets.py`, `update_creator_dataset`). Only fields explicitly
-        passed are sent. Rejected once the challenge is started. Returns `{"id", "label", "description"}`.
+        passed are sent. Allowed while the challenge is started (text only; its files stay locked). Returns `{"id", "label", "description"}`.
 
         Requires a `creator`-scope token.
         """
