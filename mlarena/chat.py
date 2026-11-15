@@ -12,7 +12,8 @@ notebook-friendly face of that flow — a client-side composition of the public
     chat.total_amount_eur                             # this session's euros
 
 `say()` opens a session lazily on the first call (which accepts the charter,
-see `MLArenaClient.open_chat_session`), sends the message with `wait=True`,
+see `MLArenaClient.open_chat_session`, once the agent is online: an agent
+nobody used for 30 minutes sleeps and takes about a minute to wake), sends the message with `wait=True`,
 prints the scoring events the turn earned and the assistant's reply, and
 returns the reply text.
 """
@@ -141,6 +142,8 @@ class ChatConversation:
     # ---- internals --------------------------------------------------------
 
     def _open(self) -> None:
+        # An agent idle for 30 minutes sleeps; this read wakes it and waits.
+        self._client.wait_for_chat_agent(self.challenge_id, timeout=self._timeout)
         view = self._client.open_chat_session(self.challenge_id)
         self._session_id = view["session"]["id"]
         self._view = view

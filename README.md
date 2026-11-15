@@ -2,6 +2,19 @@
 
 Python SDK for [ML Arena](https://ml-arena.com) — make submissions, manage challenges, manage courses, and read leaderboards from any notebook or IDE.
 
+## 4.11.0 — a chat agent sleeps when idle
+
+- A chat challenge nobody used for 30 minutes has no agent running. Reading the
+  challenge (`chat_challenge(cid)`) wakes it, usually within a minute; until
+  then `open_chat_session` answers 409 and a session's `can_send_reason` is
+  `agent_offline`.
+- New: `wait_for_chat_agent(cid, timeout=180, poll_interval=3)` polls
+  `chat_challenge` until `agent_online` and returns that view. A client-side
+  composition; raises at once on a challenge that is not started or whose
+  environment failed to load.
+- `chat(cid).say()` calls it before it opens a session, so a first message to
+  a sleeping agent waits instead of failing.
+
 ## 4.10.0 — exercise challenges
 
 Requires a platform with the `exercise_v1` kernel; on an older one every new
@@ -1137,6 +1150,7 @@ chat.reset()                                            # close it and start a f
 ```
 
 - `client.chat_challenge(challenge_id)` — the participant view: `manifest` (bot name, `charter_md`, the public `scoring_rules`), `agent_online`, limits, your group's `participant` (`total_amount_eur`, `scoreboard`, `rank`), your `sessions`.
+- `client.wait_for_chat_agent(challenge_id, timeout=180)` — an agent nobody used for 30 minutes sleeps; reading the challenge wakes it, and this waits until `agent_online`. `chat().say()` does it for you.
 - `client.open_chat_session(challenge_id)` — opens a session **and accepts the charter**; returns the `ChatSessionView`. One open session per user per challenge.
 - `client.send_chat_message(session_id, content, wait=True, timeout=180, poll_interval=0.7)` — sends, then polls `chat_session` until that turn is `completed` (returns the final view) or `failed` (raises `MLArenaError` naming the turn's `error_type`, plus its `error_message` when served — to the challenge's staff only). `wait=False` returns the 202 `{"turn", "message"}` (the turn as the session view serves it).
 - `client.chat_session(session_id)` (`participant.total_amount_eur` + `scoreboard`, `can_send` with `can_send_reason`), `client.close_chat_session(session_id)`, `client.export_chat_session(session_id, format="json"|"md")` — the evidence: transcript, tool log, scoring events with their `evidence` blobs, turn timings, totals.

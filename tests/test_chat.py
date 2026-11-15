@@ -165,6 +165,10 @@ def _event(event_id, turn_id, rule_key, label, amount):
             "label": label, "amount_eur": amount}
 
 
+# The keys of `ChatChallengeView` that `wait_for_chat_agent` reads.
+AGENT_ONLINE = {"status": "started", "env_status": "ready", "agent_online": True}
+
+
 class ScriptedChatBackend:
     """A chat challenge that answers each message from a script.
 
@@ -186,6 +190,8 @@ class ScriptedChatBackend:
         self.polls_left = 0
         self.closed = []
         self.total = Decimal("0.00")
+        # GETs of the challenge that still answer `agent_online: false`.
+        self.wake_polls_left = 0
 
     def __call__(self, method, path, kwargs):
         if method == "POST" and path.endswith("/sessions"):
@@ -208,6 +214,10 @@ class ScriptedChatBackend:
         if method == "GET" and "/chat/sessions/" in path:
             self._advance()
             return 200, self.view()
+        if method == "GET" and "/chat/challenge/" in path:
+            self.wake_polls_left -= 1
+            return 200, {"status": "started", "env_status": "ready",
+                         "agent_online": self.wake_polls_left < 0}
         raise AssertionError(f"unexpected {method} {path}")
 
     def _advance(self):
@@ -530,8 +540,9 @@ def test_say_opens_lazily_prints_new_events_and_the_reply(monkeypatch, clock, ca
     assert reply == "Bonjour ! Pouvez-vous me donner votre référence ?"
     assert chat.session_id == 1
     assert rec.paths("POST")[:2] == ["/chat/challenge/4/sessions", "/chat/sessions/1/messages"]
-    assert rec.calls[0]["json"] == {"charter_accepted": True}
-    assert rec.calls[1]["json"] == {"content": "Bonjour"}
+    assert rec.paths()[0] == "/chat/challenge/4"  # the agent is online: one read, no wait
+    assert rec.calls[1]["json"] == {"charter_accepted": True}
+    assert rec.calls[2]["json"] == {"content": "Bonjour"}
     assert capsys.readouterr().out == "Bonjour ! Pouvez-vous me donner votre référence ?\n"
     assert chat.total_amount_eur == Decimal("0.00")
 
@@ -555,6 +566,35 @@ def test_say_opens_lazily_prints_new_events_and_the_reply(monkeypatch, clock, ca
     assert [m["role"] for m in transcript] == ["user", "assistant"] * 3
     assert transcript[0]["content"] == "Bonjour"
     assert repr(chat) == "ChatConversation(challenge_id=4, session_id=1, total_amount_eur=-200.00)"
+
+
+def test_say_wakes_a_sleeping_agent_before_it_opens(monkeypatch, clock):
+    backend = ScriptedChatBackend([("Bonjour !", [])])
+    backend.wake_polls_left = 3  # asleep for three reads
+    c, rec = make_client(monkeypatch, backend)
+
+    assert c.chat(4, echo=False).say("Bonjour") == "Bonjour !"
+    assert rec.paths()[:5] == ["/chat/challenge/4"] * 4 + ["/chat/challenge/4/sessions"]
+    assert clock.sleeps[:3] == [3, 3, 3]
+
+
+def test_wait_for_chat_agent_gives_up_after_the_timeout(monkeypatch, clock):
+    view = {"status": "started", "env_status": "ready", "agent_online": False}
+    c, rec = make_client(monkeypatch, lambda m, p, k: (200, view))
+    with pytest.raises(MLArenaError, match="timed out after 10s"):
+        c.wait_for_chat_agent(4, timeout=10)
+    assert len(rec.calls) == 5  # t = 0, 3, 6, 9, 12
+
+
+@pytest.mark.parametrize("view, reason", [
+    ({"status": "stopped", "env_status": "ready", "agent_online": False}, "is 'stopped'"),
+    ({"status": "started", "env_status": "error", "agent_online": False}, "failed to load"),
+])
+def test_wait_for_chat_agent_does_not_wait_for_an_agent_that_cannot_come(monkeypatch, clock, view, reason):
+    c, rec = make_client(monkeypatch, lambda m, p, k: (200, view))
+    with pytest.raises(MLArenaError, match=reason):
+        c.wait_for_chat_agent(4)
+    assert len(rec.calls) == 1 and clock.sleeps == []
 
 
 def test_say_with_echo_false_prints_nothing(monkeypatch, clock, capsys):
@@ -590,6 +630,8 @@ def test_say_propagates_a_failed_turn(monkeypatch, clock):
                                  error_message="the agent could not answer")),])
 
     def router(method, path, kwargs):
+        if method == "GET" and "/chat/challenge/" in path:
+            return 200, AGENT_ONLINE
         if path.endswith("/sessions"):
             return 201, _view(1)
         if path.endswith("/messages"):
@@ -606,6 +648,8 @@ def test_say_propagates_a_failed_turn(monkeypatch, clock):
 
 def test_say_fails_loud_when_the_completed_turn_has_no_assistant_message(monkeypatch, clock):
     def router(method, path, kwargs):
+        if method == "GET" and "/chat/challenge/" in path:
+            return 200, AGENT_ONLINE
         if path.endswith("/sessions"):
             return 201, _view(1)
         if path.endswith("/messages"):
@@ -626,7 +670,7 @@ def test_chat_names_are_exported_at_package_level():
     assert mlarena.ChatConversation is ChatConversation
     assert mlarena.ChatSessionNotFoundError is ChatSessionNotFoundError
     assert issubclass(mlarena.ChatSessionNotFoundError, mlarena.NotFoundError)
-    assert mlarena.__version__ == "4.10.0"
+    assert mlarena.__version__ == "4.11.0"
 
 
 def test_update_chat_settings_sends_max_concurrent_turns(monkeypatch):

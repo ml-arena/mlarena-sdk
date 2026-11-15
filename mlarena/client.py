@@ -3493,6 +3493,45 @@ class MLArenaClient:
             error_label="chat_challenge",
         ).json()
 
+    def wait_for_chat_agent(self, challenge_id: int, *, timeout: float = 180,
+                            poll_interval: float = 3) -> dict:
+        """Wait until the challenge's agent is online. Returns the
+        `ChatChallengeView` that shows it (`agent_online: true`).
+
+        A chat challenge nobody used for 30 minutes has no agent running: it
+        sleeps, and reading the challenge (`chat_challenge()`, which this
+        polls) wakes it, usually within a minute. Until then
+        `open_chat_session` answers 409. A client-side composition of
+        `chat_challenge` — no endpoint of its own; `chat().say()` calls it
+        before it opens a session.
+
+        Raises `MLArenaError` at once when waiting cannot help (the challenge
+        is not `started`, or its environment failed to load), and after
+        `timeout` seconds without the agent coming online.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            view = self.chat_challenge(challenge_id)
+            if view["status"] != "started":
+                raise MLArenaError(
+                    f"wait_for_chat_agent: challenge {challenge_id} is "
+                    f"{view['status']!r}, not started — its agent does not run"
+                )
+            if view["env_status"] == "error":
+                raise MLArenaError(
+                    f"wait_for_chat_agent: the environment of challenge "
+                    f"{challenge_id} failed to load; the challenge team has to fix it"
+                )
+            if view["agent_online"]:
+                return view
+            if time.monotonic() > deadline:
+                raise MLArenaError(
+                    f"wait_for_chat_agent timed out after {timeout}s: the agent "
+                    f"of challenge {challenge_id} is still not online "
+                    f"(env_status {view['env_status']!r}). Try again or raise timeout."
+                )
+            time.sleep(poll_interval)
+
     def open_chat_session(self, challenge_id: int) -> dict:
         """Open a conversation with the agent. Returns the new `ChatSessionView`.
 
@@ -3510,7 +3549,8 @@ class MLArenaClient:
 
         Raises `ChallengeNotFoundError` on a non-chat or hidden challenge, and
         `MLArenaError` with the server's reason when it refuses (409: the
-        challenge is not started, the agent is offline,
+        challenge is not started, the agent is offline or asleep — it sleeps
+        after 30 idle minutes, see `wait_for_chat_agent` —,
         `max_sessions_per_participant` is reached, or the agent is still
         answering a message of your open session — wait for it first).
         """
@@ -3702,7 +3742,7 @@ class MLArenaClient:
             chat.reset()            # close it, start over
 
         `say()` opens the session on its first call (which accepts the
-        charter), waits for the answer, prints the scoring events it earned
+        charter, after `wait_for_chat_agent` when the agent was asleep), waits for the answer, prints the scoring events it earned
         and the reply, and returns the reply text. `timeout` and
         `poll_interval` are passed to every `send_chat_message`; `echo=False`
         prints nothing.

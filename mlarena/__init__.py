@@ -16,7 +16,7 @@ from mlarena.exceptions import (
     SubmissionNotFoundError,
 )
 
-__version__ = "4.10.0"
+__version__ = "4.11.0"
 
 _LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 
