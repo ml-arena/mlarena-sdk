@@ -2911,9 +2911,8 @@ class MLArenaClient:
         `RunResult` (`submission_runs()["runs"]`, `creator_runs()` or
         `run_benchmark()`). The file is the stored object, streamed as is to
         `<dest_dir>/<simulation_result_id><suffix>`, the suffix from
-        `replay.render_format`: `frames_v1` → `.experiment.mp`, `frames_v2`
-        → `.frames.mp` (msgpack frames), `video_mp4` → `.mp4`, `image_png`
-        → `.png`. The console's "Open file". A composition: no endpoint; the
+        `replay.render_format`: `frames_v2` → `.frames.mp` (msgpack frames),
+        `video_mp4` → `.mp4`, `image_png` → `.png`. The console's "Open file". A composition: no endpoint; the
         signed URL is a pre-authenticated R2 link, fetched without the token.
 
         Raises:
@@ -5504,9 +5503,8 @@ _LEGACY_KWARGS = {
 }
 
 # `download_replay`: the file suffix of each `render_format` (the stored
-# object's own key suffix, docs/replay_display.md §4.1).
+# object's own key suffix, the backend's `RENDER_FORMATS`).
 _REPLAY_SUFFIXES = {
-    "frames_v1": ".experiment.mp",
     "frames_v2": ".frames.mp",
     "video_mp4": ".mp4",
     "image_png": ".png",

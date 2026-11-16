@@ -220,7 +220,7 @@ Requires a platform without the `/api/data_sources/*` proxy.
 
 Requires a platform with the replay rework (its step 1). A replay is one
 file per run, and `render_format` says what it is: `frames_v2` (msgpack
-frames), `video_mp4`, `image_png`, or the legacy `frames_v1`.
+frames), `video_mp4` or `image_png`.
 
 - New: `replays(challenge_id, limit=12, before_simulation_result_id=None,
   mine=False)` (`GET /api/challenges/{id}/replays`) and

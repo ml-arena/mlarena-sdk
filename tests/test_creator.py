@@ -670,16 +670,16 @@ def test_download_replay_names_the_file_by_format():
     c, _ = make_client()
     c._request = fake_request
     with tempfile.TemporaryDirectory() as tmp:
-        for fmt, suffix in (("frames_v1", ".experiment.mp"), ("frames_v2", ".frames.mp"),
-                            ("video_mp4", ".mp4"), ("image_png", ".png")):
+        for fmt, suffix in (("frames_v2", ".frames.mp"), ("video_mp4", ".mp4"),
+                            ("image_png", ".png")):
             run = {"simulation_result_id": 41,
                    "replay": {"render_format": fmt, "signed_url": "https://r2/x?sig",
                               "render_size_bytes": 5}}
             path = c.download_replay(run, tmp)
             _expect(path.name == f"41{suffix}", path)
             _expect(path.read_bytes() == b"bytes", "streamed as is")
-        _expect(sorted(os.listdir(tmp)) == ["41.experiment.mp", "41.frames.mp",
-                                            "41.mp4", "41.png"], os.listdir(tmp))
+        _expect(sorted(os.listdir(tmp)) == ["41.frames.mp", "41.mp4", "41.png"],
+                os.listdir(tmp))
     method, url, kwargs = calls[-1]
     _expect((method, url) == ("GET", "https://r2/x?sig"), url)
     _expect("headers" not in kwargs, "no token to the storage")
