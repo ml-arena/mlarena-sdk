@@ -1,5 +1,5 @@
 """Exercise challenge (`exercise_v1`) surface of the SDK (design of record:
-the platform's `docs/exercise_kernel.md`, then `workers/exercise_v1/PROCESS.md`).
+the platform's `workers/exercise_v1/PROCESS.md`).
 
 Covers, over a fake transport (the `requests.request` monkeypatch of
 `test_chat.py`, so the chokepoint's defaults are part of what is asserted):
