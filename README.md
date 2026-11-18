@@ -2,6 +2,82 @@
 
 Python SDK for [ML Arena](https://ml-arena.com) — make submissions, manage challenges, manage courses, and read leaderboards from any notebook or IDE.
 
+## 4.12.0 — GitHub Actions, the `mlarena` command, bundles
+
+Requires a platform with the GitHub integration; on an older one the new
+routes answer 404.
+
+- New: the **`mlarena` command** (`mlarena submit`, `mlarena challenge push`,
+  `mlarena course push`, `mlarena whoami`), installed with the package. See
+  [GitHub Actions and the mlarena CLI](#github-actions-and-the-mlarena-cli).
+- New: **no stored secret in CI.** `mlarena.connect()` takes its credential
+  from `api_key`, else `MLARENA_API_KEY`, else — in a GitHub Actions job with
+  `permissions: id-token: write` — from the job's OIDC token, exchanged for a
+  15-minute `mlo_…` token of the account the repository is linked to.
+  `api_key` is now optional; `client.credentials` says which source was used.
+- New: `push_challenge(challenge_id, path, subpath=None, dry_run=False)` and
+  `import_challenge_from_github(challenge_id, repository, ref=None, path=None,
+  dry_run=False)` replace the challenge's files in one all-or-nothing step.
+  **Removed:** `sync_env_from_github` (its route is gone, with the stored
+  GitHub token).
+- New dependency: `pyyaml` (course manifests are `course.yaml`).
+  `export_course_to_dir` always writes `course.yaml`.
+- New: `WaitTimeoutError` (a `SubmissionError`): what `tail_logs` and
+  `submit(wait=True)` raise when `timeout_sec` runs out, with the submission's
+  last status on `.body`.
+- New: `push_course(path, slug=None, subpath=None, dry_run=False, prune=False)` and
+  `import_course_from_github(slug, repository, …)`: the server applies a
+  course directory as one bundle, matched by slug, so a second push changes
+  nothing. `author_course_from_dir(path)` is now a deprecated alias of
+  `push_course(path)`: it no longer creates a second course on a second run,
+  it returns the server's plan, and the manifest needs `course.slug` and a
+  `slug` on every module and lesson (`course_id` / `module_id` are not manifest
+  keys any more).
+- `export_course_to_dir` round-trips with `push_course`: it also writes each
+  module's `visibility`, nested lessons (`children`), the files the lesson
+  bodies link, the cover, and attached challenges by `slug`.
+- New: a module's **assets** replace per-lesson media:
+  `upload_module_asset(module_id, file_path, path=None)`,
+  `list_module_assets`, `delete_module_asset`, `download_module_asset`.
+  A lesson links an asset by a relative path (`![fig](media/fig.png)`).
+  **Removed:** `upload_lesson_media`, `list_lesson_media`,
+  `delete_lesson_media` (their routes are gone).
+- New: `detach_module(module_id)` hands a bundle-managed module back to the
+  editor; `update_module` / `update_lesson` accept `slug`.
+- New: `trusted_repositories()`, `add_trusted_repository("owner/name")`,
+  `remove_trusted_repository(id)`; `me()` carries `github_login`.
+  **Removed:** `update_profile(github_page=…)` (the field left the API).
+- `submit(..., deploy=True, allow_same_commit=False)`: `deploy=False` stops
+  after the upload check. From a GitHub Actions run, a commit that already
+  made a submission on the challenge is not submitted twice: `submit` returns
+  `{"submission_id", "deploy": None, "already_submitted": True, "status"}`
+  (the create route's 409 carries `submission_id` on `err.body`).
+  A submission, a challenge environment and a module carry `source_revision`
+  (repository, commit, run) when they came from GitHub.
+- **Removed** with the columns behind them (the API no longer serves or
+  accepts these keys): `update_team(team_id, name)` lost `looking_for_members`
+  (a team no longer carries it); `enroll_in_course` lost `project_url` (gone
+  from the profile's enrollments, the `course_students` roster and the last
+  column of `export_course_csv`); a run row lost `simulate_end_time_ts`
+  (`job_completed_at_ts` is the end of a run); `me()` lost the raw `is_teacher`
+  / `is_creator` flags: read `has_teacher_access` / `has_creator_access`.
+- **Moved:** the seats of a run are a configuration value.
+  `creator_challenge(id)["environment"]["number_of_agents"]` is now
+  `["configuration"]["number_of_agents"]`, and `update_settings()` no longer
+  answers an `environment` block. `["environment"]` keeps `id`,
+  `challenge_id`, `created_at_ts` and `benchmark_simulation_result_id`; it
+  lost `environment_id`, `user_id`, `name`, `description`, `is_passed_test`,
+  `passed_test_info_message` and `attach_path_files` (list the files with
+  `list_env_files`).
+- **Removed:** the seven Elo keywords of `update_settings` (`elo_k_factor`,
+  `elo_d0`, `elo_alpha`, `elo_beta`, `elo_momentum`, `elo_initial_variance`,
+  `elo_initial_score`) and the same keys of
+  `creator_challenge(id)["evaluation"]`, `config_fields()` and
+  `challenge.toml` (a file that holds one is refused as an unknown key). No
+  challenge ever changed them: they are platform constants now (K 32, scale
+  100, pairing weights 10 / 10, variance momentum 0.7, initial variance
+  22500, initial rating 1200). Passing one raises `TypeError`.
+
 ## 4.11.0 — a chat agent sleeps when idle
 
 - A chat challenge nobody used for 30 minutes has no agent running. Reading the
@@ -664,7 +740,7 @@ Everything else below is additive over 2.2.
   your own role on it — so nothing scans `members` to find out whether you
   lead it, and an invitation carries its `status`.
 - **`me()`.** `GET /api/auth/current_user`: `id`, `username`, `email`,
-  `avatar_key`, the role flags, and the platform's own derived rules
+  `avatar_key`, `is_admin`, and the platform's own derived rules
   `has_teacher_access`, `has_creator_access` and `can_create_course`.
   API-key listing and rotation stay console-only on purpose — those two
   routes refuse bearer auth so a `user` key cannot mint a `creator` one.
@@ -969,16 +1045,150 @@ The token's *scope* segment dictates which routes you can call:
 
 A `user`-scope token cannot call a `creator`-required route (and vice versa). Mint scope-specific tokens from your Profile page.
 
+## GitHub Actions and the mlarena CLI
+
+`pip install mlarena-sdk` installs the `mlarena` command. Each command is a
+composition of the client's methods, on the same routes as the console:
+
+```bash
+mlarena whoami
+mlarena submit --challenge lunar-lander-v3 --files agent.py model.pt --runtime torch --wait
+mlarena challenge push ./my-challenge --challenge my-challenge --dry-run
+mlarena course push ./my-course --dry-run
+```
+
+- `mlarena whoami` prints the account, the kind of credential and the base
+  URL; it exits 1 when the server does not accept the credential.
+- `mlarena submit --challenge <slug-or-id> [--files a b … | --dir DIR] [--name NAME] [--runtime NAME] [--no-deploy] [--wait [--timeout SEC]] [--allow-same-commit]`
+  creates a submission, uploads the files and deploys it; it prints the
+  submission's URL. Uploads are flat: a sub-folder is refused, not flattened.
+  On a file challenge the single file given is stored as the challenge's
+  submission file. `--wait` returns once the deploy has settled and fails
+  with the failure message when it failed; after `--timeout` seconds (default
+  1800) it stops waiting and exits 1, and the submission keeps running. A `requirements.txt` is not
+  installed at run time: pick the runtime image with `--runtime`.
+  In GitHub Actions the name defaults to the tag (`submission-3`), else
+  `gh-<sha7>`, and a commit already submitted is reported, not submitted
+  again.
+- `mlarena challenge push [DIR] --challenge <slug-or-id> [--path SUBPATH] [--dry-run]`
+  replaces the challenge's files with the directory (`push_challenge`) and
+  prints what changed, the config result and the `env.py` check.
+- `mlarena course push [DIR] [--slug SLUG] [--path SUBPATH] [--dry-run] [--prune]`
+  applies a course directory (`push_course`) and prints the plan: each module
+  and lesson created, updated, unchanged or orphaned.
+- `--path SUBPATH`, on both pushes, is the folder inside `DIR` that holds the
+  challenge or the course (one repository, several of them): only that folder
+  is uploaded.
+- Global options: `--base-url` (env `MLARENA_BASE_URL`), `--audience` (env
+  `MLARENA_OIDC_AUDIENCE`; only for a deployment whose public URL is not its
+  API URL).
+- Exit codes: `0` done, `1` refused by the server or failed, `2` usage. In
+  GitHub Actions the outcome is appended to the job summary and a failure is
+  an `::error::` annotation.
+- Step outputs, appended to `$GITHUB_OUTPUT` when it is set: `submit` writes
+  `submission-id`, `url`, `status`, `already-submitted` (`true` / `false`) and
+  `score` when `--wait` produced one; `challenge push` writes `url` and
+  `env-changed`; `course push` writes `url` and `course-slug`.
+
+**Credential.** `MLARENA_API_KEY` when it is set. Otherwise, in a GitHub
+Actions job with `permissions: id-token: write`, the job proves who it is with
+GitHub's OIDC token and receives a 15-minute token: there is no secret to
+store in the repository. `submit` asks for the `user` scope, `challenge push`
+for `creator`, `course push` for `teacher`.
+
+**One-time setup.**
+
+1. On ML Arena, open your Profile and connect your GitHub account. A run acts
+   for the ML Arena account linked to the GitHub user who triggered it.
+2. A repository that this GitHub user owns needs nothing more. For any other
+   repository (an organisation's, a teammate's), add it under Profile →
+   Trusted repositories, or `client.add_trusted_repository("owner/name")`.
+3. Only runs triggered by `push`, `workflow_dispatch` or `release` are
+   accepted: a pull request from a fork cannot act for you.
+
+**Participant: submit on a tag** (`.github/workflows/submit.yml`)
+
+```yaml
+on:
+  push:
+    tags: ["submission-*"]
+  workflow_dispatch:
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  submit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install mlarena-sdk
+      - run: mlarena submit --challenge lunar-lander-v3 --files agent.py model.pt --runtime torch --wait
+```
+
+**Creator: push the challenge on every commit to `main`**
+
+```yaml
+on:
+  push:
+    branches: [main]
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install mlarena-sdk
+      - run: mlarena challenge push . --challenge my-challenge
+```
+
+**Teacher: push the course on every commit to `main`**
+
+```yaml
+on:
+  push:
+    branches: [main]
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install mlarena-sdk
+      - run: mlarena course push .
+```
+
+Add `--dry-run` in a workflow that runs on other branches to check a change
+without applying it.
+
 ## API reference
 
-### `mlarena.connect(api_key, base_url="https://ml-arena.com")`
+### `mlarena.connect(api_key=None, base_url="https://ml-arena.com", *, scope="user", audience=None)`
 
-Create a client. `api_key` must be the full `mlk_<scope>_<lookup>_<secret>` token.
+Create a client. `api_key` is the full `mlk_<scope>_<lookup>_<secret>` token; left out, the credential is `MLARENA_API_KEY`, else the GitHub Actions OIDC exchange (`scope` is the scope asked for there). `client.credentials` (`kind`, `scope`, `username`, `source_revision`) says which was used.
+
+### Account
+
+- `client.me()` — who the token belongs to: `username`, the access flags, `github_login` (the linked GitHub account, or None).
+- `client.profile()`, `client.update_profile(username=None, bio=None, personal_website=None, student_number=None, student_email=None, avatar_key=None)`.
+- `client.trusted_repositories()`, `client.add_trusted_repository("owner/name")`, `client.remove_trusted_repository(id)` — the repositories you do not own whose GitHub Actions runs may act as you.
 
 ### Submissions (user scope)
 
-- `client.submit(challenge_id, agent=None, files=None, submission_name=None, runtime_id=None, runtime=None, wait=False, timeout_sec=None, poll_sec=5.0)` — one-shot create + (pick runner) + upload + deploy. Returns `{"submission_id", "deploy"}`, plus `"status"` with `wait=True`.
-- `client.create_submission(challenge_id, submission_name, copy_from_submission_id=None)`
+- `client.submit(challenge_id, agent=None, files=None, submission_name=None, runtime_id=None, runtime=None, wait=False, timeout_sec=None, poll_sec=5.0, *, deploy=True, allow_same_commit=False)` — one-shot create + (pick runner) + upload + deploy. Returns `{"submission_id", "deploy"}`, plus `"status"` with `wait=True`; `deploy=False` stops after the upload check. From a GitHub Actions run, a commit that already made a submission returns `{"submission_id", "deploy": None, "already_submitted": True, "status"}` unless `allow_same_commit=True`.
+- `client.create_submission(challenge_id, submission_name, copy_from_submission_id=None, *, allow_same_commit=False)` — from a GitHub Actions run, a second create for the same commit is a 409 whose `err.body["submission_id"]` is the existing submission.
 - `client.copyable_submissions()` — your submissions that can seed a new one (the ids `copy_from_submission_id` takes), across every challenge.
 - `client.upload_submission_file(challenge_id, submission_id, file_path)` — multipart upload from disk. The file is stored under its basename: on a file challenge that name must be `challenge(cid)["submission_filename"]`, which is not always `submission.csv`.
 - `client.update_submission_file_content(challenge_id, submission_id, filename, content)` — upload from a string (template render → upload).
@@ -1122,11 +1332,12 @@ Everything the console's creator editor does, on the same routes:
 - The challenge config — one document, two editors. From simple to advanced:
   1. **env.py only**: every key starts at its kind default; change what you need with `update_settings` (or the console's Config tab).
   2. **`challenge.toml`** beside env.py, holding only the keys your env relies on (e.g. `agent_max_time_per_step_second = 60.0`); `upload_env_file(cid, "challenge.toml")` applies it, and those keys become the file's (`update_settings` refuses them).
-  3. **Challenge as code**: `export_config(cid, "challenge.toml")` writes every value you set, defaults commented; commit it with env.py and sync from GitHub.
+  3. **Challenge as code**: `export_config(cid, "challenge.toml")` writes every value you set, defaults commented; commit it with env.py and push the directory (`push_challenge`, or `mlarena challenge push` from a GitHub Actions workflow).
   `config_fields()` lists every key (group, level, who may write it, which kinds, frozen once started, allowed in the file); `config_schema()` is the file's JSON Schema. In a local test, `env.eval_context = mlarena.local.eval_context(".")` gives the env the platform's numbers (`self.eval_context["config"]["agent_max_time_per_step_second"]`).
 - `client.update_challenge(challenge_id, name=…, description=…, is_public=…)` — the challenge row.
-- `client.update_settings(challenge_id, …)` — the configuration + evaluation columns, under their own names: `simulation_timeout_sec`, `max_upload_size_bytes`, `max_upload_files`, `max_active_submissions_per_participant`, `submission_filename`, `metrics`, `window_days` (see [Metrics](#metrics)), `is_stop_after_deployment`, `deployment_nb_constraint_run`, `deployment_nb_initial_score_run`, `episode_budget_brackets`, the `elo_*` tunables; admins also `data_source_enabled`, `data_source_url`, `data_source_asset`, `data_source_filter`, `data_source_history_hours`, `batch_cron` (the continuous data feed). Also `agent_max_time_per_step_second`, `simulation_max_steps` (the run limits), `render_delay_second` and `required_files`; `simulation_timeout_sec` at most the machine's `job_timeout_max_sec`. A key `challenge.toml` holds is refused (edit the file). The runtime: `machine_id` (from `machines(kernel_version)`), `env_cpu_request`, `env_cpu_limit`, `env_memory_request`, `env_memory_limit`, the `agent_*` sizing (kinds with `agent_containers`), `number_of_agents` (kinds with `multi_agent`); admins also `env_gpu_count`, `agent_gpu_count`, `gpu_memory_limit`, `docker_image_env_runtime_id`. Answers `{"configuration": …, "evaluation": …, "environment": …, "config": …}`.
-- Env: `client.list_env_files(challenge_id)`, `upload_env_file`, `update_env_file_content`, `delete_env_file(challenge_id, filename)`, `check_env(challenge_id, content)` (the structural check, without saving), `sync_env_from_github`. Saving, syncing or deleting `challenge.toml` applies or forgets the config file.
+- `client.update_settings(challenge_id, …)` — the configuration + evaluation columns, under their own names: `simulation_timeout_sec`, `max_upload_size_bytes`, `max_upload_files`, `max_active_submissions_per_participant`, `submission_filename`, `metrics`, `window_days` (see [Metrics](#metrics)), `is_stop_after_deployment`, `deployment_nb_constraint_run`, `deployment_nb_initial_score_run`, `episode_budget_brackets`; admins also `data_source_enabled`, `data_source_url`, `data_source_asset`, `data_source_filter`, `data_source_history_hours`, `batch_cron` (the continuous data feed). Also `agent_max_time_per_step_second`, `simulation_max_steps` (the run limits), `render_delay_second` and `required_files`; `simulation_timeout_sec` at most the machine's `job_timeout_max_sec`. A key `challenge.toml` holds is refused (edit the file). The runtime: `machine_id` (from `machines(kernel_version)`), `env_cpu_request`, `env_cpu_limit`, `env_memory_request`, `env_memory_limit`, the `agent_*` sizing (kinds with `agent_containers`), `number_of_agents` (kinds with `multi_agent`); admins also `env_gpu_count`, `agent_gpu_count`, `gpu_memory_limit`, `docker_image_env_runtime_id`. Answers `{"configuration": …, "evaluation": …, "config": …}`.
+- Env: `client.list_env_files(challenge_id)`, `upload_env_file`, `update_env_file_content`, `delete_env_file(challenge_id, filename)`, `check_env(challenge_id, content)` (the structural check, without saving). Saving or deleting `challenge.toml` applies or forgets the config file.
+- Bundle: `client.push_challenge(challenge_id, path, subpath=None, dry_run=False)` replaces the challenge's files with a directory (or a `.zip` / `.tar.gz` of it) in one all-or-nothing step: the env folder, `challenge.toml` applied, plus the overview, agent template and image when the bundle holds them. `client.import_challenge_from_github(challenge_id, "owner/name", ref=None, path=None, dry_run=False)` does the same from a public repository. Both answer the report: `env_files`, `env_changed`, `config`, `validation`, `ignored`, `source_revision`. `mlarena.make_bundle(directory)` builds the same archive.
 - Config: `client.config_fields()`, `client.config_schema()`, `client.export_config(challenge_id, path=None)`.
 - Benchmark: `client.list_benchmark_files(challenge_id)`, `upload_benchmark_file`, `update_benchmark_file_content`, `delete_benchmark_file(challenge_id, filename)`, `run_benchmark`, `benchmark_status` (`{run, checks}`: the run and the config's budgets checked against it).
 - Presentation: `client.challenge_markdown(challenge_id)` / `set_challenge_markdown`, `client.challenge_image(challenge_id, dest_dir=".")` / `set_challenge_image` / `delete_challenge_image`.
@@ -1201,7 +1412,7 @@ method↔route table for the full surface.
 **Create + enroll**
 
 - `client.create_course(name, code=None, start_date, end_date, slug=None, description=None, visibility=None, instructor_name=None)` — any token scope; creating a course makes the account a teacher (capped by `max_courses_limit`, default 1; admins exempt). Attach challenges afterwards: `add_course_challenge` per challenge, or via modules (`create_module` / `attach_challenge` / `link_module`). The response carries the course's `join_code` — the single enrollment token to share with students.
-- `client.enroll_in_course(join_code, student_email=None, student_number=None, project_url=None)` — join with the course's short join code (the token in its `/enroll/<join_code>` link).
+- `client.enroll_in_course(join_code, student_email=None, student_number=None)` — join with the course's short join code (the token in its `/enroll/<join_code>` link).
 - `client.enrollment_info(join_code)` — preview a course before enrolling (public).
 - `client.list_courses(show_all=False, challenge_id=None)` — your enrolled + active courses.
 
@@ -1213,15 +1424,23 @@ import mlarena
 teacher = mlarena.connect(api_key="mlk_teacher_…")
 
 # my-course/course.yaml describes the course; lesson bodies are markdown files
-# referenced from the manifest (see author_course_from_dir's docstring for the
-# full schema). This is a pure composition of the authoring methods — no
-# special endpoint, the same idiom as submit().
-result = teacher.author_course_from_dir("my-course/")
-print(result["join_code"])        # share this code with students
+# named by the manifest, next to the images and files they link (see
+# push_course's docstring for the full schema). The server applies the
+# directory as one bundle, matched by slug: pushing again changes nothing.
+plan = teacher.push_course("my-course/", dry_run=True)   # what would change
+plan = teacher.push_course("my-course/")
+print(plan["course"], plan["url"])
 
 # Round-trip the other way for backup / versioning:
 teacher.export_course_to_dir("intro-to-rl", "backup/")
 ```
+
+A module written by a bundle is managed by it: the editor and the module /
+lesson write methods answer 409 until `detach_module(module_id)`. A lesson
+that left the manifest is unpublished and kept (`prune=True` deletes it).
+`import_course_from_github(slug, "owner/name", ref=None, path=None)` applies a
+public repository the same way; `mlarena course push` does it from a GitHub
+Actions workflow.
 
 **Enroll by join code, then read + complete lessons**
 
@@ -1243,15 +1462,17 @@ print(student.my_progress(landing["id"]))                # content % + next less
 
 ### Course authoring (teacher scope)
 
-- `client.create_module(title, slug=None, summary=None, icon=None, visibility="private")`, `list_modules(library=None)`, `get_module`, `update_module(id, **fields)`, `delete_module(id, force=False)`, `fork_module(id)`.
+- `client.create_module(title, slug=None, summary=None, icon=None, visibility="private")`, `list_modules(library=None)`, `get_module`, `update_module(id, **fields)`, `delete_module(id, force=False)`, `fork_module(id)`, `detach_module(id)` (a bundle-managed module back to the editor).
 - `client.attach_challenge(module_id, challenge_id, label=None, position=None, pass_threshold=None)`, `update_challenge_link`, `detach_challenge`, `reorder_module_challenges`.
 - `client.create_lesson(module_id, title, kind="lesson", slug=None, parent_lesson_id=None, body_md="", gated=False)`, `get_lesson`, `update_lesson(id, **fields)`, `delete_lesson`, `reorder_lessons`.
-- `client.upload_lesson_media(lesson_id, file_path)`, `delete_lesson_media`, `preview_lesson(lesson_id, body_md=None)` — validates `mlarena:` directives (fails loud on unknown).
+- `client.upload_module_asset(module_id, file_path, path=None)` (returns `{path, url}`; link it from a lesson body by its `path`: `![fig](media/fig.png)`), `list_module_assets(module_id)`, `delete_module_asset(module_id, path)`.
+- `client.preview_lesson(lesson_id, body_md=None)` — validates `mlarena:` directives (fails loud on unknown).
+- `client.push_course(path, slug=None, subpath=None, dry_run=False, prune=False)`, `client.import_course_from_github(slug, repository, ref=None, path=None, dry_run=False, prune=False)`, `client.export_course_to_dir(slug, path)` — a course as a directory (above).
 - `client.add_course_challenge(course_id, challenge_id, title=None, summary=None, pass_threshold=None, is_published=True)` — the console's "Add challenge": one transactional call creates a private module (title defaults to the challenge's name, `summary` is the student page), links it at the end of the course and attaches the challenge; nothing is written if any part is refused.
 - `client.remove_course_challenge(course_id, module_id)` — the console's "Remove": one transactional call unlinks the entry and deletes its module when it is a simple module you may edit that no other course links; answers `{"message", "module_deleted"}`.
 - `client.update_course(id, **fields)`, `set_course_cover`, `list_course_modules`, `link_module(course_id, module_id, position=None)`, `unlink_module`, `reorder_modules`, `course_progress(course_id)` — teacher follow dashboard.
 - `client.teacher_courses()` — the courses you teach or assist on, each with its `role`; `client.challenges_for_course()` — the challenges you may attach, each with `metric`, the ranking MetricSpec (the scale and direction of a `pass_threshold`).
-- `client.course_students(course_id, challenge_id=None)` — the roster (`user_id`, `student_number`, `student_email`, `project_url`, `enrolled_at_ts`, plus the team columns for the attached challenge you name — `None` without `challenge_id`); `client.remove_student(course_id, user_id)`.
+- `client.course_students(course_id, challenge_id=None)` — the roster (`user_id`, `student_number`, `student_email`, `enrolled_at_ts`, plus the team columns for the attached challenge you name — `None` without `challenge_id`); `client.remove_student(course_id, user_id)`.
 - `client.course_assistants(course_id)`, `add_course_assistant(course_id, username)`, `remove_course_assistant(course_id, user_id)` — teaching assistants (course owner only).
 - `client.export_course_csv(course_id, challenge_id, by_participant=False, dest_dir=".")` — one attached challenge's leaderboard CSV, as the console's Students tab downloads it (writes `leaderboard_course_<cid>_comp_<challenge_id>.csv`); `client.course_cover(course_id, dest_dir=".")` — a course's cover image (course payloads carry `has_cover`, not a path).
 
@@ -1260,6 +1481,7 @@ print(student.my_progress(landing["id"]))                # content % + next less
 - `client.course_catalog(search=None, limit=None, offset=None)` — public courses.
 - `client.course(slug)`, `client.module_overview(slug, module_slug)`, `client.lesson(slug, module_slug, lesson_slug)`.
 - `client.mark_lesson_viewed(lesson_id, course_id=None)`, `client.mark_lesson_complete(lesson_id, course_id=None)`, `client.my_progress(course_id)`.
+- `client.download_module_asset(module_id, path, dest_dir=".")` — a file a lesson links (notebook, dataset), by the relative path the body writes; `lesson()["asset_base_url"]` is what such a link resolves against.
 
 ### Leaderboard
 
@@ -1310,3 +1532,6 @@ client.update_settings(challenge_id, metrics=[
 2. Open your Profile page.
 3. Mint a key for the scope you need (`user`, `creator`, or `teacher`).
 4. Copy the full token (shown once) — it starts with `mlk_`.
+
+A GitHub Actions workflow needs no key: see
+[GitHub Actions and the mlarena CLI](#github-actions-and-the-mlarena-cli).

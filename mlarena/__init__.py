@@ -1,6 +1,6 @@
-from urllib.parse import urlsplit
-
+from mlarena.bundle import make_bundle
 from mlarena.chat import ChatConversation
+from mlarena.ci_auth import PROD_BASE_URL, Credentials, resolve_credentials
 from mlarena.client import MLArenaClient
 from mlarena.exceptions import (
     AuthenticationError,
@@ -14,20 +14,29 @@ from mlarena.exceptions import (
     PermissionDeniedError,
     SubmissionError,
     SubmissionNotFoundError,
+    WaitTimeoutError,
 )
 
-__version__ = "4.11.0"
-
-_LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+__version__ = "4.12.0"
 
 
 def connect(
-    api_key: str,
-    base_url: str = "https://ml-arena.com",
+    api_key: str | None = None,
+    base_url: str = PROD_BASE_URL,
     *,
     allow_insecure: bool = False,
+    scope: str = "user",
+    audience: str | None = None,
 ) -> MLArenaClient:
     """Connect to ML Arena.
+
+    The credential is resolved in this order (`mlarena.ci_auth`):
+
+    1. `api_key`;
+    2. the `MLARENA_API_KEY` environment variable;
+    3. inside a GitHub Actions job with `permissions: id-token: write`, the
+       job's OIDC token, exchanged for a short-lived `mlo_…` token of the
+       account the repository is linked to. No secret is stored.
 
     Args:
         api_key: Full bearer token in the canonical form
@@ -39,33 +48,31 @@ def connect(
             are always allowed without this flag (local dev). Default
             ``False`` because the bearer token is sent on every request and
             cleartext transport would expose it to anyone on the network path.
+        scope: GitHub Actions only: the scope asked for the `mlo_` token
+            (``user`` | ``creator`` | ``teacher``). An API key carries its own.
+        audience: GitHub Actions only: the OIDC audience, the platform's
+            public URL. Defaults to ``MLARENA_OIDC_AUDIENCE``, else `base_url`.
 
     Returns:
-        MLArenaClient instance.
+        MLArenaClient instance; its ``credentials`` say which of the three
+        sources was used.
 
     Raises:
-        AuthenticationError: If the token doesn't look like a real `mlk_…`
-            token. The backend ultimately decides authenticity on the first
-            authenticated request.
+        AuthenticationError: If there is no credential, if the token doesn't
+            look like a real `mlk_…` token, or if the GitHub Actions exchange
+            is refused (the message is the server's). The backend ultimately
+            decides authenticity on the first authenticated request.
     """
-    if not api_key or not api_key.startswith("mlk_"):
-        raise AuthenticationError(
-            "Invalid api_key format. Expected a token of the form "
-            "'mlk_<scope>_<lookup>_<secret>' (copy it from your Profile page)."
+    def resolve():
+        return resolve_credentials(
+            api_key, base_url=base_url, scope=scope, audience=audience,
+            allow_insecure=allow_insecure,
         )
-    parts = api_key.split("_", 3)
-    if len(parts) != 4 or any(not part for part in parts):
-        raise AuthenticationError(
-            "Invalid api_key shape. Expected exactly 4 underscore-separated parts "
-            "(prefix, scope, lookup, secret)."
-        )
-    parsed = urlsplit(base_url)
-    if parsed.scheme != "https":
-        is_local = parsed.hostname in _LOCAL_HOSTS
-        if not is_local and not allow_insecure:
-            raise AuthenticationError(
-                f"Refusing to send bearer token over '{parsed.scheme}://'. "
-                "Use an https:// base_url, or pass allow_insecure=True if you "
-                "are pointing at a non-public dev server you control."
-            )
-    return MLArenaClient(token=api_key, base_url=base_url)
+
+    credentials = resolve()
+    return MLArenaClient(
+        token=credentials.token, base_url=base_url, credentials=credentials,
+        # An exchanged token lives 15 minutes; a long `submit(wait=True)`
+        # outlives it, so the client exchanges a new one when it runs out.
+        renew_credentials=resolve if credentials.expires_at_ts is not None else None,
+    )

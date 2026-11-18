@@ -115,7 +115,7 @@ def test_course_students_scopes_to_a_challenge():
         "selected_challenge_id": 42,
         "students": [{
             "user_id": 7, "username": "ana", "student_number": "S1",
-            "student_email": "ana@uni.edu", "project_url": None,
+            "student_email": "ana@uni.edu",
             "team_id": None, "team_name": None,
             "enrolled_at_ts": "2026-02-01T09:00:00Z",
         }],

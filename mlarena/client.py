@@ -13,15 +13,18 @@ import functools
 import inspect
 import io
 import os
+import re
 import tempfile
 import time
 import warnings
 from pathlib import Path
 from typing import Iterator
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 import requests
+import yaml
 
+from mlarena.bundle import bundle_root, read_bundle
 from mlarena.chat import ChatConversation
 from mlarena.exercise import format_attempt, source_of
 from mlarena.exceptions import (
@@ -35,6 +38,7 @@ from mlarena.exceptions import (
     PermissionDeniedError,
     SubmissionError,
     SubmissionNotFoundError,
+    WaitTimeoutError,
 )
 
 
@@ -47,6 +51,9 @@ class _Unset:
 
 
 _UNSET = _Unset()
+
+# A token that expires is renewed this long before it does.
+_TOKEN_RENEW_MARGIN_SEC = 60
 
 
 # SDK 4.0.0 (score model, D5): the six legacy score keywords of
@@ -81,16 +88,29 @@ class MLArenaClient:
     Pass the full bearer token returned by your Profile page (`mlk_user_...`,
     `mlk_creator_...`, or `mlk_teacher_...`). The token's scope segment dictates
     which endpoints are reachable — a `user`-scope token cannot call a
-    `creator`-required route, and vice versa.
+    `creator`-required route, and vice versa. A GitHub Actions run sends the
+    short-lived `mlo_…` token of its OIDC exchange instead, which the backend
+    reads like a key of the scope it was issued for (`mlarena.connect()`
+    resolves either; `credentials` says which).
     """
 
-    def __init__(self, token: str, base_url: str):
+    def __init__(self, token: str, base_url: str, credentials=None,
+                 renew_credentials=None):
         self._token = token
         self._base_url = base_url.rstrip("/")
+        # `mlarena.ci_auth.Credentials` when built by `mlarena.connect()`.
+        self.credentials = credentials
+        # Returns fresh credentials; set for a token that expires (the
+        # GitHub Actions exchange), None for an API key.
+        self._renew_credentials = renew_credentials
         self._last_submission_id = None
         self._last_challenge = None
 
     def _headers(self, *, json_body: bool = False) -> dict:
+        if (self._renew_credentials is not None
+                and self.credentials.expires_within(_TOKEN_RENEW_MARGIN_SEC)):
+            self.credentials = self._renew_credentials()
+            self._token = self.credentials.token
         h = {"Authorization": f"Bearer {self._token}"}
         if json_body:
             h["Content-Type"] = "application/json"
@@ -152,7 +172,7 @@ class MLArenaClient:
         Mirrors ``GET /api/profile/`` — the same data the console's Profile
         page loads (username, email, bio, links, student identity, avatar_key,
         enrollments). Each enrollment is ``{"course": {"id", "name"},
-        "project_url", "enrolled_at_ts"}``. Works with any valid token scope
+        "enrolled_at_ts"}``. Works with any valid token scope
         since the token itself identifies the user.
         """
         resp = self._request("GET", self._url("/profile/"), headers=self._headers())
@@ -164,7 +184,6 @@ class MLArenaClient:
     def update_profile(self, *,
                        username: str | None = None,
                        bio: str | None = None,
-                       github_page: str | None = None,
                        personal_website: str | None = None,
                        student_number: str | None = None,
                        student_email: str | None = None,
@@ -186,8 +205,6 @@ class MLArenaClient:
             body["username"] = username
         if bio is not None:
             body["bio"] = bio
-        if github_page is not None:
-            body["github_page"] = github_page
         if personal_website is not None:
             body["personal_website"] = personal_website
         if student_number is not None:
@@ -212,10 +229,13 @@ class MLArenaClient:
 
         Mirrors ``GET /api/auth/current_user`` — the same payload the console
         loads on every page. Keys: ``is_authenticated``, ``id``, ``username``,
-        ``email``, ``avatar_key``, ``is_admin``, ``is_teacher``, ``is_creator``,
-        ``is_human_verified``, ``has_teacher_access``, ``has_creator_access``
+        ``email``, ``avatar_key``, ``is_admin``, ``is_human_verified``,
+        ``has_teacher_access`` (the teacher flag *or* admin *or* a
+        course-assistant row), ``has_creator_access``
         (the real creator rule — the flag *or* admin *or* a creator-assistant
-        row) and ``can_create_course``. Every key is always present.
+        row), ``can_create_course`` and ``github_login`` (the GitHub account
+        linked to this one, None when there is none; it is linked from the
+        console's Profile page, a browser flow). Every key is always present.
 
         Note the route answers to any scope, but the *flags* describe the
         account, not the token: a ``mlk_user_…`` token on an admin account
@@ -233,6 +253,59 @@ class MLArenaClient:
             raise _failed(MLArenaError, "me", resp)
         return resp.json()
 
+    # ---- GitHub: trusted repositories (any token scope) ----
+    #
+    # A GitHub Actions run authenticates as the account its repository is
+    # linked to. A repository owned by the linked GitHub account
+    # (`me()["github_login"]`) is trusted as it is; any other one (an
+    # organisation's, a classmate's) must be listed here first.
+
+    def trusted_repositories(self) -> list:
+        """The repositories whose GitHub Actions runs may act as you.
+
+        Mirrors ``GET /api/profile/github/trusted_repositories``. Each row:
+        ``id``, ``repository`` (``owner/name``), ``repository_id`` (GitHub's
+        numeric id, None until the repository's first run), ``created_at_ts``
+        and ``last_used_at_ts``.
+        """
+        resp = self._request("GET",
+                             self._url("/profile/github/trusted_repositories"),
+                             headers=self._headers())
+        self._handle_response(resp)
+        if resp.status_code != 200:
+            raise _failed(MLArenaError, "trusted_repositories", resp)
+        return resp.json()
+
+    def add_trusted_repository(self, repository: str) -> dict:
+        """Trust a repository you do not own: its Actions runs may act as you.
+
+        Mirrors ``POST /api/profile/github/trusted_repositories``
+        ``{"repository": "owner/name"}``. Returns the new row (see
+        `trusted_repositories`).
+        """
+        resp = self._request("POST",
+                             self._url("/profile/github/trusted_repositories"),
+                             headers=self._headers(json_body=True),
+                             json={"repository": repository})
+        self._handle_response(resp)
+        if resp.status_code not in (200, 201):
+            raise _failed(MLArenaError, "add_trusted_repository", resp)
+        return resp.json()
+
+    def remove_trusted_repository(self, trusted_repository_id: int) -> dict:
+        """Stop trusting a repository (the row's ``id``).
+
+        Mirrors ``DELETE /api/profile/github/trusted_repositories/{id}``.
+        """
+        resp = self._request(
+            "DELETE",
+            self._url(f"/profile/github/trusted_repositories/{trusted_repository_id}"),
+            headers=self._headers())
+        self._handle_response(resp)
+        if resp.status_code != 200:
+            raise _failed(MLArenaError, "remove_trusted_repository", resp)
+        return resp.json()
+
     # ---- Teams (per-challenge; any token scope) ----
     #
     # A team is a participant action, so every route below is `user`-scoped:
@@ -240,7 +313,7 @@ class MLArenaClient:
     # submission is attributed to is the one these methods manage.
     #
     # Shapes mirror the response models in backend/app/views/_schemas.py. A
-    # team carries `id`, `challenge_id`, `name`, `looking_for_members`,
+    # team carries `id`, `challenge_id`, `name`,
     # `created_at_ts`, `members` (each: `id` — the membership row id —,
     # `user_id`, `username`, `avatar_key`, `role`) and `my_role`, your own
     # role on it ("leader", "member" or None). An invitation carries `id`,
@@ -279,18 +352,14 @@ class MLArenaClient:
             raise _failed(MLArenaError, "create_team", resp)
         return resp.json()
 
-    def update_team(self, team_id: int, name: str,
-                    looking_for_members: bool | None) -> dict:
-        """Rename a team / flip its "looking for members" flag (leader only).
+    def update_team(self, team_id: int, name: str) -> dict:
+        """Rename a team (leader only).
 
-        Mirrors ``PUT /api/teams/{team_id}``: the route takes both keys, so
-        both are required here — pass the team's current value for the one you
-        are not changing.
+        Mirrors ``PUT /api/teams/{team_id}``.
         """
         resp = self._request("PUT", self._url(f"/teams/{team_id}"),
                              headers=self._headers(json_body=True),
-                             json={"name": name,
-                                   "looking_for_members": looking_for_members})
+                             json={"name": name})
         self._handle_response(resp)
         if resp.status_code != 200:
             raise _failed(MLArenaError, "update_team", resp)
@@ -663,12 +732,13 @@ class MLArenaClient:
         (`lifecycle.py`, `get_creator_challenge`). Returns the challenge plus
         its three sibling rows as three objects, each under its own column
         names: `configuration` (`machine_id` and the runtime sizing, the env
-        runtime image, step deadlines, upload limits, `submission_filename`,
-        the GitHub sync), `evaluation`
+        runtime image, `number_of_agents`, step deadlines, upload limits,
+        `submission_filename`, the GitHub sync), `evaluation`
         (`metrics` — the MetricSpec declaration —, `window_days`, the ELO
-        parameters, the episode budget brackets) and `environment` (the
-        latest benchmark run's `benchmark_simulation_result_id` and
-        `attach_path_files`, `number_of_agents`). The configuration's
+        parameters, the episode budget brackets) and `environment` (`id`,
+        `challenge_id`, `created_at_ts` and the latest benchmark run's
+        `benchmark_simulation_result_id`; the env folder's files are
+        `list_env_files`). The configuration's
         `kernel_version` is the env runtime's kernel. Also `machine_name`,
         `machine` (`{id, name, runtime, vm_health_ok,
         vm_health_checked_at_ts}`), `role` — `"owner"` or `"assistant"` —
@@ -1112,13 +1182,6 @@ class MLArenaClient:
                         deployment_nb_constraint_run: int | None = None,
                         deployment_nb_initial_score_run: int | None = None,
                         episode_budget_brackets: list | None = None,
-                        elo_k_factor: int | None = None,
-                        elo_d0: float | None = None,
-                        elo_alpha: float | None = None,
-                        elo_beta: float | None = None,
-                        elo_momentum: float | None = None,
-                        elo_initial_variance: float | None = None,
-                        elo_initial_score: float | None = None,
                         data_source_enabled: bool | _Unset = _UNSET,
                         data_source_url: str | None | _Unset = _UNSET,
                         data_source_asset: str | None | _Unset = _UNSET,
@@ -1181,7 +1244,7 @@ class MLArenaClient:
         deployment_nb_* runs), `submission_upload` (max_upload_size_bytes,
         max_upload_files, max_active_submissions_per_participant),
         `submission_filename`, `elo` (a `metrics` spec with
-        `agg: "rating"`, elo_*),
+        `agg: "rating"`),
         `episode_budget_brackets`, `run_limits`, `agent_containers`
         (the agent_* sizing, agent_gpu_count), `multi_agent`
         (number_of_agents) and `exercises` (time_limit_sec, memory_limit_mb,
@@ -1189,9 +1252,10 @@ class MLArenaClient:
         included (machine_id, the env_* sizing, env_gpu_count,
         gpu_memory_limit).
 
-        Returns `{"configuration": {...}, "evaluation": {...}, "environment":
-        {"id", "number_of_agents"}}` — the three rows as the update left them,
-        each under its own column names.
+        Returns `{"configuration": {...}, "evaluation": {...}, "config":
+        {...}}` — the two rows as the update left them, each under its own
+        column names (`number_of_agents` is the configuration's), and the
+        flat config document of `creator_challenge`.
 
         Notable parameters:
             submission_filename: file_v1 only — the one file a participant
@@ -1214,7 +1278,7 @@ class MLArenaClient:
                 wins each run, the episode budget tiers, the leaderboard
                 order and course pass verdicts. `agg: "rating"` (only on the
                 platform key `elo`, `order: "desc"`, ranking) makes the board
-                ELO-rated; refused unless the kind has `elo` and the environment
+                ELO-rated; refused unless the kind has `elo` and the challenge
                 seats at least 2 agents (`number_of_agents`). Validated on the merged state (400
                 names the rule); once started only the presentation fields
                 may change. Not editable on a chat challenge. See the README
@@ -1238,18 +1302,9 @@ class MLArenaClient:
                 descending under "asc"; n_episodes non-decreasing; max 100
                 episodes per bracket. A single pair is a fixed budget.
 
-        ELO tunables (kinds with `elo`; frozen while the challenge runs;
-        None is not sent):
-            elo_k_factor: largest rating change per match (int >= 1).
-            elo_d0: rating scale of the expected-score formula (> 0; 400 is
-                chess).
-            elo_alpha / elo_beta: pairing weights (>= 0) of rating
-                uncertainty (who plays) and rating proximity (against whom);
-                0 = uniform.
-            elo_momentum: weight of the old rating variance in each update,
-                in [0, 1).
-            elo_initial_variance: variance of an unrated submission (> 0).
-            elo_initial_score: rating of an unrated submission.
+        The Elo parameters of a rated board (K factor, scale, pairing
+        weights, initial rating and variance) are platform constants: the
+        `elo_*` keywords left in SDK 4.12.0.
 
         Run budgets (creator keys; strictly positive; frozen while the
         challenge runs):
@@ -1367,13 +1422,6 @@ class MLArenaClient:
             "deployment_nb_constraint_run": deployment_nb_constraint_run,
             "deployment_nb_initial_score_run": deployment_nb_initial_score_run,
             "episode_budget_brackets": episode_budget_brackets,
-            "elo_k_factor": elo_k_factor,
-            "elo_d0": elo_d0,
-            "elo_alpha": elo_alpha,
-            "elo_beta": elo_beta,
-            "elo_momentum": elo_momentum,
-            "elo_initial_variance": elo_initial_variance,
-            "elo_initial_score": elo_initial_score,
             "machine_id": machine_id,
             "env_cpu_request": env_cpu_request,
             "env_cpu_limit": env_cpu_limit,
@@ -1499,35 +1547,81 @@ class MLArenaClient:
             raise _failed(MLArenaError, "upload_env_file", resp)
         return resp.json()
 
-    def sync_env_from_github(
-        self,
-        challenge_id: int,
-        github_repo_url: str,
-        github_token: str | None = None,
-    ) -> dict:
-        """Mirror a GitHub repo's default branch into the challenge env folder.
+    def push_challenge(self, challenge_id: int, path: str, *,
+                       subpath: str | None = None,
+                       dry_run: bool = False) -> dict:
+        """Replace the challenge's files with a directory, in one step
+        (creator scope).
 
-        Wipes the current env folder and replaces its contents with the repo
-        (`.git` excluded). Only allowed before the challenge is started, same
-        gate as `upload_env_file`. `github_token` is optional: when provided it
-        is persisted Fernet-encrypted on the challenge configuration and
-        reused on future syncs; leave it `None` to fall back to the saved
-        token (if any).
+        Mirrors `PUT /api/creator_challenge/challenge/{id}/bundle` (multipart
+        field `archive`, query `path` / `dry_run`). `path` is the challenge
+        directory (`env.py`, `challenge.toml`, data files…), zipped by
+        `mlarena.bundle.make_bundle` (`.git`, caches and virtualenvs left
+        out, symbolic links refused), or an existing `.zip` / `.tar.gz` of
+        it. `subpath` names the folder inside `path` that holds the
+        challenge (one repository, several challenges): of a directory, only
+        that folder is bundled; of an archive, the server reads only that
+        folder (the route's `path` query).
+
+        The bundle is applied all or nothing: `challenge.toml` is validated
+        like `upload_env_file` does, `env.py` is checked, and a refused
+        bundle raises `MLArenaError` with the server's message (its details
+        on `.body`) and changes nothing. `dry_run=True` runs the same checks
+        and writes nothing. Refused once the challenge has started, as the
+        file routes are.
+
+        Returns the server's report: what was written, the config result,
+        the `env.py` validation and the entries it ignored. From a GitHub
+        Actions run the commit is recorded as the environment's
+        `source_revision`.
         """
-        body = {"github_repo_url": github_repo_url}
-        if github_token is not None:
-            body["github_token"] = github_token
-        resp = self._request("POST",
-            self._url(
-                f"/creator_challenge/challenge/{challenge_id}/env/sync-github"
-            ),
-            headers=self._headers(json_body=True),
-            json=body,
-            timeout=180,
+        params: dict = {}
+        if os.path.isdir(path):
+            # The sub-folder is what gets bundled: nothing else is uploaded.
+            path = bundle_root(path, subpath)
+        elif subpath is not None:
+            params["path"] = subpath
+        filename, archive = read_bundle(path)
+        if dry_run:
+            params["dry_run"] = "true"
+        resp = self._request("PUT",
+            self._url(f"/creator_challenge/challenge/{challenge_id}/bundle"),
+            headers=self._headers(),
+            params=params or None,
+            files={"archive": (filename, archive)},
+            timeout=300,
         )
         self._handle_response(resp)
         if resp.status_code != 200:
-            raise _failed(MLArenaError, "sync_env_from_github", resp)
+            raise _failed(MLArenaError, "push_challenge", resp)
+        return resp.json()
+
+    def import_challenge_from_github(self, challenge_id: int, repository: str, *,
+                                     ref: str | None = None,
+                                     path: str | None = None,
+                                     dry_run: bool = False) -> dict:
+        """Replace the challenge's files with a public GitHub repository's
+        (creator scope).
+
+        Mirrors `POST /api/creator_challenge/challenge/{id}/import-github`
+        `{"repository", "ref", "path", "dry_run"}`. `repository` is
+        `owner/name` or the repository's URL; `ref` a branch, tag or commit
+        (default: the default branch); `path` the folder of the repository
+        that holds the challenge. The server downloads that commit and
+        applies it as `push_challenge` does, with the same report. A private
+        repository is pushed from its own GitHub Actions workflow instead
+        (`mlarena challenge push`).
+        """
+        resp = self._request("POST",
+            self._url(f"/creator_challenge/challenge/{challenge_id}/import-github"),
+            headers=self._headers(json_body=True),
+            json={"repository": repository, "ref": ref, "path": path,
+                  "dry_run": dry_run},
+            timeout=300,
+        )
+        self._handle_response(resp)
+        if resp.status_code != 200:
+            raise _failed(MLArenaError, "import_challenge_from_github", resp)
         return resp.json()
 
     def update_env_file_content(self, challenge_id: int, filename: str,
@@ -2171,7 +2265,8 @@ class MLArenaClient:
     # ---- Submissions (user scope) ----
 
     def create_submission(self, challenge_id: int, submission_name: str,
-                          copy_from_submission_id: int | None = None) -> dict:
+                          copy_from_submission_id: int | None = None, *,
+                          allow_same_commit: bool = False) -> dict:
         """Create a new submission for `challenge_id`.
 
         Mirrors `POST /api/submissions/challenge/{cid}` (`create_delete.py`).
@@ -2185,10 +2280,19 @@ class MLArenaClient:
         `copy_from_submission_id` is given: the source ("Source submission not
         found", also for a submission that is not yours) is the id most
         likely to be wrong on that call. Requires a `user`-scope token.
+
+        From a GitHub Actions run the submission records the commit it was
+        built from (`submission()["source_revision"]`), and a second create
+        for the same commit on the same challenge is refused: 409, a
+        `SubmissionError` whose `.body["submission_id"]` is the submission
+        that commit already made. `allow_same_commit=True` creates another
+        one anyway (a training run that is not deterministic).
         """
         body: dict = {"submission_name": submission_name}
         if copy_from_submission_id is not None:
             body["copy_from_submission_id"] = copy_from_submission_id
+        if allow_same_commit:
+            body["allow_same_commit"] = True
         resp = self._request("POST",
             self._url(f"/submissions/challenge/{challenge_id}"),
             headers=self._headers(json_body=True),
@@ -2725,7 +2829,7 @@ class MLArenaClient:
           `job_error_message` (served to the challenge's staff only),
           `job_retry_count`, `simulation_result_id`, `submission_deploy_id`
           (the attempt that queued it), `created_at_ts`,
-          `simulate_end_time_ts`, `is_test`, `is_deployment`,
+          `is_test`, `is_deployment`,
           `env_nb_steps`, the env's `step_time_*_sec` / `env_metric_*`
           columns and, when the challenge's own code is why the run ended,
           `env_error_type` (`code_error` | `timeout` | `oom_killed` |
@@ -3073,11 +3177,12 @@ class MLArenaClient:
                 return
 
             if deadline and time.monotonic() > deadline:
-                raise SubmissionError(
+                raise WaitTimeoutError(
                     f"tail_logs timed out after {timeout_sec}s: submission "
                     f"{submission_id} is still {status.get('status')!r}. Poll "
                     f"again with submission({submission_id}) or raise "
-                    f"timeout_sec."
+                    f"timeout_sec.",
+                    body=status,
                 )
 
             time.sleep(poll_sec)
@@ -3090,7 +3195,9 @@ class MLArenaClient:
                runtime: str | dict | None = None,
                wait: bool = False,
                timeout_sec: float | None = None,
-               poll_sec: float = 5.0) -> dict:
+               poll_sec: float = 5.0, *,
+               deploy: bool = True,
+               allow_same_commit: bool = False) -> dict:
         """Convenience: create submission → (pick runner) → upload files → deploy.
 
         Either pass `agent=<class>` (its source is uploaded as `agent.py`) or
@@ -3135,16 +3242,44 @@ class MLArenaClient:
         raises, with the server's limits on `.body`.
 
         Returns `{"submission_id": <id>, "deploy": <deploy response>}`, plus
-        `"status"` when `wait=True`.
+        `"status"` when `wait=True` (a wait that runs out of `timeout_sec`
+        raises `WaitTimeoutError`, a `SubmissionError`). With `deploy=False` the call stops after
+        the upload check (`"deploy"` is None): deploy it later with
+        `deploy_submission()` or from the console.
+
+        From a GitHub Actions run, a commit that already made a submission on
+        this challenge is not submitted twice (a re-run, a second tag on the
+        same commit): nothing is created, uploaded or deployed, and the call
+        returns `{"submission_id": <the existing id>, "deploy": None,
+        "already_submitted": True, "status": <submission()>}`. Pass
+        `allow_same_commit=True` to submit it again.
         """
         if (agent is None) == (files is None):
             raise SubmissionError("Provide exactly one of agent= or files=")
         if runtime_id is not None and runtime is not None:
             raise SubmissionError("Provide at most one of runtime_id= or runtime=")
+        if wait and not deploy:
+            raise SubmissionError("wait=True needs deploy=True")
 
-        created = self.create_submission(
-            challenge_id, submission_name or _default_submission_name(agent, files)
-        )
+        try:
+            created = self.create_submission(
+                challenge_id,
+                submission_name or _default_submission_name(agent, files),
+                allow_same_commit=allow_same_commit,
+            )
+        except SubmissionError as err:
+            existing_id = (err.body or {}).get("submission_id")
+            if err.status_code != 409 or existing_id is None:
+                raise
+            # This commit already made a submission (create_submission).
+            self._last_submission_id = existing_id
+            self._last_challenge = challenge_id
+            return {
+                "submission_id": existing_id,
+                "deploy": None,
+                "already_submitted": True,
+                "status": self.submission(existing_id),
+            }
         submission_id = created["submission_id"]
         # Remembered now, not after the deploy: `status()` must find the
         # submission that a rejected upload or a refused deploy leaves behind.
@@ -3198,10 +3333,11 @@ class MLArenaClient:
                     body=status,
                 )
 
-            deploy = self.deploy_submission(challenge_id, submission_id)
+            if not deploy:
+                return {"submission_id": submission_id, "deploy": None}
             result = {
                 "submission_id": submission_id,
-                "deploy": deploy,
+                "deploy": self.deploy_submission(challenge_id, submission_id),
             }
             if wait:
                 # Drain the generator: tail_logs() stops on `is_settled` and
@@ -3464,7 +3600,7 @@ class MLArenaClient:
     def chat_challenge(self, challenge_id: int) -> dict:
         """The participant view of a chat challenge — `ChatChallengeView`.
 
-        Mirrors `GET /api/chat/challenge/{cid}` (`backend/app/views/chat/`). Returns `challenge_id`, `challenge_name`, `status`
+        Mirrors `GET /api/chat/challenge/{cid}` (`backend/app/views/chat/`). Returns `challenge_name`, `challenge_slug`, `status`
         (`draft` | `started` | `stopped` | `ended`),
         `manifest` (what the agent registered: `bot_name`, `tagline`,
         `welcome_message`, `charter_md`, `rules_public_md`, the public
@@ -3575,8 +3711,7 @@ class MLArenaClient:
         (`llm_unavailable` | `llm_timeout` | `context_full` — the conversation
         outgrew the model's context window and was closed: open a new one —
         | `turn_timeout` | `env_error` | `agent_offline` | `platform_error`;
-        None on a turn
-        failed before the platform recorded causes) — and `error_message`,
+        always set on a failed turn, None otherwise) — and `error_message`,
         the raw text behind it, served to the challenge's creator /
         assistants and admins only (None for everyone else); None before the
         first message), `participant` (your group's `total_amount_eur` and
@@ -3847,7 +3982,8 @@ class MLArenaClient:
         Mirrors `POST /api/chat/sessions/{sid}/void` `{"reason": ...}`:
         the session becomes `voided` and its scoring events leave the
         group's total (recomputed in the same transaction). Undo with
-        `unvoid_chat_session()`.
+        `unvoid_chat_session()`. A 409 while a turn of the session is in
+        flight, as on `close_chat_session()`: retry once the agent answered.
 
         Raises `ChatSessionNotFoundError` when the session is not on a
         challenge you may manage.
@@ -4157,7 +4293,7 @@ class MLArenaClient:
                             ok: tuple[int, ...] = (200, 201),
                             error_label: str = "upload",
                             timeout: int = 120) -> dict:
-        """Multipart helper for the media/cover upload routes (sibling of
+        """Multipart helper for the cover upload route (sibling of
         ``upload_env_file``)."""
         if not os.path.isfile(file_path):
             raise MLArenaError(f"File not found: {file_path}")
@@ -4185,7 +4321,7 @@ class MLArenaClient:
                       teacher_user_id: int | None = None) -> dict:
         """Create an academic course — this is how you become a teacher.
 
-        Mirrors `POST /api/academic_courses/` (`academic_courses/legacy.py`).
+        Mirrors `POST /api/academic_courses/` (`academic_courses/courses.py`).
         Creating a course is the self-serve teacher-onboarding action: it works
         with any valid token scope and flips the owning account to a teacher.
         Each account may own at most `max_courses_limit` courses (default 1);
@@ -4251,8 +4387,7 @@ class MLArenaClient:
 
     def enroll_in_course(self, join_code: str | None = None,
                          student_email: str | None = None,
-                         student_number: str | None = None,
-                         project_url: str | None = None) -> dict:
+                         student_number: str | None = None) -> dict:
         """Enroll the authenticated user in a course.
 
         Mirrors `POST /api/academic_courses/enroll/<join_code>`. A course has a
@@ -4263,9 +4398,8 @@ class MLArenaClient:
         `student_email` / `student_number` fill the caller's global student
         identity when it isn't set yet (they never overwrite values already on
         the profile — set those via the Profile page / profile update). The
-        backend requires both to be present before enrolling. `project_url` is
-        stored on the enrollment. Returns `{message, challenge_ids,
-        course_slug}`.
+        backend requires both to be present before enrolling. Returns
+        `{message, challenge_ids, course_slug}`.
         """
         if join_code is None:
             raise MLArenaError("enroll_in_course requires a join code")
@@ -4274,8 +4408,6 @@ class MLArenaClient:
             body["student_email"] = student_email
         if student_number is not None:
             body["student_number"] = student_number
-        if project_url is not None:
-            body["project_url"] = project_url
         return self._course_call(
             "POST", f"/academic_courses/enroll/{join_code}", json_body=body,
             ok=(200, 201), error_label="enroll_in_course",
@@ -4486,12 +4618,16 @@ class MLArenaClient:
     def update_module(self, module_id: int, **fields) -> dict:
         """Update module meta — owner only. Mirrors `PUT /api/teacher/modules/{id}`.
 
-        Accepts `title`, `summary`, `icon`, `visibility`, `is_published` (the
-        slug is immutable for URL stability). Only the fields you pass are
-        changed, so `update_module(id, is_published=False)` sends a module back
-        to draft without touching anything else.
+        Accepts `title`, `slug`, `summary`, `icon`, `visibility`,
+        `is_published`. Only the fields you pass are changed, so
+        `update_module(id, is_published=False)` sends a module back to draft
+        without touching anything else. A new `slug` changes the module's
+        URLs; its lessons and their progress are kept. A module managed by a
+        bundle (`content_origin == "bundle"`) refuses edits with a 409 naming
+        its source: change the files and push again, or `detach_module`.
         """
-        allowed = {"title", "summary", "icon", "visibility", "is_published"}
+        allowed = {"title", "slug", "summary", "icon", "visibility",
+                   "is_published"}
         body = _filtered_fields(fields, allowed, "update_module")
         return self._course_call(
             "PUT", f"/teacher/modules/{module_id}", json_body=body,
@@ -4521,6 +4657,20 @@ class MLArenaClient:
         return self._course_call(
             "POST", f"/teacher/modules/{module_id}/fork",
             ok=(200, 201), error_label="fork_module",
+        )
+
+    def detach_module(self, module_id: int) -> dict:
+        """Hand a bundle-managed module back to the editor — owner only.
+
+        Mirrors `POST /api/teacher/modules/{id}/detach`. A module last
+        written by a course bundle (`push_course`, `mlarena course push`) has
+        `content_origin == "bundle"` and refuses editor writes; detaching
+        sets it to `editor`. The next push of a bundle that names the module
+        takes it over again. Returns the module detail.
+        """
+        return self._course_call(
+            "POST", f"/teacher/modules/{module_id}/detach",
+            error_label="detach_module",
         )
 
     def attach_challenge(self, module_id: int, challenge_id: int,
@@ -4630,11 +4780,13 @@ class MLArenaClient:
     def update_lesson(self, lesson_id: int, **fields) -> dict:
         """Partial update of a lesson — owner only.
 
-        Mirrors `PUT /api/teacher/lessons/{id}`. Accepts `title`, `body_md`,
-        `is_published`, `gated`, `estimated_minutes`. Only the fields you pass
-        are changed.
+        Mirrors `PUT /api/teacher/lessons/{id}`. Accepts `title`, `slug`,
+        `body_md`, `is_published`, `gated`, `estimated_minutes`. Only the
+        fields you pass are changed. A new `slug` changes the lesson's URL
+        and keeps its id, so the students' progress on it is kept.
         """
-        allowed = {"title", "body_md", "is_published", "gated", "estimated_minutes"}
+        allowed = {"title", "slug", "body_md", "is_published", "gated",
+                   "estimated_minutes"}
         body = _filtered_fields(fields, allowed, "update_lesson")
         return self._course_call(
             "PUT", f"/teacher/lessons/{lesson_id}", json_body=body,
@@ -4664,39 +4816,93 @@ class MLArenaClient:
             error_label="reorder_lessons",
         )
 
-    def upload_lesson_media(self, lesson_id: int, file_path: str) -> dict:
-        """Upload a file for a lesson; returns `{filename, url}`.
+    # ---- Course authoring: module assets (teacher scope) --------------------
+    #
+    # A module has one asset store: the images and files its lessons link.
+    # A lesson body links an asset by its path in the store, as a relative
+    # link (`![fig](media/fig.png)`, `[data](data/week1.csv)`); the lesson's
+    # `asset_base_url` is what such a link resolves against.
 
-        Mirrors `POST /api/teacher/lessons/{id}/media`. Any file type: put the
-        returned `url` in the lesson body as `![alt](url)` for an image, or as
-        `[label](url)` for anything else (notebook, dataset, handout) — the
-        asset route serves non-images as a download.
+    def upload_module_asset(self, module_id: int, file_path: str, *,
+                            path: str | None = None) -> dict:
+        """Upload a file to a module's asset store; returns `{path, url}`.
+
+        Mirrors `POST /api/teacher/modules/{id}/assets` (multipart `file`,
+        form field `path`). `path` is where it is stored, relative to the
+        store (`data/week1/x.csv`: letters, digits, `.`, `_` and `-` in each
+        segment); left out, `media/<the file's name>`. A file already at that
+        path is replaced. Any file type: write the returned `path` in a
+        lesson body as `![alt](path)` for an image, or as `[label](path)` for
+        anything else (notebook, dataset, handout), which downloads when a
+        student clicks it. Refused (409) on a module managed by a bundle.
         """
-        return self._upload_course_file(
-            "POST", f"/teacher/lessons/{lesson_id}/media", file_path,
-            error_label="upload_lesson_media",
-        )
+        if not os.path.isfile(file_path):
+            raise MLArenaError(f"File not found: {file_path}")
+        with open(file_path, "rb") as fh:
+            resp = self._request(
+                "POST", self._url(f"/teacher/modules/{module_id}/assets"),
+                headers=self._headers(),
+                files={"file": (os.path.basename(file_path), fh)},
+                data={"path": path} if path is not None else None,
+                timeout=120,
+            )
+        self._handle_response(resp)
+        if resp.status_code not in (200, 201):
+            raise _failed(MLArenaError, "upload_module_asset", resp)
+        return resp.json()
 
-    def list_lesson_media(self, lesson_id: int) -> list:
-        """The files attached to a lesson: `[{filename, url, size_bytes}]`.
+    def list_module_assets(self, module_id: int) -> list:
+        """The files of a module's asset store: `[{path, url, size_bytes}]`.
 
-        Mirrors `GET /api/teacher/lessons/{id}/media` (owner scope). Use it to
-        find a file whose link is no longer in the body — the upload response is
-        otherwise the only place its URL ever appeared.
+        Mirrors `GET /api/teacher/modules/{id}/assets` (owner). Use it to
+        find a file whose link is no longer in any body.
         """
         return self._course_call(
-            "GET", f"/teacher/lessons/{lesson_id}/media",
-            error_label="list_lesson_media",
+            "GET", f"/teacher/modules/{module_id}/assets",
+            error_label="list_module_assets",
+        )
+
+    def delete_module_asset(self, module_id: int, path: str) -> dict:
+        """Delete one file of a module's asset store, by its `path`.
+
+        Mirrors `DELETE /api/teacher/modules/{id}/assets/{path}`.
+        """
+        return self._course_call(
+            "DELETE", f"/teacher/modules/{module_id}/assets/{quote(path)}",
+            error_label="delete_module_asset",
+        )
+
+    def download_module_asset(self, module_id: int, path: str,
+                              dest_dir: str = ".") -> str:
+        """Download one module asset to `dest_dir/<path>`; returns the
+        written path.
+
+        Mirrors `GET /api/academic_courses/assets/modules/{id}/{path}` — the
+        *consumption* route, so this is the call a student (not just the
+        author) makes to fetch a lab notebook or dataset a lesson links:
+        `path` is the relative link as the lesson body writes it. A module
+        whose lessons are gated requires enrollment; the bearer token carries
+        that.
+        """
+        parts = path.split("/")
+        if path.startswith("/") or "\\" in path or any(
+                part in ("", ".", "..") for part in parts):
+            raise MLArenaError(f"Not a module asset path: {path!r}")
+        return self._download_course_file(
+            f"/academic_courses/assets/modules/{module_id}/{quote(path)}",
+            os.path.join(dest_dir, *parts),
+            error_label="download_module_asset",
         )
 
     def download_lesson_media(self, lesson_id: int, filename: str,
                               dest_dir: str = ".") -> str:
         """Download one lesson file to `dest_dir`; returns the written path.
 
-        Mirrors `GET /api/academic_courses/assets/lessons/{id}/{filename}` — the
-        *consumption* route, so this is the call a student (not just the author)
-        makes to fetch a lab notebook or dataset a lesson links. Gated lessons
-        require enrollment; the bearer token carries that.
+        Mirrors `GET /api/academic_courses/assets/lessons/{id}/{filename}`,
+        the URL of a file attached to a lesson before module assets existed.
+        A lesson body that still links such a URL is read with this method;
+        files are now a module's assets (`download_module_asset`). Gated
+        lessons require enrollment; the bearer token carries that.
         """
         os.makedirs(dest_dir, exist_ok=True)
         resp = self._request(
@@ -4712,16 +4918,6 @@ class MLArenaClient:
                 if chunk:
                     fh.write(chunk)
         return out_path
-
-    def delete_lesson_media(self, lesson_id: int, filename: str) -> dict:
-        """Delete a lesson media file.
-
-        Mirrors `DELETE /api/teacher/lessons/{id}/media/{filename}`.
-        """
-        return self._course_call(
-            "DELETE", f"/teacher/lessons/{lesson_id}/media/{filename}",
-            error_label="delete_lesson_media",
-        )
 
     def preview_lesson(self, lesson_id: int, body_md: str | None = None) -> dict:
         """Server-validate a lesson body's `mlarena:` directives (strict mode).
@@ -4912,7 +5108,7 @@ class MLArenaClient:
         None (the route no longer defaults to the course's first challenge).
         A challenge not attached to the course is a 400. Returns
         `{challenges, selected_challenge_id, students}`, where each student
-        carries `user_id`, `student_number`, `student_email`, `project_url` and
+        carries `user_id`, `student_number`, `student_email` and
         `enrolled_at_ts`.
         """
         params = {"challenge_id": challenge_id} if challenge_id is not None else None
@@ -5008,8 +5204,8 @@ class MLArenaClient:
     def _download_course_file(self, path: str, out_path: str, *,
                               params: dict | None = None,
                               error_label: str = "download") -> str:
-        """Stream a course route's file body to ``out_path`` (sibling of
-        ``download_lesson_media``); returns the written path."""
+        """Stream a course route's file body to ``out_path``; returns the
+        written path."""
         directory = os.path.dirname(out_path)
         if directory:
             os.makedirs(directory, exist_ok=True)
@@ -5028,247 +5224,329 @@ class MLArenaClient:
 
     # ---- High-level course helpers (client-side compositions) ---------------
 
-    def author_course_from_dir(self, path: str) -> dict:
-        """Create/update a whole course from a local directory + `course.yaml`.
+    def push_course(self, path: str, *, slug: str | None = None,
+                    subpath: str | None = None,
+                    dry_run: bool = False, prune: bool = False) -> dict:
+        """Create or update a whole course from a directory, in one step
+        (teacher scope).
 
-        The "write your course via the SDK" ergonomic — a pure composition of
-        the authoring methods above (no new endpoint), mirroring how `submit()`
-        bundles create + upload + deploy. Requires a `teacher`-scope token.
+        Mirrors `PUT /api/teacher/courses/{slug}/bundle` (multipart field
+        `archive`, query `dry_run` / `prune`). `path` is the course directory
+        (`course.yaml`, the lessons' markdown, their images and files),
+        zipped by `mlarena.bundle.make_bundle`, or an existing `.zip` /
+        `.tar.gz` of it. `slug` is the course's; by default it is read from
+        the manifest's `course.slug`. `subpath` names the folder inside the
+        directory `path` that holds the course (one repository, several
+        courses): only that folder is bundled, as `push_challenge` does. The
+        course route takes no sub-folder, so an archive is pushed whole and
+        `subpath` with one raises.
 
         Directory layout::
 
             my-course/
-              course.yaml            # or course.json — the manifest
-              cover.png              # optional, referenced from the manifest
+              course.yaml            # or course.json: the manifest
+              cover.png              # optional, named by the manifest
               foundations/
-                what-is-rl.md        # lesson bodies referenced from the manifest
+                what-is-rl.md        # a lesson body, named by the manifest
+              media/loop.png         # linked from a body as ![](media/loop.png)
+
+        Every path of the manifest and every relative link of a lesson body
+        is relative to the directory's root.
 
         Manifest (`course.yaml`)::
 
             course:
               name: "Intro to RL"
+              slug: intro-to-rl
               code: "RL101"          # optional
-              slug: intro-to-rl      # optional (auto-derived)
               description: "..."     # optional markdown
               visibility: public     # private | unlisted | public
               instructor_name: "Prof X"
               start_date: 2026-01-01
               end_date: 2026-06-01
               cover: cover.png       # optional, relative to the dir
-              course_id: 12          # optional — update this course instead of creating
             modules:
               - title: "Foundations"
-                slug: foundations    # optional
+                slug: foundations
                 summary: "..."       # optional
                 icon: book           # optional
-                visibility: public   # optional (default private) — teacher reuse
-                is_published: true   # optional (default true) — false = hidden from students
-                module_id: 7         # optional — link this existing module instead of creating
-                challenges:          # optional (`competitions:` also accepted)
-                  - challenge_id: 42        # (`competition_id:` also accepted)
+                visibility: public   # optional (default private): teacher reuse
+                is_published: true   # optional (default true): false = hidden from students
+                challenges:          # optional
+                  - slug: cartpole-v1       # the challenge's URL slug (or challenge_id:)
                     label: "CartPole"
-                    pass_threshold: 195.0   # optional — score that validates it
+                    pass_threshold: 195.0   # optional: the score that validates it
                 lessons:
                   - title: "What is RL?"
-                    slug: what-is-rl       # optional
+                    slug: what-is-rl
                     kind: lesson           # lesson | exercise
-                    file: foundations/what-is-rl.md   # body markdown, relative to the dir
-                    body_md: "inline..."   # alternative to `file`
+                    file: foundations/what-is-rl.md   # or inline body_md:
                     gated: false           # optional
-                    is_published: true     # optional (default false / draft)
+                    is_published: true     # optional (default false: a draft)
                     estimated_minutes: 15  # optional
+                    renamed_from: intro    # optional: the lesson's previous slug
+                    children: []           # optional: sub-lessons, one level
 
-        Idempotency is explicit, not magical: pass `course.course_id` to update
-        an existing course's meta, and a module's `module_id` to link an existing
-        module rather than create a new one. Returns a summary
-        `{course_id, slug, join_code, modules: [...]}`.
+        The server applies the bundle; this method only uploads it. It is
+        idempotent: the course, each module and each lesson are matched by
+        slug (required on all three; `renamed_from` renames a module or a
+        lesson in place), so pushing twice changes nothing the second time.
+        The manifest is declarative for what it lists: a key left out takes
+        its default, except in the `course` block, and a module without
+        `challenges` keeps its attached challenges. A lesson that left the
+        manifest is unpublished, not deleted (the students' progress on it is
+        kept) and reported as orphaned; `prune=True` deletes it. Unknown
+        keys, a missing file or an invalid lesson directive refuse the whole
+        bundle: `MLArenaError` with the server's message, nothing written.
+        `dry_run=True` returns the same plan and writes nothing.
 
-        Manifests written before SDK 2.0 name a module's challenge list
-        `competitions:` and each entry's id `competition_id:`. Both spellings
-        are still read, permanently; `export_course_to_dir` writes
-        `challenges:` / `challenge_id:`. A module or entry that carries both
-        spellings is rejected.
+        A module written by a bundle is managed by it: the console's editor
+        and the module / lesson write methods answer 409 until
+        `detach_module`. Relative links in a lesson are kept as written; the
+        files they name become the module's assets.
+
+        Returns the server's plan: `dry_run`, `course` (`id`, `slug`,
+        `action`), `modules` (each `slug`, `id`, `action` — `created` |
+        `updated` | `unchanged` | `adopted` —, `renamed_from`, `lessons`,
+        `orphaned_lessons`, `pruned_lessons`, `assets`), `unmanaged_modules`,
+        `source_revision` and the course's `url`. Manifests written before
+        SDK 2.0 (`competitions:` / `competition_id:`) are still read by the
+        server.
         """
-        base = os.path.abspath(path)
-        manifest = _load_course_manifest(base)
-        course_spec = dict(manifest.get("course") or {})
-        modules_spec = manifest.get("modules") or []
-
-        existing_course_id = course_spec.pop("course_id", None)
-        cover = course_spec.pop("cover", None)
-        # Resolve every module's challenge links before the first request, so
-        # a malformed list fails before anything is created.
-        challenge_links = [
-            [(_manifest_challenge_id(link), link) for link in _manifest_challenge_links(m)]
-            for m in modules_spec
-        ]
-
-        if existing_course_id is not None:
-            self.update_course(existing_course_id, **_course_meta_fields(course_spec))
-            course_id = existing_course_id
-            course_out = {"id": course_id, "slug": course_spec.get("slug")}
-        else:
-            course_out = self.create_course(
-                name=course_spec["name"],
-                code=course_spec.get("code"),
-                start_date=course_spec["start_date"],
-                end_date=course_spec["end_date"],
-                instructor_name=course_spec.get("instructor_name"),
-                slug=course_spec.get("slug"),
-                description=course_spec.get("description"),
-                visibility=course_spec.get("visibility"),
-                teacher_user_id=course_spec.get("teacher_user_id"),
+        if os.path.isdir(path):
+            path = bundle_root(path, subpath)
+        elif subpath is not None:
+            raise MLArenaError(
+                "push_course takes subpath= only with a directory: an archive "
+                "is pushed whole, with the manifest at its root"
             )
-            course_id = course_out["id"]
-
-        if cover:
-            self.set_course_cover(course_id, os.path.join(base, cover))
-
-        module_summaries = []
-        ordered_module_ids = []
-        for position, m in enumerate(modules_spec):
-            module_id = m.get("module_id")
-            if module_id is None:
-                created = self.create_module(
-                    title=m["title"], slug=m.get("slug"), summary=m.get("summary"),
-                    icon=m.get("icon"), visibility=m.get("visibility", "private"),
-                    is_published=bool(m.get("is_published", True)),
+        if slug is None:
+            if not os.path.isdir(path):
+                raise MLArenaError(
+                    "push_course needs slug= when path is an archive (the "
+                    "manifest inside it is read by the server only)"
                 )
-                module_id = created["id"]
-                lesson_ids = []
-                for lesson_spec in (m.get("lessons") or []):
-                    lesson_ids.append(
-                        self._author_lesson(base, module_id, lesson_spec)["id"]
-                    )
-                for challenge_id, link in challenge_links[position]:
-                    self.attach_challenge(
-                        module_id, challenge_id,
-                        label=link.get("label"), position=link.get("position"),
-                        pass_threshold=link.get("pass_threshold"),
-                    )
-                module_summaries.append(
-                    {"module_id": module_id, "title": m["title"],
-                     "lesson_ids": lesson_ids, "created": True}
-                )
-            else:
-                module_summaries.append(
-                    {"module_id": module_id, "title": m.get("title"),
-                     "lesson_ids": [], "created": False}
-                )
+            slug = _manifest_course_slug(os.path.abspath(path))
+        filename, archive = read_bundle(path)
+        params: dict = {}
+        if dry_run:
+            params["dry_run"] = "true"
+        if prune:
+            params["prune"] = "true"
+        resp = self._request(
+            "PUT", self._url(f"/teacher/courses/{quote(slug, safe='')}/bundle"),
+            headers=self._headers(),
+            params=params or None,
+            files={"archive": (filename, archive)},
+            timeout=300,
+        )
+        self._handle_response(resp)
+        if resp.status_code not in (200, 201):
+            raise _failed(MLArenaError, "push_course", resp)
+        return resp.json()
 
-            self.link_module(course_id, module_id, position=position)
-            ordered_module_ids.append(module_id)
+    def import_course_from_github(self, slug: str, repository: str, *,
+                                  ref: str | None = None,
+                                  path: str | None = None,
+                                  dry_run: bool = False,
+                                  prune: bool = False) -> dict:
+        """Create or update a course from a public GitHub repository
+        (teacher scope).
 
-        # Pin the manifest's module order (link positions can drift if some were
-        # already linked from a prior run).
-        if len(ordered_module_ids) > 1:
-            self.reorder_modules(course_id, ordered_module_ids)
-
-        return {
-            "course_id": course_id,
-            "slug": course_out.get("slug"),
-            "join_code": course_out.get("join_code"),
-            "modules": module_summaries,
-        }
-
-    def _author_lesson(self, base: str, module_id: int, spec: dict) -> dict:
-        """Create one lesson from a manifest entry (body from `file` or inline
-        `body_md`), then publish/set the fields `create_lesson` doesn't take."""
-        body_md = spec.get("body_md", "")
-        if spec.get("file"):
-            with open(os.path.join(base, spec["file"]), "r", encoding="utf-8") as fh:
-                body_md = fh.read()
-
-        lesson = self.create_lesson(
-            module_id, title=spec["title"], kind=spec.get("kind", "lesson"),
-            slug=spec.get("slug"), parent_lesson_id=spec.get("parent_lesson_id"),
-            body_md=body_md, gated=bool(spec.get("gated", False)),
+        Mirrors `POST /api/teacher/courses/{slug}/import-github`
+        `{"repository", "ref", "path", "dry_run", "prune"}`. `repository` is
+        `owner/name` or the repository's URL; `ref` a branch, tag or commit
+        (default: the default branch); `path` the folder of the repository
+        that holds `course.yaml`. The server downloads that commit and
+        applies it as `push_course` does, with the same plan. A private
+        repository is pushed from its own GitHub Actions workflow instead
+        (`mlarena course push`).
+        """
+        return self._course_call(
+            "POST", f"/teacher/courses/{quote(slug, safe='')}/import-github",
+            json_body={"repository": repository, "ref": ref, "path": path,
+                       "dry_run": dry_run, "prune": prune},
+            ok=(200, 201), error_label="import_course_from_github",
+            timeout=300,
         )
 
-        # is_published / estimated_minutes are only settable via update.
-        updates = {}
-        if spec.get("is_published"):
-            updates["is_published"] = True
-        if spec.get("estimated_minutes") is not None:
-            updates["estimated_minutes"] = spec["estimated_minutes"]
-        if updates:
-            lesson = self.update_lesson(lesson["id"], **updates)
-        return lesson
+    def author_course_from_dir(self, path: str) -> dict:
+        """Deprecated alias of `push_course(path)`.
+
+        It uploads the directory as a course bundle and returns the server's
+        plan. The course is matched by the manifest's `course.slug`, which is
+        therefore required; the manifest's `course_id` / `module_id` keys are
+        not part of the bundle format.
+        """
+        warnings.warn(
+            "author_course_from_dir() is deprecated, use push_course()",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.push_course(path)
 
     def export_course_to_dir(self, slug: str, path: str) -> dict:
-        """Export a course to a local directory of markdown + a `course.yaml`.
+        """Export a course to a local directory: a `course.yaml`, the lessons'
+        markdown, the files they link and the cover.
 
-        The inverse of `author_course_from_dir` — for backup / versioning a
-        course as files. Reads the public consumption surface (landing + lesson
-        bodies), so it works for a course you can view (public, or one you own /
-        are enrolled in; owners also get draft lessons *and draft modules* — for
-        anyone else an unpublished module is simply absent, so exporting someone
-        else's course gives you the published cut of it). Returns the manifest dict.
+        The inverse of `push_course`: pushing the exported directory changes
+        nothing. Reads the public consumption surface (landing + lesson
+        bodies + module assets), so it works for a course you can view
+        (public, or one you own / are enrolled in; owners also get draft
+        lessons *and draft modules* — for anyone else an unpublished module
+        is simply absent, so exporting someone else's course gives you the
+        published cut of it).
+
+        Layout: `<module-slug>/<lesson-slug>.md` for each lesson body, and
+        every relative link of a body (`![](media/loop.png)`,
+        `[data](data.csv)`) downloaded from its module's assets to that same
+        path from the directory's root, which is what a bundle's links are
+        relative to. A linked file the module does not hold is reported with
+        a warning and skipped; two modules that hold different files under
+        one path cannot share a directory, and raise. An attached challenge
+        is written by its slug. A module's `visibility` is written for a
+        course you manage (it is a teacher-side field). Returns the manifest
+        dict.
         """
         landing = self.course(slug)
         base = os.path.abspath(path)
         os.makedirs(base, exist_ok=True)
 
         modules_out = []
-        for module in landing.get("modules", []):
+        asset_owner: dict[str, str] = {}
+        for module in landing["modules"]:
             module_slug = module["slug"]
-            module_dir = os.path.join(base, module_slug)
-            os.makedirs(module_dir, exist_ok=True)
+            os.makedirs(os.path.join(base, module_slug), exist_ok=True)
 
+            entries: dict[int, dict] = {}
             lessons_out = []
-            for toc in module.get("lessons", []):
+            for toc in module["lessons"]:
                 full = self.lesson(slug, module_slug, toc["slug"])
-                rel = os.path.join(module_slug, f"{toc['slug']}.md")
-                with open(os.path.join(base, rel), "w", encoding="utf-8") as fh:
-                    fh.write(full.get("body_md", ""))
-                lessons_out.append({
+                body_md = full["body_md"]
+                rel = f"{module_slug}/{toc['slug']}.md"
+                with open(os.path.join(base, module_slug, f"{toc['slug']}.md"),
+                          "w", encoding="utf-8") as fh:
+                    fh.write(body_md)
+                for asset_path in _relative_asset_links(body_md):
+                    self._export_asset(full["asset_base_url"], asset_path, base,
+                                       module_slug, asset_owner)
+                entry = {
                     "title": toc["title"],
                     "slug": toc["slug"],
-                    "kind": toc.get("kind", "lesson"),
+                    "kind": toc["kind"],
                     "file": rel,
-                    "gated": toc.get("gated", False),
-                    "is_published": toc.get("is_published", True),
-                    "estimated_minutes": toc.get("estimated_minutes"),
-                })
+                    "gated": toc["gated"],
+                    "is_published": toc["is_published"],
+                    "estimated_minutes": toc["estimated_minutes"],
+                }
+                entries[toc["id"]] = entry
+                if toc["parent_lesson_id"] is None:
+                    lessons_out.append(entry)
+                else:
+                    # A lesson's children follow it in the landing's order.
+                    entries[toc["parent_lesson_id"]].setdefault(
+                        "children", []).append(entry)
 
-            modules_out.append({
+            module_out = {
                 "title": module["title"],
                 "slug": module_slug,
-                "summary": module.get("summary"),
-                "icon": module.get("icon"),
-                "is_published": module.get("is_published", True),
-                "challenges": [
-                    {
-                        # The manifest key stays `challenge_id`; the landing
-                        # payload names the challenge itself.
-                        "challenge_id": c["challenge"]["id"],
-                        "label": c.get("label"),
-                        "pass_threshold": c.get("pass_threshold"),
-                    }
-                    for c in module.get("challenges", [])
-                ],
+                "summary": module["summary"],
+                "icon": module["icon"],
+            }
+            if landing["can_manage"]:
+                module_out["visibility"] = self.get_module(module["id"])["visibility"]
+            module_out.update({
+                "is_published": module["is_published"],
+                "challenges": [_manifest_challenge_entry(c)
+                               for c in module["challenges"]],
                 "lessons": lessons_out,
             })
+            modules_out.append(module_out)
 
-        manifest = {
-            "course": {
-                "name": landing["name"],
-                "code": landing.get("code"),
-                "slug": landing.get("slug"),
-                "description": landing.get("description"),
-                "visibility": landing.get("visibility"),
-                "instructor_name": landing.get("instructor_name"),
-                "start_date": landing.get("start_date"),
-                "end_date": landing.get("end_date"),
-            },
-            "modules": modules_out,
+        course_out = {
+            "name": landing["name"],
+            "slug": landing["slug"],
+            "code": landing["code"],
+            "description": landing["description"],
+            "visibility": landing["visibility"],
+            "instructor_name": landing["instructor_name"],
+            "start_date": landing["start_date"],
+            "end_date": landing["end_date"],
         }
+        if landing["has_cover"]:
+            course_out["cover"] = self._export_course_cover(landing["id"], base)
+        manifest = {"course": course_out, "modules": modules_out}
         _dump_course_manifest(base, manifest)
         return manifest
 
+    def _export_asset(self, asset_base_url: str, asset_path: str, base: str,
+                      module_slug: str, asset_owner: dict) -> None:
+        """Download one linked module asset to `base/<asset_path>`.
+
+        `asset_base_url` is the lesson's (a path of this server, `/api/…/`).
+        `asset_owner` remembers which module wrote each path, across the
+        export.
+        """
+        resp = self._request(
+            "GET",
+            f"{self._base_url}{asset_base_url}{quote(asset_path)}",
+            headers=self._headers(), timeout=300,
+        )
+        if resp.status_code == 404:
+            warnings.warn(
+                f"module {module_slug!r}: a lesson links {asset_path!r}, which "
+                f"is not among the module's assets; skipped",
+                stacklevel=3,
+            )
+            return
+        self._handle_response(resp)
+        if resp.status_code != 200:
+            raise _failed(MLArenaError, "export_course_to_dir (asset)", resp)
+        content = resp.content
+        out_path = os.path.join(base, *asset_path.split("/"))
+        owner = asset_owner.get(asset_path)
+        if owner is not None and owner != module_slug:
+            with open(out_path, "rb") as fh:
+                if fh.read() != content:
+                    raise MLArenaError(
+                        f"modules {owner!r} and {module_slug!r} both hold an "
+                        f"asset {asset_path!r}, with different content: one "
+                        f"course directory cannot hold both. Rename one of "
+                        f"them, then export again."
+                    )
+            return
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        with open(out_path, "wb") as fh:
+            fh.write(content)
+        asset_owner[asset_path] = module_slug
+
+    def _export_course_cover(self, course_id: int, base: str) -> str:
+        """Write the course's cover as `cover.<ext>` in `base`; returns the
+        file name. The extension is the served image type's."""
+        resp = self._request(
+            "GET", self._url(f"/academic_courses/assets/courses/{course_id}/cover"),
+            headers=self._headers(), timeout=300, stream=True,
+        )
+        self._handle_response(resp)
+        if resp.status_code != 200:
+            raise _failed(MLArenaError, "course_cover", resp)
+        content_type = resp.headers["Content-Type"].split(";")[0].strip().lower()
+        if content_type not in _COVER_EXTENSIONS:
+            raise MLArenaError(
+                f"course cover is served as {content_type!r}, not an image type "
+                f"this export knows ({', '.join(sorted(_COVER_EXTENSIONS))})"
+            )
+        name = f"cover{_COVER_EXTENSIONS[content_type]}"
+        with open(os.path.join(base, name), "wb") as fh:
+            for chunk in resp.iter_content(chunk_size=1 << 20):
+                if chunk:
+                    fh.write(chunk)
+        return name
+
     def __repr__(self) -> str:
-        head = self._token.split("_", 3)
-        masked = "_".join(head[:3] + ["…"]) if len(head) == 4 else "…"
+        # mlk_<scope>_<lookup>_<secret> / mlo_<lookup>_<secret>: never the secret.
+        head = self._token.split("_")
+        masked = "_".join(head[:-1] + ["…"]) if len(head) in (3, 4) else "…"
         return f"MLArenaClient(base_url='{self._base_url}', token='{masked}')"
 
 
@@ -5290,17 +5568,9 @@ def _filtered_fields(fields: dict, allowed: set, method_name: str) -> dict:
     return body
 
 
-def _course_meta_fields(course_spec: dict) -> dict:
-    """The subset of a manifest ``course:`` block that ``update_course`` accepts."""
-    allowed = {"name", "code", "description", "visibility",
-               "instructor_name", "start_date", "end_date"}
-    return {k: v for k, v in course_spec.items() if k in allowed and v is not None}
-
-
 def _load_course_manifest(base: str) -> dict:
-    """Read ``course.yaml`` / ``course.yml`` (PyYAML, lazy) or ``course.json``
-    from a course directory. Fails loud if none is found or YAML isn't installed
-    when a YAML manifest is present (no silent fallback)."""
+    """Read ``course.yaml`` / ``course.yml`` or ``course.json`` from a course
+    directory. Fails loud if none is found."""
     import json
 
     yaml_path = next(
@@ -5312,13 +5582,6 @@ def _load_course_manifest(base: str) -> dict:
     json_path = os.path.join(base, "course.json")
 
     if yaml_path is not None:
-        try:
-            import yaml
-        except ImportError as exc:
-            raise MLArenaError(
-                "Reading a course.yaml manifest needs PyYAML "
-                "(`pip install pyyaml`), or provide a course.json instead."
-            ) from exc
         with open(yaml_path, "r", encoding="utf-8") as fh:
             return yaml.safe_load(fh) or {}
     if os.path.isfile(json_path):
@@ -5329,47 +5592,108 @@ def _load_course_manifest(base: str) -> dict:
     )
 
 
-# course.yaml input alias: manifests on teachers' disks predate the rename and
-# say `competitions:` / `competition_id:`. Those keys are read permanently;
-# export writes only the new ones. Both spellings in one block is ambiguous, so
-# it fails loud instead of picking one.
-
-def _manifest_challenge_links(module_spec: dict) -> list:
-    """A manifest module's challenge list, under `challenges:` or the legacy
-    `competitions:` key."""
-    if "challenges" in module_spec and "competitions" in module_spec:
+def _manifest_course_slug(base: str) -> str:
+    """`course.slug` of the manifest in a course directory: the course a
+    bundle of it is pushed to."""
+    course = _load_course_manifest(base).get("course") or {}
+    slug = course.get("slug")
+    if not slug:
         raise MLArenaError(
-            f"Module {module_spec.get('title')!r} has both 'challenges' and "
-            f"'competitions'; keep only 'challenges'"
+            f"The manifest in {base!r} has no course.slug: add it (the course "
+            f"is matched by its slug), or pass slug="
         )
-    if "competitions" in module_spec:
-        return module_spec["competitions"] or []
-    return module_spec.get("challenges") or []
+    return str(slug)
 
 
-def _manifest_challenge_id(link_spec: dict) -> int:
-    """A manifest challenge entry's id, under `challenge_id:` or the legacy
-    `competition_id:` key. An entry with neither raises KeyError."""
-    if "challenge_id" in link_spec and "competition_id" in link_spec:
-        raise MLArenaError(
-            f"Challenge entry {link_spec!r} has both 'challenge_id' and "
-            f"'competition_id'; keep only 'challenge_id'"
-        )
-    if "competition_id" in link_spec:
-        return link_spec["competition_id"]
-    return link_spec["challenge_id"]
+def _manifest_challenge_entry(link: dict) -> dict:
+    """A module's attached challenge as the manifest names it: by slug, which
+    is the same on every deployment, or by `challenge_id` for a challenge
+    that has no slug."""
+    challenge = link["challenge"]
+    key = ({"slug": challenge["slug"]} if challenge["slug"] is not None
+           else {"challenge_id": challenge["id"]})
+    return {**key, "label": link["label"],
+            "pass_threshold": link["pass_threshold"]}
+
+
+_COVER_EXTENSIONS = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+}
+
+# What a lesson body links to: the server's rule, `relative_link_targets` and
+# `asset_relpath` in `backend/app/services/course_manifest.py`. A course
+# bundle holds exactly these files, so the export downloads exactly these.
+
+# Text that renders as written, where a `[a](b)` is not a link.
+_LINK_FREE_RES = (
+    re.compile(r"(?ms)^[ \t]*(?P<fence>`{3,}|~{3,}).*?^[ \t]*(?P=fence)[ \t]*$"),
+    re.compile(r"(?s)<!--.*?-->"),
+    re.compile(r"(`+)[^`\n](?:[^\n]*?[^`\n])??\1(?!`)"),
+    re.compile(r"(?s)\$\$.+?\$\$"),
+    re.compile(r"(?<![\\$])\$(?!\s)[^$\n]+?(?<![\s\\])\$(?!\d)"),
+)
+# `[text](target "title")`, `![alt](target)` and `[label]: target`.
+_MD_LINK_RES = (
+    re.compile(
+        r"\[(?:[^\[\]]|\[[^\[\]]*\])*\]\(\s*(?P<target><[^<>\n]*>|[^()\s]+)"
+        r"(?:\s+(?:\"[^\"]*\"|'[^']*'|\([^()]*\)))?\s*\)"
+    ),
+    re.compile(r"(?m)^ {0,3}\[(?!\^)[^\]\n]+\]:[ \t]*(?P<target><[^<>\n]*>|\S+)"),
+)
+_HTML_LINK_RES = (
+    re.compile(r"(?is)<(?:img|video|audio|source)\b[^>]*?\ssrc\s*=\s*"
+               r"(?:\"(?P<dq>[^\"]*)\"|'(?P<sq>[^']*)')"),
+    re.compile(r"(?is)<a\b[^>]*?\shref\s*=\s*(?:\"(?P<dq>[^\"]*)\"|'(?P<sq>[^']*)')"),
+)
+_URL_SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
+
+
+def _relative_asset_links(body_md: str) -> list[str]:
+    """The module asset paths a lesson body links to, sorted.
+
+    A relative link (`![](media/fig.png)`, `[data](data.csv)`, an HTML `src`
+    / `href`) resolves against the module's asset base, so it names a module
+    asset. Not assets: anything with a scheme, `/`-absolute targets, `#`
+    anchors, whatever sits in code, a comment or math, and a target that
+    climbs out of the store (`../x`).
+    """
+    text = body_md
+    for pattern in _LINK_FREE_RES:
+        text = pattern.sub(" ", text)
+    targets = []
+    for pattern in _MD_LINK_RES:
+        for match in pattern.finditer(text):
+            target = match.group("target")
+            if target.startswith("<") and target.endswith(">"):
+                target = target[1:-1]
+            targets.append(target)
+    for pattern in _HTML_LINK_RES:
+        for match in pattern.finditer(text):
+            target = match.group("dq") if match.group("dq") is not None else match.group("sq")
+            targets.append(target.strip())
+
+    found: set[str] = set()
+    for target in targets:
+        if not target or target.startswith(("#", "/")) or _URL_SCHEME_RE.match(target):
+            continue
+        asset_path = unquote(re.split(r"[?#]", target, maxsplit=1)[0])
+        while asset_path.startswith("./"):
+            asset_path = asset_path[2:]
+        parts = asset_path.split("/")
+        if not asset_path or "\\" in asset_path or any(
+                part in ("", ".", "..") for part in parts):
+            continue
+        found.add(asset_path)
+    return sorted(found)
 
 
 def _dump_course_manifest(base: str, manifest: dict) -> None:
-    """Write a manifest as ``course.yaml`` (PyYAML if available) else ``course.json``."""
-    try:
-        import yaml
-        with open(os.path.join(base, "course.yaml"), "w", encoding="utf-8") as fh:
-            yaml.safe_dump(manifest, fh, sort_keys=False, allow_unicode=True)
-    except ImportError:
-        import json
-        with open(os.path.join(base, "course.json"), "w", encoding="utf-8") as fh:
-            json.dump(manifest, fh, indent=2, ensure_ascii=False)
+    """Write a manifest as ``course.yaml``."""
+    with open(os.path.join(base, "course.yaml"), "w", encoding="utf-8") as fh:
+        yaml.safe_dump(manifest, fh, sort_keys=False, allow_unicode=True)
 
 
 def _default_submission_name(agent, files) -> str:

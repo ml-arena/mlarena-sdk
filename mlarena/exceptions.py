@@ -52,6 +52,18 @@ class SubmissionError(MLArenaError):
     pass
 
 
+class WaitTimeoutError(SubmissionError):
+    """Raised when a wait on a submission (`tail_logs(timeout_sec=)`,
+    `submit(wait=True, timeout_sec=)`) runs out before the deploy settled.
+
+    The submission is still running: `body` is its last status payload
+    (`submission()`), so `err.body["id"]` and `err.body["status"]` say what
+    to poll. A subclass of `SubmissionError`, which is what the timeout used
+    to raise.
+    """
+    pass
+
+
 class NotFoundError(MLArenaError):
     """Base for "the thing you asked for is not there" (HTTP 404).
 

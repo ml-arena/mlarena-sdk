@@ -386,17 +386,18 @@ def test_update_settings_removed_score_kwargs_raise_naming_metrics():
         raise AssertionError("update_settings dropped metric_order= silently")
 
 
-def test_update_settings_sends_the_elo_tunables():
-    """The ELO tunables are Evaluation columns, sent under their own names."""
+def test_update_settings_has_no_elo_keyword():
+    """The Elo parameters are platform constants (SDK 4.12.0): the keywords
+    are gone, and passing one sends nothing."""
     c, rec = make_client(lambda *_: (200, {"configuration": {}, "evaluation": {}}))
-    tunables = {
-        "elo_k_factor": 16, "elo_d0": 400.0, "elo_alpha": 0.0, "elo_beta": 5.0,
-        "elo_momentum": 0.5, "elo_initial_variance": 10000.0,
-        "elo_initial_score": 1000.0,
-    }
-    c.update_settings(7, metrics=RATED_METRICS, **tunables)
-    _expect(rec.last["json"] == {"metrics": RATED_METRICS, **tunables},
-            rec.last["json"])
+    for name in ("elo_k_factor", "elo_d0", "elo_alpha", "elo_beta", "elo_momentum",
+                 "elo_initial_variance", "elo_initial_score"):
+        try:
+            c.update_settings(7, metrics=RATED_METRICS, **{name: 16})
+        except TypeError:
+            _expect(rec.calls == [], "no request was sent")
+        else:
+            raise AssertionError(f"update_settings accepted {name}=")
 
 
 def test_create_challenge_docstring_names_only_real_kinds():

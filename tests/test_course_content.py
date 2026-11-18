@@ -8,9 +8,13 @@ params) mapping that the parity rule requires.
 
 Runs under pytest *or* directly: ``python tests/test_course_content.py``.
 """
+import io
+import json
 import os
 import sys
 import tempfile
+import warnings
+import zipfile
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -25,13 +29,19 @@ from mlarena.exceptions import AuthenticationError, MLArenaError
 
 
 class FakeResponse:
-    def __init__(self, status_code=200, json_data=None, text=""):
+    def __init__(self, status_code=200, json_data=None, text="", content=b"",
+                 headers=None):
         self.status_code = status_code
         self._json = {} if json_data is None else json_data
         self.text = text
+        self.content = content
+        self.headers = headers or {}
 
     def json(self):
         return self._json
+
+    def iter_content(self, chunk_size=1):
+        yield self.content
 
     def raise_for_status(self):
         if self.status_code >= 400:
@@ -207,17 +217,81 @@ def test_preview_lesson_strict():
     _expect(rec.last["json"] == {}, rec.last["json"])
 
 
-def test_upload_lesson_media_multipart():
-    c, rec = make_client(lambda *_: (201, {"filename": "a.png", "url": "/x"}))
+def test_update_module_and_lesson_accept_a_slug():
+    c, rec = make_client(lambda *_: (200, {"id": 2}))
+    c.update_module(2, slug="week-1")
+    _expect(rec.last["json"] == {"slug": "week-1"}, rec.last["json"])
+    c.update_lesson(5, slug="intro")
+    _expect(rec.last["path"] == "/teacher/lessons/5", rec.last["path"])
+    _expect(rec.last["json"] == {"slug": "intro"}, rec.last["json"])
+
+
+def test_detach_module():
+    c, rec = make_client(lambda *_: (200, {"id": 2, "content_origin": "editor"}))
+    out = c.detach_module(2)
+    _expect(rec.last["method"] == "POST", rec.last["method"])
+    _expect(rec.last["path"] == "/teacher/modules/2/detach", rec.last["path"])
+    _expect(out["content_origin"] == "editor", out)
+
+
+def test_upload_module_asset_multipart():
+    c, rec = make_client(lambda *_: (201, {"path": "media/a.png", "url": "/x"}))
     with tempfile.TemporaryDirectory() as d:
         p = os.path.join(d, "a.png")
         with open(p, "wb") as fh:
             fh.write(b"\x89PNG")
-        out = c.upload_lesson_media(5, p)
-    _expect(rec.last["method"] == "POST", rec.last["method"])
-    _expect(rec.last["path"] == "/teacher/lessons/5/media", rec.last["path"])
-    _expect("files" in rec.last, "multipart files missing")
-    _expect(out["url"] == "/x", out)
+        out = c.upload_module_asset(5, p)
+        _expect(rec.last["method"] == "POST", rec.last["method"])
+        _expect(rec.last["path"] == "/teacher/modules/5/assets", rec.last["path"])
+        _expect(rec.last["files"]["file"][0] == "a.png", rec.last["files"])
+        # No `path`: the server stores it as media/<name>.
+        _expect(rec.last["data"] is None, rec.last["data"])
+        _expect(out["path"] == "media/a.png", out)
+
+        c.upload_module_asset(5, p, path="data/week1/a.png")
+        _expect(rec.last["data"] == {"path": "data/week1/a.png"}, rec.last["data"])
+
+
+def test_list_and_delete_module_assets():
+    c, rec = make_client(lambda method, *_: (
+        (200, [{"path": "media/a.png", "url": "/x", "size_bytes": 4}])
+        if method == "GET" else (200, {"message": "Asset deleted"})))
+    out = c.list_module_assets(5)
+    _expect(rec.last["path"] == "/teacher/modules/5/assets", rec.last["path"])
+    _expect(out[0]["size_bytes"] == 4, out)
+
+    c.delete_module_asset(5, "data/week 1/a.png")
+    _expect(rec.last["method"] == "DELETE", rec.last["method"])
+    _expect(rec.last["path"] == "/teacher/modules/5/assets/data/week%201/a.png",
+            rec.last["path"])
+
+
+def test_download_module_asset_keeps_the_relative_path():
+    c, rec = make_client(lambda *_: FakeResponse(200, content=b"x,y\n"))
+    with tempfile.TemporaryDirectory() as d:
+        out = c.download_module_asset(5, "data/week1/a.csv", d)
+        _expect(out == os.path.join(d, "data", "week1", "a.csv"), out)
+        with open(out, "rb") as fh:
+            _expect(fh.read() == b"x,y\n", "wrong content")
+        _expect(rec.last["path"]
+                == "/academic_courses/assets/modules/5/data/week1/a.csv",
+                rec.last["path"])
+        # A path that leaves the destination is refused before any request.
+        n_calls = len(rec.calls)
+        for bad in ("../a.csv", "/etc/passwd", "data//a.csv"):
+            try:
+                c.download_module_asset(5, bad, d)
+                raise AssertionError(f"expected MLArenaError for {bad}")
+            except MLArenaError:
+                pass
+        _expect(len(rec.calls) == n_calls, "a refused path made a request")
+
+
+def test_lesson_media_write_methods_are_gone():
+    # The lesson-scoped media routes were replaced by the module asset store.
+    c, _ = make_client()
+    for name in ("upload_lesson_media", "list_lesson_media", "delete_lesson_media"):
+        _expect(not hasattr(c, name), name)
 
 
 # --------------------------------------------------------------------------- #
@@ -353,180 +427,354 @@ def test_enroll_uses_join_code():
 # --------------------------------------------------------------------------- #
 
 
-def _author_router(method, path, kwargs):
-    if method == "POST" and path == "/academic_courses/":
-        return (201, {"id": 100, "slug": "intro-to-rl", "join_code": "JOINME"})
-    if method == "POST" and path == "/teacher/modules":
-        return (201, {"id": 200})
-    if method == "POST" and path.endswith("/lessons"):
-        return (201, {"id": 300})
-    if method == "PUT" and path.startswith("/teacher/lessons/"):
-        return (200, {"id": 300, "is_published": True})
-    if method == "POST" and path.endswith("/challenges"):
-        return (201, {"id": 1})
-    if method == "POST" and path.endswith("/modules"):  # link_module
-        return (201, {"id": 1})
-    if method == "PUT" and path.endswith("/modules/reorder"):
-        return (200, [])
-    return (200, {"ok": True})
+_PLAN = {
+    "dry_run": False,
+    "course": {"id": 100, "slug": "intro-to-rl", "action": "created"},
+    "modules": [{
+        "slug": "foundations", "id": 200, "action": "created",
+        "renamed_from": None,
+        "lessons": [{"slug": "what-is-rl", "id": 300, "action": "created",
+                     "renamed_from": None}],
+        "orphaned_lessons": [], "pruned_lessons": [],
+        "assets": {"written": 1, "removed": 0},
+    }],
+    "unmanaged_modules": [],
+    "source_revision": None,
+    "url": "/courses/intro-to-rl",
+}
 
 
 def _write_manifest(d, manifest):
-    import json
     with open(os.path.join(d, "course.json"), "w") as fh:
         json.dump(manifest, fh)
 
 
-def _one_module_manifest(module_links):
-    return {
-        "course": {"name": "Intro", "start_date": "2026-01-01",
-                   "end_date": "2026-06-01"},
-        "modules": [{"title": "Foundations", **module_links}],
+def _write_course_dir(d, slug="intro-to-rl"):
+    """A course directory in the bundle layout: manifest, a lesson body and the
+    image it links (paths relative to the root)."""
+    os.makedirs(os.path.join(d, "foundations"))
+    os.makedirs(os.path.join(d, "media"))
+    with open(os.path.join(d, "foundations", "what-is-rl.md"), "w") as fh:
+        fh.write("# What is RL\n![loop](media/loop.png)\n")
+    with open(os.path.join(d, "media", "loop.png"), "wb") as fh:
+        fh.write(b"\x89PNG")
+    course = {"name": "Intro to RL"}
+    if slug is not None:
+        course["slug"] = slug
+    _write_manifest(d, {
+        "course": course,
+        "modules": [{
+            "title": "Foundations", "slug": "foundations",
+            "challenges": [{"slug": "cartpole-v1", "label": "CartPole"}],
+            "lessons": [{"title": "What is RL?", "slug": "what-is-rl",
+                         "file": "foundations/what-is-rl.md",
+                         "is_published": True}],
+        }],
+    })
+
+
+def _archive_names(call):
+    filename, payload = call["files"]["archive"]
+    with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+        return filename, archive.namelist()
+
+
+def test_push_course_uploads_the_directory_as_one_bundle():
+    c, rec = make_client(lambda *_: (200, _PLAN))
+    with tempfile.TemporaryDirectory() as d:
+        _write_course_dir(d)
+        out = c.push_course(d)
+
+    _expect(out == _PLAN, out)
+    # One request: the server applies the bundle, the client composes nothing.
+    _expect(len(rec.calls) == 1, [call["path"] for call in rec.calls])
+    call = rec.last
+    _expect(call["method"] == "PUT", call["method"])
+    # The slug of the route is the manifest's course.slug.
+    _expect(call["path"] == "/teacher/courses/intro-to-rl/bundle", call["path"])
+    _expect(call["params"] is None, call["params"])
+    filename, names = _archive_names(call)
+    _expect(filename == "bundle.zip", filename)
+    # Rooted at the directory, manifest + body + linked file.
+    _expect(names == ["course.json", "foundations/what-is-rl.md", "media/loop.png"],
+            names)
+
+
+def test_push_course_flags_and_explicit_slug():
+    c, rec = make_client(lambda *_: (200, {**_PLAN, "dry_run": True}))
+    with tempfile.TemporaryDirectory() as d:
+        _write_course_dir(d, slug=None)
+        # Without course.slug in the manifest there is no course to push to.
+        try:
+            c.push_course(d)
+            raise AssertionError("expected MLArenaError without a slug")
+        except MLArenaError as err:
+            _expect("course.slug" in str(err), str(err))
+        _expect(rec.calls == [], "a request was made without a slug")
+
+        c.push_course(d, slug="other", dry_run=True, prune=True)
+    _expect(rec.last["path"] == "/teacher/courses/other/bundle", rec.last["path"])
+    _expect(rec.last["params"] == {"dry_run": "true", "prune": "true"},
+            rec.last["params"])
+
+
+def test_push_course_sends_an_existing_archive_as_it_is():
+    c, rec = make_client(lambda *_: (200, _PLAN))
+    with tempfile.TemporaryDirectory() as d:
+        archive = os.path.join(d, "course.tar.gz")
+        with open(archive, "wb") as fh:
+            fh.write(b"not-inspected")
+        # The manifest is inside the archive: the slug must be given.
+        try:
+            c.push_course(archive)
+            raise AssertionError("expected MLArenaError: archive without slug")
+        except MLArenaError:
+            pass
+        c.push_course(archive, slug="intro-to-rl")
+    _expect(rec.last["files"]["archive"] == ("course.tar.gz", b"not-inspected"),
+            rec.last["files"])
+
+
+def test_push_course_refusal_carries_the_server_message():
+    c, rec = make_client(lambda *_: (400, {
+        "error": "module 'foundations': lesson 'x': 'foundations/x.md' is not in the bundle."}))
+    with tempfile.TemporaryDirectory() as d:
+        _write_course_dir(d)
+        try:
+            c.push_course(d)
+            raise AssertionError("expected MLArenaError on a refused bundle")
+        except MLArenaError as err:
+            _expect("is not in the bundle" in str(err), str(err))
+            _expect(err.status_code == 400, err.status_code)
+
+
+def test_import_course_from_github_body():
+    c, rec = make_client(lambda *_: (200, _PLAN))
+    c.import_course_from_github("intro-to-rl", "prof/rl-course")
+    _expect(rec.last["method"] == "POST", rec.last["method"])
+    _expect(rec.last["path"] == "/teacher/courses/intro-to-rl/import-github",
+            rec.last["path"])
+    _expect(rec.last["json"] == {"repository": "prof/rl-course", "ref": None,
+                                 "path": None, "dry_run": False, "prune": False},
+            rec.last["json"])
+
+    c.import_course_from_github("intro-to-rl", "prof/rl-course", ref="v2",
+                                path="courses/rl", dry_run=True, prune=True)
+    _expect(rec.last["json"] == {"repository": "prof/rl-course", "ref": "v2",
+                                 "path": "courses/rl", "dry_run": True,
+                                 "prune": True}, rec.last["json"])
+
+
+def test_author_course_from_dir_is_a_deprecated_alias_of_push_course():
+    """It used to compose create calls and duplicated the course on a second
+    run. It now uploads the same bundle `push_course` does: one idempotent
+    request, the server's plan as the result."""
+    c, rec = make_client(lambda *_: (200, _PLAN))
+    with tempfile.TemporaryDirectory() as d:
+        _write_course_dir(d)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            first = c.author_course_from_dir(d)
+            second = c.author_course_from_dir(d)
+    _expect(any(issubclass(w.category, DeprecationWarning)
+                and "push_course" in str(w.message) for w in caught), caught)
+    _expect(first == _PLAN and second == _PLAN, (first, second))
+    # Two runs, two identical bundle uploads, and no create route at all.
+    _expect([(call["method"], call["path"]) for call in rec.calls]
+            == [("PUT", "/teacher/courses/intro-to-rl/bundle")] * 2,
+            [(call["method"], call["path"]) for call in rec.calls])
+    _expect(rec.calls[0]["files"]["archive"][1] == rec.calls[1]["files"]["archive"][1],
+            "the same directory gave two different bundles")
+
+
+def test_author_course_from_dir_ships_legacy_manifest_keys_unchanged():
+    # course.yaml files written before SDK 2.0 say competitions: /
+    # competition_id:. The server reads those aliases; the client sends the
+    # manifest as it is on disk.
+    c, rec = make_client(lambda *_: (200, _PLAN))
+    manifest = {
+        "course": {"name": "Intro", "slug": "intro"},
+        "modules": [{"title": "Foundations", "slug": "foundations",
+                     "competitions": [{"competition_id": 42}]}],
     }
-
-
-def test_author_course_from_dir():
-    c, rec = make_client(_author_router)
     with tempfile.TemporaryDirectory() as d:
-        os.makedirs(os.path.join(d, "foundations"))
-        with open(os.path.join(d, "foundations", "what-is-rl.md"), "w") as fh:
-            fh.write("# What is RL\nbody")
-        manifest = {
-            "course": {
-                "name": "Intro to RL", "code": "RL101",
-                "start_date": "2026-01-01", "end_date": "2026-06-01",
-                "visibility": "public",
-            },
-            "modules": [
-                {
-                    "title": "Foundations", "visibility": "public",
-                    "challenges": [{"challenge_id": 42, "label": "CartPole"}],
-                    "lessons": [
-                        {"title": "What is RL?", "file": "foundations/what-is-rl.md",
-                         "is_published": True, "estimated_minutes": 10},
-                    ],
-                },
-                {"title": "Reuse", "module_id": 555},  # link an existing module
-            ],
-        }
-        import json
-        with open(os.path.join(d, "course.json"), "w") as fh:
-            json.dump(manifest, fh)
-
-        out = c.author_course_from_dir(d)
-
-    _expect(out["course_id"] == 100, out)
-    _expect(out["join_code"] == "JOINME", out)
-    _expect(len(out["modules"]) == 2, out["modules"])
-    _expect(out["modules"][0]["created"] is True, out["modules"][0])
-    _expect(out["modules"][1]["created"] is False, out["modules"][1])
-
-    paths = [(call["method"], call["path"]) for call in rec.calls]
-    _expect(("POST", "/academic_courses/") in paths, paths)
-    _expect(("POST", "/teacher/modules") in paths, paths)
-    _expect(("POST", "/teacher/modules/200/lessons") in paths, paths)
-    _expect(("PUT", "/teacher/lessons/300") in paths, paths)
-    _expect(("POST", "/teacher/modules/200/challenges") in paths, paths)
-    attach = next(c for c in rec.calls if c["path"] == "/teacher/modules/200/challenges")
-    _expect(attach["json"] == {"challenge_id": 42, "label": "CartPole"}, attach["json"])
-    _expect(("POST", "/teacher/course/100/modules") in paths, paths)
-    _expect(("PUT", "/teacher/course/100/modules/reorder") in paths, paths)
-
-    # The lesson body was read from disk and posted.
-    lesson_call = next(c for c in rec.calls if c["path"] == "/teacher/modules/200/lessons")
-    _expect("body" in lesson_call["json"]["body_md"], lesson_call["json"])
-
-    # The existing module (555) was linked, never re-created.
-    link_calls = [c["json"]["module_id"] for c in rec.calls
-                  if c["path"] == "/teacher/course/100/modules"]
-    _expect(link_calls == [200, 555], link_calls)
+        _write_manifest(d, manifest)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            c.author_course_from_dir(d)
+    _, payload = rec.last["files"]["archive"]
+    with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+        _expect(json.loads(archive.read("course.json")) == manifest,
+                "the manifest was rewritten")
 
 
-def test_author_course_from_dir_reads_legacy_manifest_keys():
-    # course.yaml files written before SDK 2.0 say competitions: / competition_id:.
-    c, rec = make_client(_author_router)
-    with tempfile.TemporaryDirectory() as d:
-        _write_manifest(d, _one_module_manifest({
-            "competitions": [{"competition_id": 42, "label": "CartPole",
-                              "pass_threshold": 195.0}],
-        }))
-        c.author_course_from_dir(d)
-    attach = [call for call in rec.calls
-              if call["path"] == "/teacher/modules/200/challenges"]
-    _expect(len(attach) == 1, [call["path"] for call in rec.calls])
-    _expect(attach[0]["json"] == {"challenge_id": 42, "label": "CartPole",
-                                  "pass_threshold": 195.0}, attach[0]["json"])
-
-
-def test_author_course_from_dir_rejects_both_spellings():
-    for links in (
-        {"challenges": [{"challenge_id": 1}], "competitions": [{"competition_id": 1}]},
-        {"challenges": [{"challenge_id": 1, "competition_id": 1}]},
-    ):
-        c, rec = make_client(_author_router)
-        with tempfile.TemporaryDirectory() as d:
-            _write_manifest(d, _one_module_manifest(links))
-            try:
-                c.author_course_from_dir(d)
-                raise AssertionError(f"expected MLArenaError for {links}")
-            except MLArenaError:
-                pass
-        # Validated before the first request: nothing was created.
-        _expect(rec.calls == [], [call["path"] for call in rec.calls])
+_PNG = b"\x89PNG\r\n"
 
 
 def _export_router(method, path, kwargs):
     if path == "/academic_courses/intro":
         return (200, {
-            "name": "Intro to RL", "code": "RL101", "slug": "intro",
+            "id": 9, "name": "Intro to RL", "code": "RL101", "slug": "intro",
             "description": "d", "visibility": "public",
             "instructor_name": "Prof", "start_date": "2026-01-01",
-            "end_date": "2026-06-01",
+            "end_date": "2026-06-01", "has_cover": True, "can_manage": True,
             "modules": [{
                 "id": 1, "title": "Foundations", "slug": "foundations",
                 "summary": "s", "icon": "book", "layout": "advanced",
-                "challenges": [{
-                    "challenge": {"id": 42, "name": "CartPole-v1"},
-                    "label": "CartPole", "pass_threshold": None,
-                    "metric": {
-                        "key": "reward", "label": "Reward", "source": "score",
-                        "agg": "mean", "order": "desc", "format": "number",
-                        "unit": None, "precision": 2, "is_ranking": True,
-                        "visible": True,
-                    },
-                }],
-                "lessons": [{"title": "What is RL?", "slug": "what-is-rl",
-                             "kind": "lesson", "gated": False,
-                             "is_published": True, "estimated_minutes": 10}],
+                "position": 0, "is_published": True,
+                "challenges": [
+                    {"challenge": {"id": 42, "name": "CartPole-v1",
+                                   "slug": "cartpole-v1"},
+                     "label": "CartPole", "pass_threshold": 195.0, "metric": None},
+                    {"challenge": {"id": 43, "name": "Old", "slug": None},
+                     "label": None, "pass_threshold": None, "metric": None},
+                ],
+                "lessons": [
+                    {"id": 10, "parent_lesson_id": None, "title": "What is RL?",
+                     "slug": "what-is-rl", "kind": "lesson", "gated": False,
+                     "is_published": True, "estimated_minutes": 10},
+                    {"id": 11, "parent_lesson_id": 10, "title": "Lab",
+                     "slug": "lab", "kind": "exercise", "gated": True,
+                     "is_published": False, "estimated_minutes": None},
+                ],
             }],
         })
     if path.endswith("/lessons/what-is-rl"):
-        return (200, {"body_md": "# What is RL\nexported body"})
-    return (200, {"ok": True})
+        return (200, {
+            "body_md": ("# What is RL\nexported body\n"
+                        "![loop](media/loop.png) [site](https://example.org/x.png)\n"
+                        "```\n![not a link](media/in-code.png)\n```\n"
+                        "[gone](media/gone.csv) [up](../secret.txt)\n"),
+            "asset_base_url": "/api/academic_courses/assets/modules/1/",
+        })
+    if path.endswith("/lessons/lab"):
+        return (200, {
+            "body_md": "[data](./data/week1.csv?raw=1#top)",
+            "asset_base_url": "/api/academic_courses/assets/modules/1/",
+        })
+    if path == "/teacher/modules/1":
+        return (200, {"id": 1, "visibility": "unlisted"})
+    if path == "/academic_courses/assets/modules/1/media/loop.png":
+        return FakeResponse(200, content=_PNG)
+    if path == "/academic_courses/assets/modules/1/data/week1.csv":
+        return FakeResponse(200, content=b"x,y\n")
+    if path == "/academic_courses/assets/modules/1/media/gone.csv":
+        return (404, {"error": "File not found"})
+    if path == "/academic_courses/assets/courses/9/cover":
+        return FakeResponse(200, content=_PNG,
+                            headers={"Content-Type": "image/png"})
+    raise AssertionError(f"unexpected request {method} {path}")
 
 
 def test_export_course_to_dir():
     c, rec = make_client(_export_router)
     with tempfile.TemporaryDirectory() as d:
-        manifest = c.export_course_to_dir("intro", d)
-        body_path = os.path.join(d, "foundations", "what-is-rl.md")
-        _expect(os.path.isfile(body_path), "lesson body not written")
-        with open(body_path) as fh:
-            _expect("exported body" in fh.read(), "wrong body content")
-        manifest_files = [os.path.join(d, n) for n in ("course.yaml", "course.json")
-                          if os.path.isfile(os.path.join(d, n))]
-        _expect(manifest_files, "manifest not written")
-        with open(manifest_files[0]) as fh:
-            written = fh.read()
-        _expect("challenge_id" in written and "competition" not in written, written)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            manifest = c.export_course_to_dir("intro", d)
 
-    _expect(manifest["course"]["name"] == "Intro to RL", manifest)
-    _expect(manifest["modules"][0]["lessons"][0]["file"]
-            == os.path.join("foundations", "what-is-rl.md"), manifest)
-    _expect(manifest["modules"][0]["challenges"]
-            == [{"challenge_id": 42, "label": "CartPole", "pass_threshold": None}],
-            manifest["modules"][0])
-    _expect("competitions" not in manifest["modules"][0], manifest["modules"][0])
+        def read(*parts):
+            with open(os.path.join(d, *parts), "rb") as fh:
+                return fh.read()
+
+        _expect(b"exported body" in read("foundations", "what-is-rl.md"),
+                "wrong body content")
+        # Linked files land where the body's relative link points, from the root.
+        _expect(read("media", "loop.png") == _PNG, "image not exported")
+        _expect(read("data", "week1.csv") == b"x,y\n", "data file not exported")
+        _expect(read("cover.png") == _PNG, "cover not exported")
+        _expect(not os.path.exists(os.path.join(d, "media", "in-code.png")),
+                "a link inside a code fence was followed")
+        manifest_files = [n for n in ("course.yaml", "course.json")
+                          if os.path.isfile(os.path.join(d, n))]
+        _expect(len(manifest_files) == 1, manifest_files)
+
+    # A linked file the module does not hold is reported, not fatal.
+    _expect(any("media/gone.csv" in str(w.message) for w in caught), caught)
+    paths = [call["path"] for call in rec.calls]
+    _expect(not any("secret" in p or "example.org" in p or "in-code" in p
+                    for p in paths), paths)
+
+    _expect(manifest["course"] == {
+        "name": "Intro to RL", "slug": "intro", "code": "RL101",
+        "description": "d", "visibility": "public", "instructor_name": "Prof",
+        "start_date": "2026-01-01", "end_date": "2026-06-01",
+        "cover": "cover.png",
+    }, manifest["course"])
+    module = manifest["modules"][0]
+    _expect(module["visibility"] == "unlisted", module)
+    # By slug when the challenge has one: the same on every deployment.
+    _expect(module["challenges"] == [
+        {"slug": "cartpole-v1", "label": "CartPole", "pass_threshold": 195.0},
+        {"challenge_id": 43, "label": None, "pass_threshold": None},
+    ], module["challenges"])
+    _expect(module["lessons"] == [{
+        "title": "What is RL?", "slug": "what-is-rl", "kind": "lesson",
+        "file": "foundations/what-is-rl.md", "gated": False,
+        "is_published": True, "estimated_minutes": 10,
+        "children": [{
+            "title": "Lab", "slug": "lab", "kind": "exercise",
+            "file": "foundations/lab.md", "gated": True,
+            "is_published": False, "estimated_minutes": None,
+        }],
+    }], module["lessons"])
+
+
+def test_export_then_push_round_trips():
+    """What export writes is a bundle `push_course` accepts as it is: the
+    manifest's slug names the route and every file the bodies link is in the
+    archive under the path they link."""
+    c, rec = make_client(_export_router)
+    with tempfile.TemporaryDirectory() as d:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            c.export_course_to_dir("intro", d)
+        # course.yaml with PyYAML installed, course.json without.
+        manifest_name = next(n for n in ("course.yaml", "course.json")
+                             if os.path.isfile(os.path.join(d, n)))
+        c._request = Recorder(lambda *_: (200, _PLAN))
+        c.push_course(d)
+        call = c._request.last
+    _expect(call["path"] == "/teacher/courses/intro/bundle", call["path"])
+    _, names = _archive_names(call)
+    _expect(names == sorted([manifest_name, "cover.png", "data/week1.csv",
+                             "foundations/lab.md", "foundations/what-is-rl.md",
+                             "media/loop.png"]), names)
+
+
+def test_export_refuses_two_modules_with_one_asset_path():
+    def router(method, path, kwargs):
+        if path == "/academic_courses/intro":
+            lesson = {"id": 1, "parent_lesson_id": None, "title": "L", "slug": "l",
+                      "kind": "lesson", "gated": False, "is_published": True,
+                      "estimated_minutes": None}
+            module = {"title": "M", "summary": None, "icon": None,
+                      "is_published": True, "challenges": [], "lessons": [lesson]}
+            return (200, {
+                "id": 9, "name": "Intro", "code": None, "slug": "intro",
+                "description": None, "visibility": "public",
+                "instructor_name": None, "start_date": None, "end_date": None,
+                "has_cover": False, "can_manage": False,
+                "modules": [{**module, "id": 1, "slug": "a"},
+                            {**module, "id": 2, "slug": "b"}],
+            })
+        for module_id, slug in ((1, "a"), (2, "b")):
+            if path == f"/academic_courses/intro/modules/{slug}/lessons/l":
+                return (200, {
+                    "body_md": "![f](media/fig.png)",
+                    "asset_base_url": f"/api/academic_courses/assets/modules/{module_id}/",
+                })
+            if path == f"/academic_courses/assets/modules/{module_id}/media/fig.png":
+                return FakeResponse(200, content=slug.encode())
+        raise AssertionError(f"unexpected request {method} {path}")
+
+    c, rec = make_client(router)
+    with tempfile.TemporaryDirectory() as d:
+        try:
+            c.export_course_to_dir("intro", d)
+            raise AssertionError("expected MLArenaError on the asset conflict")
+        except MLArenaError as err:
+            _expect("media/fig.png" in str(err), str(err))
 
 
 # --------------------------------------------------------------------------- #

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mlarena-sdk"
-version = "4.11.0"
+version = "4.12.0"
 description = "Python SDK for ML Arena - make submissions, manage challenges, courses, and view leaderboards"
 readme = "README.md"
 license = "MIT"
@@ -28,6 +28,8 @@ classifiers = [
 ]
 dependencies = [
     "requests>=2.32.0",
+    # course.yaml: push_course reads course.slug, export_course_to_dir writes it.
+    "pyyaml>=6.0",
     # mlarena.local reads challenge.toml; tomllib is stdlib from 3.11.
     "tomli>=2.0; python_version < '3.11'",
 ]
@@ -37,6 +39,9 @@ pandas = ["pandas>=1.0.0"]
 # mlarena.local.record_render: replay.mp4 from start_render_video (the
 # platform's H.264 profile) through imageio-ffmpeg's bundled ffmpeg.
 video = ["imageio-ffmpeg>=0.6,<0.7", "pillow>=10.2.0"]
+
+[project.scripts]
+mlarena = "mlarena.cli:main"
 
 [project.urls]
 Homepage = "https://ml-arena.com"

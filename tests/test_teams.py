@@ -63,7 +63,6 @@ TEAM = {
     "id": 3,
     "challenge_id": 4,
     "name": "Team A",
-    "looking_for_members": False,
     "created_at_ts": "2026-09-01T10:00:00Z",
     "members": [
         {"id": 9, "user_id": 2, "username": "leader", "avatar_key": None,
@@ -125,18 +124,12 @@ def test_create_team_route_and_body():
     assert rec.last["json"] == {"name": "Team A"}
 
 
-def test_update_team_sends_both_keys():
+def test_update_team_route_and_body():
     c, rec = make_client(lambda *_: (200, TEAM))
-    c.update_team(3, "Team B", True)
+    c.update_team(3, "Team B")
     assert rec.last["method"] == "PUT"
     assert rec.last["path"] == "/teams/3"
-    assert rec.last["json"] == {"name": "Team B", "looking_for_members": True}
-
-
-def test_update_team_can_clear_looking_for_members():
-    c, rec = make_client(lambda *_: (200, TEAM))
-    c.update_team(3, "Team B", None)
-    assert rec.last["json"] == {"name": "Team B", "looking_for_members": None}
+    assert rec.last["json"] == {"name": "Team B"}
 
 
 def test_delete_team_route():
@@ -228,7 +221,7 @@ def _every_team_call(c):
     return [
         lambda: c.challenge_team(4),
         lambda: c.create_team(4, "T"),
-        lambda: c.update_team(3, "T", False),
+        lambda: c.update_team(3, "T"),
         lambda: c.delete_team(3),
         lambda: c.leave_team(3),
         lambda: c.remove_team_member(3, 9),
@@ -274,7 +267,7 @@ def test_a_team_403_is_a_permission_denied_error():
 ME = {
     "is_authenticated": True, "id": 2, "username": "alice",
     "email": "alice@example.com", "avatar_key": None,
-    "is_admin": False, "is_teacher": False, "is_creator": True,
+    "is_admin": False,
     "is_human_verified": True, "has_teacher_access": False,
     "has_creator_access": True, "can_create_course": True,
 }
