@@ -2966,7 +2966,8 @@ class MLArenaClient:
         run, unscored runs last (the console's "Best"); it is one page of
         `limit` rows, takes no `before_simulation_result_id`, and a
         multi-agent challenge answers 400. `mine=True` keeps the runs one of
-        your (or your team's) submissions played in. Pass a row to
+        your (or your team's) submissions played in. The route is open to
+        anyone who can see the challenge. Pass a row to
         `download_replay` to save its file.
         """
         params: dict = {"limit": limit}
@@ -3048,6 +3049,29 @@ class MLArenaClient:
                     fh.write(chunk)
         os.replace(tmp_path, out_path)
         return out_path
+
+    def latest_replays(self, limit: int = 1) -> dict:
+        """The newest replays across the public challenges, newest first.
+
+        Mirrors `GET /api/challenges/replays` — the landing page's "Latest
+        replay". Returns `{"replays": [...]}`, each row `{"challenge_id",
+        "challenge_name", "run", "challenge_context"}`: `run` is a public
+        `ReplayRun` (the row shape of `replays()`, so `download_replay(row[
+        "run"])` saves its file) and `challenge_context` its challenge's
+        `RunsContext`. The runs are the ones each challenge's `replays()`
+        lists, taken over the public challenges only, whoever calls: a
+        private challenge you can see is not in it. `limit` is 1..12.
+        """
+        resp = self._request("GET",
+            self._url("/challenges/replays"),
+            headers=self._headers(),
+            params={"limit": limit},
+            timeout=30,
+        )
+        self._handle_response(resp)
+        if resp.status_code != 200:
+            raise _failed(MLArenaError, "latest_replays", resp)
+        return resp.json()
 
     def recent_replays(self, challenge_id: int, limit: int = 12) -> dict:
         """Deprecated alias of :meth:`replays` (4.4.0).

@@ -615,6 +615,18 @@ def test_replays_sends_only_the_passed_keys():
     _expect(rec.last["params"] == {"limit": 12, "order": "score"}, rec.last["params"])
 
 
+def test_latest_replays_reads_the_public_challenges_newest():
+    row = {"challenge_id": 7, "challenge_name": "arena", "run": {"simulation_result_id": 3},
+           "challenge_context": {}}
+    c, rec = make_client(lambda *_: (200, {"replays": [row]}))
+    _expect(c.latest_replays()["replays"] == [row], "as served")
+    _expect((rec.last["method"], rec.last["path"]) == ("GET", "/challenges/replays"),
+            rec.last["path"])
+    _expect(rec.last["params"] == {"limit": 1}, rec.last["params"])
+    c.latest_replays(limit=5)
+    _expect(rec.last["params"] == {"limit": 5}, rec.last["params"])
+
+
 def test_replay_reads_one_run():
     c, rec = make_client(lambda *_: (200, {"run": {"simulation_result_id": 3}}))
     _expect(c.replay(7, 3)["run"]["simulation_result_id"] == 3, "as served")
