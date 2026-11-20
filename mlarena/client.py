@@ -4969,31 +4969,6 @@ class MLArenaClient:
             error_label="download_module_asset",
         )
 
-    def download_lesson_media(self, lesson_id: int, filename: str,
-                              dest_dir: str = ".") -> str:
-        """Download one lesson file to `dest_dir`; returns the written path.
-
-        Mirrors `GET /api/academic_courses/assets/lessons/{id}/{filename}`,
-        the URL of a file attached to a lesson before module assets existed.
-        A lesson body that still links such a URL is read with this method;
-        files are now a module's assets (`download_module_asset`). Gated
-        lessons require enrollment; the bearer token carries that.
-        """
-        os.makedirs(dest_dir, exist_ok=True)
-        resp = self._request(
-            "GET", self._url(f"/academic_courses/assets/lessons/{lesson_id}/{filename}"),
-            headers=self._headers(), timeout=300, stream=True,
-        )
-        self._handle_response(resp)
-        if resp.status_code != 200:
-            raise _failed(MLArenaError, "download_lesson_media", resp)
-        out_path = os.path.join(dest_dir, os.path.basename(filename))
-        with open(out_path, "wb") as fh:
-            for chunk in resp.iter_content(chunk_size=1 << 20):
-                if chunk:
-                    fh.write(chunk)
-        return out_path
-
     def preview_lesson(self, lesson_id: int, body_md: str | None = None) -> dict:
         """Server-validate a lesson body's `mlarena:` directives (strict mode).
 

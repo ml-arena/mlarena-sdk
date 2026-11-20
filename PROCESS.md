@@ -1,6 +1,6 @@
 # mlarena-sdk — Python SDK
 
-**Purpose**: Python client (`mlarena-sdk` 4.15.0, import `mlarena`) and the `mlarena` command over the public backend REST routes (`/api/*`).
+**Purpose**: Python client (`mlarena-sdk` 4.16.0, import `mlarena`) and the `mlarena` command over the public backend REST routes (`/api/*`).
 
 **Key features**:
 - Bearer-token auth with scope-segmented keys `mlk_<scope>_<lookup>_<secret>` (`user`, `creator`, `teacher`), or, in a GitHub Actions job, the 15-minute `mlo_<lookup>_<secret>` token of the OIDC exchange (no stored secret).
@@ -57,7 +57,7 @@ The SDK and the React console are peers over one REST surface; every user-facing
 | `chat_challenge` (+ `wait_for_chat_agent`, a client-side poll of it), `open_chat_session`, `chat_session`, `send_chat_message`, `close_chat_session`, `export_chat_session` (user); `chat_admin`, `update_chat_settings`, `chat_sessions`, `void_chat_session`, `unvoid_chat_session`, `export_chat_evidence` (creator) | `/api/chat/*` | `chatApi.ts` |
 | `exercise_challenge`, `submit_exercise`, `exercise_attempt`, `exercise_attempts` (user); `exercise_admin` (creator) | `/api/exercise/*` | `exerciseApi.ts` |
 | `create_course`, `list_courses`, `enrollment_info`, `enroll_in_course` | `/api/academic_courses/`, `/api/academic_courses/enroll/{join_code}` | `coursesApi.ts` |
-| `course_catalog`, `course`, `module_overview`, `lesson`, `mark_lesson_viewed`, `mark_lesson_complete`, `mark_lesson_incomplete`, `my_progress`, `download_module_asset` (`…/assets/modules/{id}/{path}`), `download_lesson_media` (`…/assets/lessons/{id}/{filename}`, the pre-module-asset URLs) | `/api/academic_courses/*` (consumption, assets) | `coursesApi.ts` |
+| `course_catalog`, `course`, `module_overview`, `lesson`, `mark_lesson_viewed`, `mark_lesson_complete`, `mark_lesson_incomplete`, `my_progress`, `download_module_asset` (`…/assets/modules/{id}/{path}`) | `/api/academic_courses/*` (consumption, assets) | `coursesApi.ts` |
 | `create_module`, `list_modules`, `get_module`, `update_module`, `delete_module`, `fork_module`, `detach_module` (`POST …/{id}/detach`), `upload_module_asset`, `list_module_assets`, `delete_module_asset` (`…/{id}/assets`), `attach_challenge`, `update_challenge_link`, `detach_challenge`, `reorder_module_challenges` | `/api/teacher/modules/*` | `coursesApi.ts` |
 | `create_lesson`, `get_lesson`, `update_lesson`, `delete_lesson`, `reorder_lessons`, `preview_lesson` | `/api/teacher/lessons/*`, `/api/teacher/modules/{id}/lessons*` | `coursesApi.ts` |
 | `update_course`, `set_course_cover`, `list_course_modules`, `link_module`, `unlink_module`, `reorder_modules`, `add_course_challenge`, `remove_course_challenge`, `course_progress` | `/api/teacher/course/{id}/*` | `coursesApi.ts` |

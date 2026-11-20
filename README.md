@@ -2,6 +2,15 @@
 
 Python SDK for [ML Arena](https://ml-arena.com) — make submissions, manage challenges, manage courses, and read leaderboards from any notebook or IDE.
 
+## 4.16.0 — lesson media route removed
+
+- **Removed:** `download_lesson_media(lesson_id, filename)`. Its route,
+  `GET /api/academic_courses/assets/lessons/{id}/{filename}`, is gone from the
+  platform: every lesson file is a module asset, read with
+  `download_module_asset(module_id, path)`.
+- GitHub Actions examples use `actions/checkout@v7` and
+  `actions/setup-python@v7` (the earlier majors run on a deprecated Node).
+
 ## 4.15.0 — compute footprint
 
 - New: `challenge_footprint(challenge_id)` — the challenge's evaluation
@@ -1161,8 +1170,8 @@ jobs:
   submit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - run: pip install mlarena-sdk
@@ -1182,8 +1191,8 @@ jobs:
   push:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - run: pip install mlarena-sdk
@@ -1203,8 +1212,8 @@ jobs:
   push:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - run: pip install mlarena-sdk
