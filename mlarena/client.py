@@ -232,8 +232,8 @@ class MLArenaClient:
         ``email``, ``avatar_key``, ``is_admin``, ``is_human_verified``,
         ``has_teacher_access`` (the teacher flag *or* admin *or* a
         course-assistant row), ``has_creator_access``
-        (the real creator rule — the flag *or* admin *or* a creator-assistant
-        row), ``can_create_course`` and ``github_login`` (the GitHub account
+        (the real creator rule — the flag *or* admin *or* an assistant row
+        on a challenge), ``can_create_course`` and ``github_login`` (the GitHub account
         linked to this one, None when there is none; it is linked from the
         console's Profile page, a browser flow). Every key is always present.
 
@@ -758,10 +758,13 @@ class MLArenaClient:
         `start_blockers` lists every reason `start_challenge` would refuse
         now, each `{code, message}` (`env_missing`, `configuration_missing`,
         `image_inconsistent`, `config_not_applied`, `required_file_missing`,
-        `runtime` — the machine's caps, its time cap included —,
+        `runtime` — the size, the run timeout, the agents per run or where
+        the challenge is placed —,
         `env_invalid`, `chat_missing`, `llm_not_configured`,
         `ground_truth_missing`, `benchmark_missing`, `benchmark_unscored`);
-        `[]` means ready, None while started. `start_recommendations` lists,
+        `[]` means ready, None while started. A `runtime` message is worded
+        for the caller: what to change (or "ask an admin") for a creator,
+        the machine, its limits and the rule that failed for an admin key. `start_recommendations` lists,
         the same way, what participants would miss if it started now — advice
         `start_challenge` never checks: `description_missing` (no card
         blurb), `overview_missing` (no overview, or only whitespace),
@@ -1316,7 +1319,10 @@ class MLArenaClient:
                 ELO-rated; refused unless the kind has `elo` and the challenge
                 seats at least 2 agents (`number_of_agents`). Validated on the merged state (400
                 names the rule); once started only the presentation fields
-                may change. Not editable on a chat challenge. See the README
+                may change. On flex_v1 the server appends the platform
+                footprint descriptors (`energy`, `co2e`) the list leaves
+                out: list them to relabel or hide them; they cannot be
+                removed. Not editable on a chat challenge. See the README
                 "Metrics" section.
             window_days: when set, every declared key is also folded over
                 the runs of the last `window_days` days (the leaderboard's
@@ -1387,8 +1393,12 @@ class MLArenaClient:
         `available_kinds()[i]["runtime_defaults"]` / `["runtime_presets"]`.
         The backend checks the merged runtime against the machine (request
         ≤ limit, one job within the machine's `job_cpu_max` /
-        `job_memory_max`, GPUs within its inventory) and answers 400 naming
-        the rule:
+        `job_memory_max`, GPUs within its inventory) and answers 400. The
+        message is worded for the caller: what to change (a smaller size, a
+        shorter run timeout, the agents per run, or "ask an admin") for a
+        creator, the machine, its limit and the rule that failed for an
+        admin key; `.body["details"]` lists each reason. A refused
+        `challenge.toml` adds the lines of the keys concerned:
             machine_id: a machine from `machines(kernel_version)` whose queue
                 for the challenge's kernel the owner may use.
             env_cpu_request / env_cpu_limit / env_memory_request /
@@ -1904,7 +1914,8 @@ class MLArenaClient:
         refusal bubbles up as MLArenaError whose message is the first
         blocker's (409 for a conflict with the platform — image
         consistency, runtime —, 400 for missing authoring) and whose
-        `.body["details"]` lists every blocker's message.
+        `.body["details"]` lists every blocker's message, each worded for
+        the caller as in `start_blockers`.
         """
         resp = self._request("PUT",
             self._url(
@@ -2196,7 +2207,7 @@ class MLArenaClient:
 
         Mirrors `POST
         /api/creator_challenge/challenge/{cid}/submissions/{sid}/clean_redeploy`
-        (`submissions.py`) — the Restart button of the creator's submissions
+        (`submissions.py`) — the Re-score action of the Studio's submissions
         tab. Allowed for an `active` or `deploy_failed` submission; anything
         else is a 400 naming the status. Returns `submission_id`,
         `deleted_results`, `deployment_id` and the submission's status block.
@@ -2219,7 +2230,7 @@ class MLArenaClient:
         return resp.json()
 
     def clean_redeploy_all(self, challenge_id: int) -> dict:
-        """Clean and redeploy every eligible submission of a challenge.
+        """Re-score every eligible submission of a challenge (wipe its runs, deploy it again).
 
         Mirrors `POST
         /api/creator_challenge/challenge/{id}/submissions/clean_redeploy_all`
@@ -2257,7 +2268,7 @@ class MLArenaClient:
         )
 
     def challenge_assistants(self, challenge_id: int) -> list:
-        """The creator-assistants of a challenge.
+        """The assistants of a challenge.
 
         Mirrors `GET /api/creator_challenge/challenge/{id}/assistants`
         (`assistants.py`). Each entry carries `user_id`, `username` and
@@ -2287,7 +2298,7 @@ class MLArenaClient:
 
     def remove_challenge_assistant(self, challenge_id: int,
                                    user_id: int) -> dict:
-        """Revoke a creator-assistant — owner only.
+        """Remove an assistant from a challenge — owner only.
 
         Mirrors `DELETE
         /api/creator_challenge/challenge/{id}/assistants/{user_id}`
@@ -4179,7 +4190,7 @@ class MLArenaClient:
           `feedback["stdout"]` is what your code printed.
 
         An attempt that ends `status="error"` is not a verdict on your code
-        (`grader_error`: the checker failed, the creator was told;
+        (`grader_error`: the checker failed, the exercise set's owner was told;
         `worker_offline`: no checker picked it up) and raises `MLArenaError`
         carrying the attempt as `.body` — send it again later. Not settled
         after `timeout` seconds raises `MLArenaError` naming the state the
@@ -4761,8 +4772,14 @@ class MLArenaClient:
         challenge when their best leaderboard value meets it in the direction
         the challenge ranks (`>=` when its ranking spec's `order` is "desc",
         `<=` when it is "asc"; the returned link carries that spec as
-        `metric`). Omit it for no
-        pass/fail — do not pass 0, which would validate every entrant.
+        `metric`). Omit it for the kind's default: 70 (% solved) for an
+        exercise set, no pass/fail for every other kind
+        (`challenges_for_course` lists it as `default_pass_threshold`). The
+        default is applied when the link is created only: on a link that
+        already exists (`update_challenge_link`, a `course.yaml` re-push) an
+        omitted `pass_threshold` leaves the stored bar unchanged. To
+        remove a bar, call `update_challenge_link(..., pass_threshold=None)`.
+        Do not pass 0, which would validate every entrant.
         """
         body: dict = {"challenge_id": challenge_id}
         if label is not None:
@@ -5136,9 +5153,11 @@ class MLArenaClient:
         """The challenges you may attach to a module.
 
         Mirrors `GET /api/teacher/challenges-for-course`: public challenges plus
-        your own, each with `id`, `name` and `metric` — the ranking MetricSpec:
+        your own, each with `id`, `name`, `metric` — the ranking MetricSpec:
         the scale a threshold is on (`label`, `format`, `precision`) and
-        the direction it is compared in (`order`).
+        the direction it is compared in (`order`) — and
+        `default_pass_threshold`, the bar `attach_challenge` stores when you
+        name none (70 for an exercise set, None otherwise).
         A challenge with no evaluation is not listed, because `attach_challenge`
         refuses it.
         """
@@ -5170,8 +5189,12 @@ class MLArenaClient:
     def remove_student(self, course_id: int, user_id: int) -> dict:
         """Remove a student's enrollment from a course.
 
-        Mirrors `DELETE /api/teacher/student/{course_id}/{user_id}`. Their
-        submissions are untouched — only the enrollment row goes.
+        Mirrors `DELETE /api/teacher/student/{course_id}/{user_id}`. Only the
+        enrollment row is deleted: the student leaves the roster, the progress
+        table, the exports and the course view of the leaderboards. Their
+        account, student number and email, submissions, teams and lesson
+        progress are kept, and they can enroll again with the join code (their
+        completed lessons then count again).
         """
         return self._course_call(
             "DELETE", f"/teacher/student/{course_id}/{user_id}",
@@ -5179,7 +5202,7 @@ class MLArenaClient:
         )
 
     def course_assistants(self, course_id: int):
-        """The teaching assistants on a course (course owner only).
+        """The assistants on a course (course owner or admin).
 
         Mirrors `GET /api/teacher/course/{id}/assistants`. Each row carries
         `user_id`, `username` and `created_at_ts`. Returns a DataFrame if
@@ -5191,7 +5214,7 @@ class MLArenaClient:
         ))
 
     def add_course_assistant(self, course_id: int, username: str) -> dict:
-        """Add a teaching assistant by username (course owner only).
+        """Add an assistant by username (course owner or admin).
 
         Mirrors `POST /api/teacher/course/{id}/assistants`. A TA gets the same
         teacher view of the course, but cannot manage the assistant list.
@@ -5203,7 +5226,7 @@ class MLArenaClient:
         )
 
     def remove_course_assistant(self, course_id: int, user_id: int) -> dict:
-        """Remove a teaching assistant (course owner only).
+        """Remove an assistant (course owner or admin).
 
         Mirrors `DELETE /api/teacher/course/{id}/assistants/{user_id}`.
         """
@@ -5325,7 +5348,9 @@ class MLArenaClient:
                 challenges:          # optional
                   - slug: cartpole-v1       # the challenge's URL slug (or challenge_id:)
                     label: "CartPole"
-                    pass_threshold: 195.0   # optional: the score that validates it
+                    pass_threshold: 195.0   # optional: the score that validates it; omitted =
+                                            # the kind's default on a new link (70 for an
+                                            # exercise set, else none), unchanged on an existing one
                 lessons:
                   - title: "What is RL?"
                     slug: what-is-rl
