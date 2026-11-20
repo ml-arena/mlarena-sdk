@@ -2,6 +2,13 @@
 
 Python SDK for [ML Arena](https://ml-arena.com) — make submissions, manage challenges, manage courses, and read leaderboards from any notebook or IDE.
 
+## 4.14.0 — one latest replay per challenge
+
+- New: `latest_replays(limit=6, one_per_challenge=True)` keeps each public
+  challenge's newest replay only, so the rows are different challenges (the
+  landing page's "Latest replays" playlist). Requires a platform that has
+  the option; an older one answers 400.
+
 ## 4.13.0 — latest replays
 
 - New: `latest_replays(limit=1)`, the newest replays across the public

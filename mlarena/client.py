@@ -3050,22 +3050,27 @@ class MLArenaClient:
         os.replace(tmp_path, out_path)
         return out_path
 
-    def latest_replays(self, limit: int = 1) -> dict:
+    def latest_replays(self, limit: int = 1, one_per_challenge: bool = False) -> dict:
         """The newest replays across the public challenges, newest first.
 
         Mirrors `GET /api/challenges/replays` — the landing page's "Latest
-        replay". Returns `{"replays": [...]}`, each row `{"challenge_id",
+        replays". Returns `{"replays": [...]}`, each row `{"challenge_id",
         "challenge_name", "run", "challenge_context"}`: `run` is a public
         `ReplayRun` (the row shape of `replays()`, so `download_replay(row[
         "run"])` saves its file) and `challenge_context` its challenge's
         `RunsContext`. The runs are the ones each challenge's `replays()`
         lists, taken over the public challenges only, whoever calls: a
         private challenge you can see is not in it. `limit` is 1..12.
+        `one_per_challenge=True` keeps each challenge's newest replay only,
+        so `limit` rows are `limit` different challenges.
         """
+        params: dict = {"limit": limit}
+        if one_per_challenge:
+            params["one_per_challenge"] = "true"
         resp = self._request("GET",
             self._url("/challenges/replays"),
             headers=self._headers(),
-            params={"limit": limit},
+            params=params,
             timeout=30,
         )
         self._handle_response(resp)

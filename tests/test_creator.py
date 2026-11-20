@@ -625,6 +625,8 @@ def test_latest_replays_reads_the_public_challenges_newest():
     _expect(rec.last["params"] == {"limit": 1}, rec.last["params"])
     c.latest_replays(limit=5)
     _expect(rec.last["params"] == {"limit": 5}, rec.last["params"])
+    c.latest_replays(limit=6, one_per_challenge=True)
+    _expect(rec.last["params"] == {"limit": 6, "one_per_challenge": "true"}, rec.last["params"])
 
 
 def test_replay_reads_one_run():
