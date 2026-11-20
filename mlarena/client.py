@@ -4639,6 +4639,8 @@ class MLArenaClient:
         `metric`, the challenge's ranking MetricSpec (its `order` "desc":
         `passed` means value >= bar, "asc": <=; its `label`, `format` and
         `precision` say how to read `value`, the best submission's `score`).
+        `best_submission_id` is the submission behind `value` when the caller
+        may open it (their own, or a teammate's).
         """
         return self._course_call(
             "GET", f"/academic_courses/{course_id}/progress/me",
@@ -5128,7 +5130,14 @@ class MLArenaClient:
 
         Mirrors `GET /api/teacher/course/{id}/progress`. Requires teacher/TA/admin.
         Challenge metas and cells carry `metric`, the ranking MetricSpec,
-        next to `pass_threshold` (see `my_progress`).
+        next to `pass_threshold` (see `my_progress`). Each challenge meta
+        carries `is_published`: False for a challenge of an entry hidden from
+        students, which only the course's staff follow. A cell's
+        `best_submission_id` is served only when the caller may open that
+        submission (`submission()`): it is None, next to a `value`, on an
+        entry hidden from students (unless the caller is an admin, staff of
+        the challenge, or the submission is public) and for a team's line
+        held by a teammate the caller does not teach.
         """
         return self._course_call(
             "GET", f"/teacher/course/{course_id}/progress",
