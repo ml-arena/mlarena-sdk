@@ -2,6 +2,34 @@
 
 Python SDK for [ML Arena](https://ml-arena.com) — make submissions, manage challenges, manage courses, and read leaderboards from any notebook or IDE.
 
+## 4.15.0 — compute footprint
+
+- New: `challenge_footprint(challenge_id)` — the challenge's evaluation
+  footprint, `{"last_30d", "since_start"}`, each `{runs, metered_runs,
+  agent_energy_wh, env_energy_wh, agent_co2e_g, env_co2e_g}` (the console
+  challenge page's footprint card). Requires a platform that serves
+  `GET /api/challenges/{id}/footprint`; an older one answers 404.
+- New: `mlarena.format_metric(value, spec)` — a value as the console shows
+  it under its descriptor (`format`, `unit`, `precision`), including the two
+  new formats: `energy` (a value in Wh, shown mWh below 1 Wh, kWh from
+  1000 Wh) and `mass` (a value in g, shown mg / g / kg the same way); `None`
+  reads "—". An unknown format raises `ValueError`.
+- Metric declarations may use `format: "energy"` / `"mass"` (with
+  `unit: None`) and the platform keys `energy`, `co2e`, `cpu_time`,
+  `gpu_time`, `busy_time` (flex_v1 only). Every flex_v1 board gains visible
+  *Energy / run* and *CO₂e / run* columns (`energy`, `co2e` in
+  `df.attrs["metrics"]` and as DataFrame columns).
+- Run rows carry the footprint under the backend's column names: per agent
+  `agent_busy_time_sec`, `agent_call_count`, `agent_call_time_total_sec`,
+  `agent_metric_ram_gib_sec`, `agent_metric_gpu_energy_j`,
+  `agent_metric_gpu_busy_sec`, `agent_energy_wh`, `agent_co2e_g`; per run
+  `env_metric_ram_gib_sec`, `env_metric_gpu_energy_j`,
+  `env_metric_gpu_busy_sec`, `env_energy_wh`, `env_co2e_g`.
+  `agent_metric_cpu_time_total_sec` is now the agent container's own CPU time
+  and `agent_metric_vram_max_bytes` its own VRAM; both are `None` on a run
+  that was not metered (every run before this release: the old values were
+  host- and device-wide and were cleared).
+
 ## 4.14.0 — one latest replay per challenge
 
 - New: `latest_replays(limit=6, one_per_challenge=True)` keeps each public
@@ -1247,7 +1275,10 @@ if st["is_deployable"]:
 `submission_runs()["runs"]` (like `creator_runs()`) serves the one
 `RunResult`. A run carries the job's own `job_status`
 (`pending` | `running` | `completed` | `failed` | `cancelled`),
-`env_nb_steps`, the env's resource columns and, when the challenge's own code
+`env_nb_steps`, the env's resource columns (its footprint:
+`env_metric_cpu_time_total_sec`, `env_metric_ram_gib_sec`,
+`env_metric_gpu_energy_j`, `env_metric_gpu_busy_sec`, `env_energy_wh`,
+`env_co2e_g`) and, when the challenge's own code
 is why it ended, `env_error_type` (`code_error` | `timeout` | `oom_killed` |
 `crash`; the legacy `simulation_error` | `pod_crash` on older runs). Its
 `submission_results` list one row per agent in
@@ -1257,7 +1288,11 @@ the run — `submission_id`, `submission_name`, `user_name`, `submission_status`
 `agent_nb_steps`, `game_outcome`, `final_rank` (both `None` on a solo run),
 `score_elo_before`, `score_elo_delta`,
 `metrics` (the env's per-run keys, plus the optional `score2`), the agent's
-resource columns and, when that agent is why the
+resource columns, its footprint (`agent_busy_time_sec`, `agent_call_count`,
+`agent_call_time_total_sec`, `agent_metric_cpu_time_total_sec`,
+`agent_metric_ram_gib_sec`, `agent_metric_gpu_energy_j`,
+`agent_metric_gpu_busy_sec`, `agent_metric_vram_max_bytes`,
+`agent_energy_wh`, `agent_co2e_g`; `None` = the run was not metered) and, when that agent is why the
 run ended, `agent_error_type` (the same values) with
 `agent_error_message`. Your row is the one whose `submission_id` is yours; the
 others are the opponents:
@@ -1328,6 +1363,7 @@ print(c.leaderboard(cid).head())
 - `client.challenges(q=None, tags=None, status="started", page=None, per_page=None)` — public list. `status` is `"started"` (started challenges only) or `"all"` (draft, started and stopped). Each row's `status` is `"draft"`, `"started"` or `"stopped"`.
 - `client.challenge(challenge_id)` — the participant view: the kernel, the limits, the machine and its health.
 - `client.challenge_by_slug(slug)` — the same detail, looked up by the `<slug>` of `https://ml-arena.com/challenges/<slug>`; its `id` is what the other methods take.
+- `client.challenge_footprint(challenge_id)` — what the challenge's runs consumed on the platform's machines: `{"last_30d", "since_start"}`, each `{runs, metered_runs, agent_energy_wh, env_energy_wh, agent_co2e_g, env_co2e_g}` (Wh and g; only the `metered_runs` count in the sums).
 - `client.replays(challenge_id, limit=12, before_simulation_result_id=None, mine=False)` — the challenge's newest runs with a replay (public `ReplayRun` rows: who played, how it ended, the replay), paged by `simulation_result_id`; `mine=True` keeps the runs your submissions played in. `client.replay(challenge_id, simulation_result_id)` — one of them, freshly signed. `client.download_replay(run, dest_dir)` — saves a row's replay file. `recent_replays` is a deprecated alias of `replays`.
 - `client.create_challenge(name, kernel_version, description=None, copy_from_challenge_id=None, tag_names=None)` — creator scope. The backend resolves the machine (the kernel's default queue) + default evaluation + default env runtime from `kernel_version`; the reply names it (`machine_name`). Pass `tag_names=["rl", "research"]` to attach tags at creation time; unknown names raise `MLArenaError`.
 - `client.available_kinds()` / `client.copyable_challenges()` — creator scope. What `kernel_version` and `copy_from_challenge_id` accept; each kind's `has_machine`, `runtime_defaults` and `runtime_presets`.
@@ -1515,11 +1551,11 @@ A challenge declares what its leaderboard shows as `metrics`, an ordered list of
 |---|---|
 | `key` | `^[a-z][a-z0-9_]{0,31}$`, unique; not `score`, `rank` or `metrics` |
 | `label` | 1..40 characters, the column header |
-| `source` | `"score"` — the env's main score (at most one spec); `"env"` — `metrics_detail[key]` that `env.py` returns per agent (served on the run row as `metrics[key]`); `"platform"` — `elo`, `action_time_max`, `ram_max`, `vram_max`, `steps` or `n_episodes` |
+| `source` | `"score"` — the env's main score (at most one spec); `"env"` — `metrics_detail[key]` that `env.py` returns per agent (served on the run row as `metrics[key]`); `"platform"` — `elo`, `action_time_max`, `ram_max`, `vram_max`, `steps`, `n_episodes`, or the agent's footprint `energy` (Wh / run), `co2e` (g CO₂e / run), `cpu_time`, `gpu_time`, `busy_time` (seconds; flex_v1 only) |
 | `agg` | how runs fold into the submission's value: `"mean"`, `"sum"`, `"max"`, `"min"`, `"last"`, `"rating"` (ELO) |
 | `order` | `"desc"` higher is better, `"asc"` lower is better, `None` not comparable |
-| `format` | `"number"`, `"integer"`, `"percent"` (a fraction, shown ×100), `"seconds"`, `"bytes"`, `"currency"` |
-| `unit` | ≤ 8 characters or `None`; required for `currency` |
+| `format` | `"number"`, `"integer"`, `"percent"` (a fraction, shown ×100), `"seconds"`, `"bytes"`, `"currency"`, `"energy"` (a value in Wh, shown mWh / Wh / kWh), `"mass"` (a value in g, shown mg / g / kg) |
+| `unit` | ≤ 8 characters or `None`; required for `currency`, `None` for `energy` and `mass` |
 | `precision` | decimal places, 0..10 |
 | `is_ranking` | exactly one spec is `True`, and it has an `order`: the board ranks on it |
 | `visible` | `False` = folded and served, but not a column in the console |
@@ -1536,6 +1572,8 @@ client.update_settings(challenge_id, metrics=[
 ```
 
 - `metrics` replaces the whole list; the server validates it on the merged state (400 names the rule). Once the challenge has started only `label`, `unit`, `precision`, `format` and `visible` may change; `window_days` is frozen.
+- Every flex_v1 board carries the platform's *Energy / run* (`energy`, format `energy`) and *CO₂e / run* (`co2e`, format `mass`) descriptors, visible and not ranking; a creator may hide them (`visible: False`). A run that was not metered has no value and is left out of the mean.
+- `mlarena.format_metric(value, spec)` renders a value as the console does: `format_metric(0.0042, {"format": "energy", "precision": 2, "unit": None})` → `"4.20 mWh"`, `format_metric(1530, {"format": "mass", "precision": 1, "unit": None})` → `"1.5 kg"`; `None` → `"—"`.
 - `window_days` (≥ 1) also folds every key over the last `window_days` days: `metrics_window` on the rows, `metrics_window_<key>` in the DataFrame.
 - A submission's values read everywhere as `score` (the ranking spec's value) + `metrics` (`{key: value}`): `leaderboard()`, `submission()`, `creator_submissions()`. The declaration is the board's `challenge` block (`leaderboard()`'s `df.attrs["metrics"]`). Course payloads carry `metric` — the ranking spec — and `value`, the best submission's `score`.
 

@@ -16,8 +16,9 @@ from mlarena.exceptions import (
     SubmissionNotFoundError,
     WaitTimeoutError,
 )
+from mlarena.metrics import format_metric
 
-__version__ = "4.14.0"
+__version__ = "4.15.0"
 
 
 def connect(

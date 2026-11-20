@@ -1043,6 +1043,71 @@ def test_leaderboard_row_missing_a_declared_key_fails_fast():
         raise AssertionError("a row missing a declared key was accepted")
 
 
+_FOOTPRINT_SPECS = [
+    {"key": "energy", "label": "Energy / run", "source": "platform", "agg": "mean",
+     "order": "asc", "format": "energy", "unit": None, "precision": 2,
+     "is_ranking": False, "visible": True},
+    {"key": "co2e", "label": "CO₂e / run", "source": "platform", "agg": "mean",
+     "order": "asc", "format": "mass", "unit": None, "precision": 2,
+     "is_ranking": False, "visible": True},
+]
+
+
+def test_leaderboard_carries_the_footprint_columns():
+    """4.15.0: a flex_v1 board declares `energy` / `co2e` (formats `energy` /
+    `mass`): each is a plain column, None for a submission with no metered
+    run, and `format_metric` reads it under its descriptor."""
+    if not _has_pandas():
+        return
+    metrics = _CRPS_METRICS + _FOOTPRINT_SPECS
+    board = {
+        "challenge": {"challenge_id": 9, "metrics": metrics, "window_days": None,
+                      "has_gpu": False},
+        "total": 2, "me": None, "matches": [],
+        "leaders": [
+            _leader(1, 0.21, {"crps": 0.21, "n_samples": 40.0, "action_time_max": 0.5,
+                              "energy": 0.0042, "co2e": 0.00021}, None),
+            _leader(2, 0.30, {"crps": 0.30, "n_samples": 10.0, "action_time_max": 0.2,
+                              "energy": None, "co2e": None}, None),
+        ],
+    }
+    c, _ = make_client(lambda *_: (200, board))
+    df = c.leaderboard(9)
+    assert df.loc[0, "energy"] == 0.0042 and df.loc[0, "co2e"] == 0.00021
+    assert df["energy"].isna()[1] and df["co2e"].isna()[1]
+    specs = {d["key"]: d for d in df.attrs["metrics"]}
+    assert mlarena.format_metric(df.loc[0, "energy"], specs["energy"]) == "4.20 mWh"
+    assert mlarena.format_metric(df.loc[0, "co2e"], specs["co2e"]) == "0.21 mg"
+    assert mlarena.format_metric(None, specs["energy"]) == "—"
+
+
+def test_run_rows_keep_the_footprint_columns_as_served():
+    """The per-run footprint is served under the backend's column names and
+    returned untouched; an unmetered run's CPU time is None, not a float."""
+    agent_row = {
+        "id": 1, "submission_id": 5, "score": 1.0,
+        "agent_metric_cpu_time_total_sec": None, "agent_metric_vram_max_bytes": None,
+        "agent_busy_time_sec": 1.25, "agent_call_count": 200,
+        "agent_call_time_total_sec": 0.75, "agent_metric_ram_gib_sec": None,
+        "agent_metric_gpu_energy_j": None, "agent_metric_gpu_busy_sec": None,
+        "agent_energy_wh": None, "agent_co2e_g": None,
+    }
+    run = {"simulation_result_id": 3, "env_metric_cpu_time_total_sec": None,
+           "env_metric_ram_gib_sec": None, "env_metric_gpu_energy_j": None,
+           "env_metric_gpu_busy_sec": None, "env_energy_wh": None, "env_co2e_g": None,
+           "submission_results": [agent_row]}
+    page = {"runs": [run], "total": 1, "challenge_context": {"metrics": []}}
+    c, _ = make_client(lambda *_: (200, page))
+    assert c.submission_runs(5) == page
+    doc = MLArenaClient.submission_runs.__doc__
+    for key in ("agent_busy_time_sec", "agent_call_count", "agent_call_time_total_sec",
+                "agent_metric_ram_gib_sec", "agent_metric_gpu_energy_j",
+                "agent_metric_gpu_busy_sec", "agent_energy_wh", "agent_co2e_g",
+                "env_metric_ram_gib_sec", "env_metric_gpu_energy_j",
+                "env_metric_gpu_busy_sec", "env_energy_wh", "env_co2e_g"):
+        assert key in doc, key
+
+
 def test_leaderboard_key_colliding_with_a_row_column_raises():
     if not _has_pandas():
         return

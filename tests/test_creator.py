@@ -636,6 +636,41 @@ def test_replay_reads_one_run():
             rec.last["path"])
 
 
+FOOTPRINT = {
+    "last_30d": {"runs": 120, "metered_runs": 96, "agent_energy_wh": 14.2,
+                 "env_energy_wh": 3.1, "agent_co2e_g": 0.8, "env_co2e_g": 0.2},
+    "since_start": {"runs": 900, "metered_runs": 96, "agent_energy_wh": 14.2,
+                    "env_energy_wh": 3.1, "agent_co2e_g": 0.8, "env_co2e_g": 0.2},
+}
+
+
+def test_challenge_footprint_reads_the_public_route():
+    c, rec = make_client(lambda *_: (200, FOOTPRINT), scope="user")
+    _expect(c.challenge_footprint(7) == FOOTPRINT, "as served")
+    _expect((rec.last["method"], rec.last["path"]) == ("GET", "/challenges/7/footprint"),
+            rec.last["path"])
+    _expect(rec.last["headers"]["Authorization"].startswith("Bearer "), "token")
+    _expect("params" not in rec.last or rec.last["params"] is None, rec.last.get("params"))
+
+
+def test_challenge_footprint_refusals():
+    from mlarena.exceptions import ChallengeNotFoundError
+    c, _ = make_client(lambda *_: (404, {"error": "Challenge not found"}), scope="user")
+    try:
+        c.challenge_footprint(7)
+    except ChallengeNotFoundError as exc:
+        _expect(exc.status_code == 404, exc.status_code)
+    else:
+        raise AssertionError("a 404 did not raise")
+    c, _ = make_client(lambda *_: (500, {"error": "boom"}), scope="user")
+    try:
+        c.challenge_footprint(7)
+    except MLArenaError as exc:
+        _expect(exc.status_code == 500 and "challenge_footprint" in str(exc), str(exc))
+    else:
+        raise AssertionError("a 500 did not raise")
+
+
 PUBLIC_REPLAY_RUN = {
     "simulation_result_id": 41,
     "created_at_ts": "2026-10-04T08:00:00Z",

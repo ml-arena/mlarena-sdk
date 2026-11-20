@@ -911,6 +911,32 @@ class MLArenaClient:
             raise _failed(MLArenaError, "datasets", resp)
         return resp.json()
 
+    def challenge_footprint(self, challenge_id: int) -> dict:
+        """The challenge's evaluation footprint: what its runs consumed on
+        the platform's machines.
+
+        Mirrors `GET /api/challenges/{id}/footprint` — the console challenge
+        page's footprint card; open to anyone who can see the challenge.
+        Returns `ChallengeFootprint` `{"last_30d", "since_start"}`, each
+        `{"runs", "metered_runs", "agent_energy_wh", "env_energy_wh",
+        "agent_co2e_g", "env_co2e_g"}`: the sums over the challenge's runs
+        of the window, agents and env apart (energy in Wh, CO₂e in g;
+        `mlarena.format_metric(v, {"format": "energy", "precision": 2,
+        "unit": None})` shows one, `"mass"` for CO₂e). Only `metered_runs` of the `runs` count in the sums (a
+        run before the platform measured it, or on an unmetered machine,
+        has no figure). A challenge you cannot see raises
+        `ChallengeNotFoundError` (404).
+        """
+        resp = self._request("GET",
+            self._url(f"/challenges/{challenge_id}/footprint"),
+            headers=self._headers(),
+            timeout=30,
+        )
+        self._handle_response(resp)
+        if resp.status_code != 200:
+            raise _failed(MLArenaError, "challenge_footprint", resp)
+        return resp.json()
+
     def download_dataset(self, challenge_id: int, dest_dir: str = ".") -> list[str]:
         """Download every published dataset file for a challenge into `dest_dir`.
 
@@ -1273,8 +1299,16 @@ class MLArenaClient:
                 "platform"), `agg` ("mean" | "sum" | "max" | "min" |
                 "last" | "rating"), `order` ("desc" | "asc" | None),
                 `format` ("number" | "integer" | "percent" | "seconds" |
-                "bytes" | "currency"), `unit`, `precision` (0..10),
-                `is_ranking`, `visible`. Exactly one entry has
+                "bytes" | "currency" | "energy" (a value in Wh, shown
+                mWh / Wh / kWh) | "mass" (a value in g, shown mg / g / kg);
+                `unit` must be None for the last two), `unit`, `precision`
+                (0..10), `is_ranking`, `visible`. A `platform` key is one of
+                `elo`, `action_time_max`, `ram_max`, `vram_max`, `steps`,
+                `n_episodes`, and the agent's footprint `energy` (Wh / run),
+                `co2e` (g CO₂e / run), `cpu_time`, `gpu_time`, `busy_time`
+                (seconds) — the footprint keys only on a kind with agent
+                containers (flex_v1; 400 elsewhere). `mlarena.format_metric`
+                renders a value as the console does. Exactly one entry has
                 `is_ranking: True` with an `order`: its `order` decides who
                 wins each run, the episode budget tiers, the leaderboard
                 order and course pass verdicts. `agg: "rating"` (only on the
@@ -2850,8 +2884,19 @@ class MLArenaClient:
           `score_elo_before`, `score_elo_delta`, `metrics` (the env's
           per-run keys, plus the optional secondary `score2`),
           `info_message`, the agent's `action_time_*_sec` /
-          `agent_metric_*` columns and, when that agent is why the run
-          ended, `agent_error_type` with `agent_error_message`.
+          `agent_metric_*` columns, its footprint (`agent_busy_time_sec`:
+          `__init__` + every call; `agent_call_count`,
+          `agent_call_time_total_sec`, `agent_metric_cpu_time_total_sec`,
+          `agent_metric_ram_gib_sec`, `agent_metric_gpu_energy_j`,
+          `agent_metric_gpu_busy_sec`, `agent_metric_vram_max_bytes`,
+          `agent_energy_wh`, `agent_co2e_g`) and, when that agent is why the
+          run ended, `agent_error_type` with `agent_error_message`. A None
+          footprint value means the run was not metered (before the
+          platform measured it, an older runtime image, an unmetered
+          machine), never zero; the run's env side carries
+          `env_metric_ram_gib_sec`, `env_metric_gpu_energy_j`,
+          `env_metric_gpu_busy_sec`, `env_energy_wh`, `env_co2e_g` the same
+          way.
         - `challenge_context` — the `RunsContext` (`metrics`,
           `number_of_agents`, `render_delay_second`).
 
