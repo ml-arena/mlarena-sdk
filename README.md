@@ -17,15 +17,19 @@ Requires a platform at Alembic `d4a8c2f6e0b5` or later.
   `workspace()["challenges"]`, `workspace()["courses"]` and
   `course_progress(course_id)` instead. The `mlarena` command (`submit`,
   `challenge push`, `course push`) and the GitHub action call none of them.
-- New: `workspace(scope="mine")` — everything you author in one read
-  (`GET /api/author/workspace`, any key scope): your `challenges` (each with
+- New: `workspace()` — everything you author in one read
+  (`GET /api/author/workspace`; a `creator` or a `teacher` key, either one
+  reads the whole payload; a `user` key is refused, as it was by the two
+  lists the route replaces): your `challenges` (each with
   its reference, its counters and, for a draft, the `start_blockers`
   `start_challenge` would refuse with), your `courses` (enrollments, students
   active in the last 7 days, last activity, the course's challenges as
   references), the `attention` list (deploy failures per challenge, blocked
   drafts, a course ending within 7 days with students who handed in nothing,
   a challenge of your course that its owner stopped or ended) and your
-  `quotas`. `scope="all"` is an admin's: everyone's challenges and courses.
+  `quotas`. Everyone's challenges and courses (the route's `scope=all`) is an
+  admin's listing in the console: a signed-in admin session, never a key, so
+  the method takes no scope.
 - **Deprecated:** `creator_challenges()` and `teacher_courses()`. Their two
   list routes are gone from the platform; both methods now build their rows
   from `workspace()` and warn. `creator_challenges()` rows no longer carry
@@ -33,8 +37,10 @@ Requires a platform at Alembic `d4a8c2f6e0b5` or later.
   (see `creator_challenge(id)`); `teacher_courses()` rows no longer carry
   `description`, `has_cover`, `instructor_name` or `is_enrolled` (see
   `teacher_course(id)`). An admin gets their own objects from both, where
-  they got everyone's: use `workspace(scope="all")`. Both work with a key of
-  any scope.
+  they got everyone's (that listing is now the console's). Each works with
+  the key it needed before: `creator_challenges()` with a `creator` key,
+  `teacher_courses()` with a `teacher` key (and each with the other's: the
+  route takes either).
 - **Changed:** a course's "last active" (`last_active_at_ts` on
   `course_progress` rows, `list_courses`, and the workspace) moves on a
   student's deploy, chat message and exercise attempt on one of the course's
@@ -97,20 +103,30 @@ Requires a platform at Alembic `d4a8c2f6e0b5` or later.
   body of a refused `start_challenge`, `.body["start_blockers"]`) carry
   `fix_by` (`"author"` | `"admin"`), `can_fix` (whether you can), `place`
   (the part of the challenge workspace: `files`, `benchmark`, `chat_agent`,
-  `advanced`, `platform`, or None) and `platform_conflict` (a conflict with
+  `scoring_settings`, `advanced`, `platform`, or None; a seat-count blocker
+  names `scoring_settings`, where Agents per run is edited) and `platform_conflict` (a conflict with
   the platform's state rather than authoring to do). A file you got wrong is
   a blocker (`env_invalid` for an `env.py` that is not UTF-8 text,
   `config_not_applied` for a `challenge.toml` that is not); when the
   challenge's files cannot be read at all, `creator_challenge(id)` serves
   `start_blockers: None` with `start_blockers_error`, and `start_challenge`
-  raises with a 503 (nothing changed, try again).
+  raises with a 503 whose `.body["reason"]` is `"files_unreadable"` (nothing
+  changed, try again). `start_blockers_error` is also set, on the workspace
+  row and the detail, when computing the list failed for that challenge; the
+  rest of the workspace is served.
+- A runtime refusal read by an author (`update_settings`, a refused
+  `challenge.toml`, a `runtime` start blocker) names where to change the
+  setting by the workspace's tabs: "in Scoring" (agents per run) or "in
+  Settings › Advanced" (size, run timeout), no longer "in Config".
+- A challenge reference's `kernel_version` and `kind_label` are None when
+  the platform cannot tell the challenge's kind (a broken image reference),
+  where the listing failed before.
 - `workspace()`: `attention` lists at most 20 items of each kind and
   `attention_overflow` counts the rest; a `deploy_failed_submissions` item is
   raised for a `started` challenge only; a `draft_blocked` item only for a
   draft with a `platform_conflict` blocker, carrying those blockers (the row
   keeps the full `start_blockers`); a `course_challenge_closed` item only for
-  an entry students see. On `scope="all"`, `start_blockers` is None on a
-  draft you neither own nor assist. Course rows carry `enrollment_state` and
+  an entry students see. Course rows carry `enrollment_state` and
   `can_edit`.
 - `deploy_failed_submissions` and `deploy_failed_submissions_by_owner`
   (`challenge_overview`, `workspace`) are None on a kind that never deploys
@@ -1523,7 +1539,7 @@ print(c.leaderboard(cid).head())
 
 Everything the console's creator editor does, on the same routes:
 
-- `client.workspace()` — everything you author in one read: `challenges` (each `{challenge, counters, created_at_ts, start_blockers, start_blockers_error}`; `challenge` is the reference: `id`, `name`, `slug`, `status`, `end_date_ts`, `is_public`, `kernel_version`, `kind_label`, `user_id`, `owner_username`, `role`, `statistics`), `courses`, the `attention` list and your `quotas`; `scope="all"` for an admin. `client.creator_challenges()` is its deprecated flat form.
+- `client.workspace()` — everything you author in one read: `challenges` (each `{challenge, counters, created_at_ts, start_blockers, start_blockers_error}`; `challenge` is the reference: `id`, `name`, `slug`, `status`, `end_date_ts`, `is_public`, `kernel_version`, `kind_label`, `user_id`, `owner_username`, `role`, `statistics`), `courses`, the `attention` list and your `quotas`; needs a `creator` or a `teacher` key. `client.creator_challenges()` is its deprecated flat form.
 - `client.creator_challenge(challenge_id)` — one of your challenges with its three sibling rows: `configuration`, `evaluation` and `environment`, each under its own column names, plus `config` (the flat config document: `values`, `origin` per key, `file_lines`, `file_in_sync`).
 - The challenge config — one document, two editors. From simple to advanced:
   1. **env.py only**: every key starts at its kind default; change what you need with `update_settings` (or the console's Config tab).
@@ -1672,7 +1688,7 @@ print(student.my_progress(landing["id"]))                # content % + next less
 - `client.archive_course(id)` / `unarchive_course(id)` — the owner's: an archived course takes no enrollment, leaves the catalog and stops counting in the limit of 3 active courses; its students and staff keep it. `client.duplicate_course(id, name=None)` — a new course of yours with the settings and a copy of every module you may read (the challenges stay the same challenges; no enrollment, progress, dates or assistants; private, fresh join code); a module you may not read is linked instead and named in `linked_modules`. `client.delete_course(id)` — needs a course with no enrolled user; removes the course and the entries it made for itself (a private module of the owner with no lesson and at most one challenge, linked nowhere else), never another module or a challenge, and answers `{can_delete, enrollment_count, deleted_modules, kept_modules}`; `client.course_deletion(id)` serves that list before the fact.
 - `client.send_course_report(id)` — mails the course report now (two leaderboard CSVs per challenge) to the owner, the assistants (`report_to_assistants`) and `report_recipients`; one send per course every 10 minutes.
 - `client.export_course_grades_csv(course_id, dest_dir=".")` — the course-wide grade sheet, `course_progress` as a CSV (writes `grades_course_<id>.csv`).
-- `client.workspace()["courses"]` — the courses you own or assist on (archived ones included, `archived_at_ts`), each with its `role` (`owner` | `assistant`, `None` on a course an admin lists with `scope="all"`), `enrollment_count`, `active_enrollment_count_7d`, `last_active_at_ts` and its `challenges` (`client.teacher_courses()` is the deprecated form); `client.challenges_for_course()` — the challenges you may attach, each with `metric`, the ranking MetricSpec (the scale and direction of a `pass_threshold`), and `default_pass_threshold`, the bar an attach that names none is stored with (70 for an exercise set, `None` otherwise).
+- `client.workspace()["courses"]` — the courses you own or assist on (archived ones included, `archived_at_ts`), each with its `role` (`owner` | `assistant`), `enrollment_count`, `active_enrollment_count_7d`, `last_active_at_ts` and its `challenges` (`client.teacher_courses()` is the deprecated form); `client.challenges_for_course()` — the challenges you may attach, each with `metric`, the ranking MetricSpec (the scale and direction of a `pass_threshold`), and `default_pass_threshold`, the bar an attach that names none is stored with (70 for an exercise set, `None` otherwise).
 - `client.course_students(course_id, challenge_id=None)` — the roster (`user_id`, `student_number`, `student_email`, `enrolled_at_ts`, plus the team columns for the attached challenge you name — `None` without `challenge_id`); `client.remove_student(course_id, user_id)` deletes the enrollment only (account, submissions, teams and lesson progress are kept; the student can enroll again).
 - `client.course_assistants(course_id)`, `add_course_assistant(course_id, username)`, `remove_course_assistant(course_id, user_id)` — assistants (course owner or admin).
 - `client.export_course_csv(course_id, challenge_id, by_participant=False, dest_dir=".")` — one attached challenge's leaderboard CSV, as the console's Students tab downloads it (writes `leaderboard_course_<cid>_comp_<challenge_id>.csv`); `client.course_cover(course_id, dest_dir=".")` — a course's cover image (course payloads carry `has_cover`, not a path).

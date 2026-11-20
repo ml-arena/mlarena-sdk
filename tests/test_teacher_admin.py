@@ -130,26 +130,39 @@ def test_workspace_is_one_read_of_the_author_route():
                     "deploy_failed_submissions_by_owner": {
                         "participant": 1, "challenge": 0, "platform": 0, "unattributed": 0}}],
     )
-    c, rec = make_client(lambda *_: (200, body), scope="user")
-    out = c.workspace()
-    _expect((rec.last["method"], rec.last["path"]) == ("GET", "/author/workspace"), rec.last)
-    _expect(rec.last["params"] == {"scope": "mine"}, rec.last["params"])
-    _expect(len(rec.calls) == 1, rec.calls)
-    _expect(out == body, out)
+    for scope in ("creator", "teacher"):
+        c, rec = make_client(lambda *_: (200, body), scope=scope)
+        out = c.workspace()
+        _expect((rec.last["method"], rec.last["path"]) == ("GET", "/author/workspace"), rec.last)
+        # No query string: the scope is the server's default, `mine`
+        # (everyone's is an admin's session in the console, never a key).
+        _expect(not rec.last.get("params"), rec.last.get("params"))
+        _expect(len(rec.calls) == 1, rec.calls)
+        _expect(out == body, out)
 
-    c.workspace(scope="all")
-    _expect(rec.last["params"] == {"scope": "all"}, rec.last["params"])
 
-
-def test_workspace_scope_all_refused_is_a_permission_error():
-    body = {"error": "Only an admin may list everyone's challenges and courses"}
-    c, _rec = make_client(lambda *_: (403, body))
+def test_workspace_takes_no_scope():
+    """`scope="all"` is session-only on the platform: the SDK has no way to
+    ask for it, rather than a parameter every key is refused."""
+    c, rec = make_client(lambda *_: (200, _workspace()), scope="creator")
     try:
         c.workspace(scope="all")
-    except MLArenaError as e:
-        _expect("Only an admin" in str(e), str(e))
+    except TypeError:
+        pass
     else:
-        raise AssertionError("expected an error")
+        raise AssertionError("workspace() takes no scope")
+    _expect(rec.calls == [], rec.calls)
+
+
+def test_workspace_refuses_a_user_key_with_the_servers_sentence():
+    body = {"error": "Key scope 'user' cannot access this route: it takes a 'creator' or 'teacher' key"}
+    c, _rec = make_client(lambda *_: (403, body), scope="user")
+    try:
+        c.workspace()
+    except mlarena.PermissionDeniedError as e:
+        _expect("'creator' or 'teacher' key" in str(e), str(e))
+    else:
+        raise AssertionError("expected PermissionDeniedError")
 
 
 def test_teacher_courses_is_a_deprecated_composition_of_the_workspace():

@@ -705,26 +705,32 @@ class MLArenaClient:
             raise _failed(MLArenaError, "machines", resp)
         return resp.json()
 
-    def workspace(self, scope: str = "mine") -> dict:
+    def workspace(self) -> dict:
         """Everything you author, in one read: the Studio home's payload.
 
-        Mirrors `GET /api/author/workspace`. Any token scope; an account that
+        Mirrors `GET /api/author/workspace`. Needs a `creator` or a `teacher`
+        key, either one: the route replaced the list of each scope, and one
+        key reads the whole payload. A `user` key is refused
+        (`PermissionDeniedError`), as it was by both lists. An account that
         owns and assists nothing gets empty lists and its quotas. Returns
         `{"scope", "challenges", "courses", "attention", "attention_overflow",
-        "quotas"}`.
+        "quotas"}`; `scope` is `"mine"`: everyone's challenges and courses
+        (`scope=all`) is an admin's listing in the console, which no key
+        reads.
 
         `challenges`: the challenges you own or assist on, your own first,
         each group newest first. A row is `{"challenge", "counters",
         "created_at_ts", "start_blockers", "start_blockers_error"}`:
         `challenge` and `counters` as `challenge_overview` returns them
-        (`challenge["role"]` is `"owner"`, `"assistant"`, or None on a row an
-        admin gets through `scope="all"`; `challenge["can_edit"]` says
-        whether you may open its workspace). `start_blockers` is served for a
-        `draft` you own or assist on only: every reason `start_challenge`
-        would refuse now (the list `creator_challenge()` serves; `[]` =
-        ready), else None; `start_blockers_error` says why it is unknown when
-        the draft's files could not be read. On a draft of `scope="all"` you
-        neither own nor assist, both are None: the gate is not computed.
+        (`challenge["role"]` is `"owner"` or `"assistant"`;
+        `challenge["can_edit"]` says whether you may open its workspace;
+        `challenge["kernel_version"]` and `["kind_label"]` are None when the
+        platform cannot tell the challenge's kind). `start_blockers` is
+        served for a `draft`: every reason `start_challenge` would refuse
+        now (the list `creator_challenge()` serves; `[]` = ready), else
+        None; `start_blockers_error` says why it is unknown when the gate
+        could not answer for the draft (its files could not be read, it is
+        incomplete, or computing the list failed).
 
         `courses`: the courses you own or assist on, archived ones included.
         A row carries `id`, `name`, `code`, `slug`, `visibility`,
@@ -757,14 +763,8 @@ class MLArenaClient:
 
         `quotas`: `owned_challenge_count` (no limit on challenges yet),
         `max_courses_limit`, `active_course_count`, `can_create_course`.
-
-        `scope="all"` lists every challenge and every course: an admin's
-        filter (403 otherwise). Those extra rows carry `role` None, no
-        `start_blockers`, and raise no attention item.
         """
-        return self._course_call(
-            "GET", "/author/workspace", params={"scope": scope}, error_label="workspace",
-        )
+        return self._course_call("GET", "/author/workspace", error_label="workspace")
 
     def creator_challenges(self) -> list:
         """Deprecated: use `workspace()["challenges"]`.
@@ -777,7 +777,8 @@ class MLArenaClient:
         (`GET /api/creator_challenge/challenges`) is gone, and with it
         `description`, `has_configuration`, `has_environment` and
         `machine_name` (read them from `creator_challenge(id)`). An admin
-        gets their own challenges; everyone's is `workspace(scope="all")`.
+        gets their own challenges; everyone's is the console's. Works with
+        the `creator` key it always needed (a `teacher` key reads it too).
         """
         warnings.warn(
             "MLArenaClient.creator_challenges() is deprecated, "
@@ -827,8 +828,9 @@ class MLArenaClient:
         now, each `{code, message, fix_by, can_fix, place}`: `fix_by` is who
         fixes it (`"author"`: any editor of the challenge; `"admin"`),
         `can_fix` whether you can, and `place` the part of the challenge
-        workspace where (`files`, `benchmark`, `chat_agent` under Scoring;
-        `advanced`, `platform` under Settings; None when no part does).
+        workspace where (`files`, `benchmark`, `chat_agent`,
+        `scoring_settings` under Scoring; `advanced`, `platform` under
+        Settings; None when no part does).
         Codes: (`env_missing`, `configuration_missing`,
         `image_inconsistent`, `config_not_applied`, `required_file_missing`,
         `runtime` — the size, the run timeout, the agents per run or where
@@ -837,7 +839,8 @@ class MLArenaClient:
         `ground_truth_missing`, `benchmark_missing`, `benchmark_unscored`);
         `[]` means ready, None while started, and None with
         `start_blockers_error` set (a sentence) when the challenge's files
-        could not be read, so the checklist is unknown. A file you got wrong
+        could not be read, it is incomplete or computing the list failed, so
+        the checklist is unknown. A file you got wrong
         is a blocker, not such a fault: an `env.py` that is not UTF-8 text is
         `env_invalid`, a `challenge.toml` that is not is `config_not_applied`.
         A `runtime` message is worded
@@ -2000,9 +2003,10 @@ class MLArenaClient:
         `.body["details"]` lists every blocker's message, each worded for
         the caller as in `start_blockers`; `.body["start_blockers"]` is that
         list itself (`code`, `message`, `fix_by`, `can_fix`, `place`,
-        `platform_conflict`). A 503
-        means the challenge's files could not be read: nothing was changed,
-        try again.
+        `platform_conflict`). A 503 whose `.body["reason"]` is
+        `"files_unreadable"` means the challenge's files could not be read:
+        nothing was changed, try again (the `reason` tells it from a
+        maintenance 503, which is a `MaintenanceError`).
         """
         resp = self._request("PUT",
             self._url(
@@ -5411,7 +5415,8 @@ class MLArenaClient:
         list route this method called (`GET /api/teacher/courses`) is gone,
         and with it `description`, `has_cover`, `instructor_name` and
         `is_enrolled` (read them from `teacher_course(id)`). An admin gets
-        their own courses; everyone's is `workspace(scope="all")`.
+        their own courses; everyone's is the console's. Works with the
+        `teacher` key it always needed (a `creator` key reads it too).
         Returns a DataFrame if pandas is installed, else a list of dicts.
         """
         warnings.warn(
