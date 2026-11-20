@@ -909,8 +909,8 @@ def test_challenge_admin_and_creator_routes():
     assert rec.last["json"] == {"machine_id": 2}
     c.machines(kernel_version="file_v1")
     assert (rec.last["method"], rec.last["path"]) == ("GET", "/machines/")
-    c.creator_challenges()
-    assert rec.last["path"] == "/creator_challenge/challenges"
+    c.workspace()
+    assert rec.last["path"] == "/author/workspace"
     c.list_tags()
     assert rec.last["path"] == "/challenge_tags/tags"
 

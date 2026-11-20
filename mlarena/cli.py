@@ -443,7 +443,16 @@ def _course_plan_lines(report: dict) -> list[str]:
         lines.append(f"  module {slug}: not in the manifest, untouched")
     if report["source_revision"] is not None:
         lines.append(f"source: {_revision_label(report['source_revision'])}")
+    lines += [f"warning: {warning}" for warning in report["warnings"]]
     return lines
+
+
+def _annotate_warning(message: str) -> None:
+    """A `::warning::` workflow command: the message shows on the run page."""
+    if not _in_github_actions():
+        return
+    escaped = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+    print(f"::warning title=mlarena::{escaped}")
 
 
 def cmd_course_push(args) -> int:
@@ -458,6 +467,8 @@ def cmd_course_push(args) -> int:
     lines = _course_plan_lines(report)
     for line in lines:
         _out(line)
+    for warning in report["warnings"]:
+        _annotate_warning(warning)
     url = f"{_site_url(args)}{report['url']}"
     _out(url)
     _step_summary(f"### {heading}\n\n```\n" + "\n".join(lines)

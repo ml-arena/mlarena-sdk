@@ -628,6 +628,11 @@ COURSE_PLAN = {
     "unmanaged_modules": ["extra"],
     "source_revision": REVISION,
     "url": "/courses/intro-to-rl",
+    "warnings": [
+        "module 'foundations', lesson 'bandits': mlarena:challenge: challenge 9 is not "
+        "visible to the students of course 'Intro to RL' (it is private and the course "
+        "does not assign it), so they will not see this block",
+    ],
 }
 
 
@@ -1004,8 +1009,14 @@ def test_cli_course_push_prints_the_plan(fake, tmp_path, capsys, actions):
     assert "  module extra: not in the manifest, untouched" in out
     assert "source: alice/agent@0123456" in out
     assert "https://ml-arena.com/courses/intro-to-rl" in out
+    # The push's warnings: a line of the plan, an annotation on the run page
+    # and a line of the job summary.
+    warning = COURSE_PLAN["warnings"][0]
+    assert f"warning: {warning}" in out
+    assert f"::warning title=mlarena::{warning}" in out
     summary = actions.read_text()
     assert "### ML Arena course push" in summary
+    assert f"warning: {warning}" in summary
     assert "[Open the course](https://ml-arena.com/courses/intro-to-rl)" in summary
 
 

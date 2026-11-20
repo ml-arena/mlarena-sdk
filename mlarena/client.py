@@ -705,34 +705,90 @@ class MLArenaClient:
             raise _failed(MLArenaError, "machines", resp)
         return resp.json()
 
-    def creator_challenges(self) -> list:
-        """List challenges the caller owns or assists on (creator scope).
+    def workspace(self, scope: str = "mine") -> dict:
+        """Everything you author, in one read: the Studio home's payload.
 
-        Mirrors `GET /api/creator_challenge/challenges`
-        (`lifecycle.py`, `get_creator_challenges`). Unlike `challenges()`
-        this includes the caller's **hidden** (`is_public=False`) challenges
-        — useful for finding a challenge you created but did not make
-        public. Each item is the challenge's reference (see
-        `challenge_overview`): `id`, `name`, `slug`, `status` (`draft` |
-        `started` | `stopped` | `ended`), `end_date_ts`, `is_public`,
-        `kernel_version`, `kind_label`, `user_id`, `owner_username`, `role`
-        and `statistics`; plus `description`, `created_at_ts`,
-        `has_configuration`, `has_environment` and `machine_name`. `role` is
-        what you are to the challenge: `"owner"` or `"assistant"`; an admin
-        is served every challenge, with `role` None on those they neither own
-        nor assist. Your own come first, each group newest first.
+        Mirrors `GET /api/author/workspace`. Any token scope; an account that
+        owns and assists nothing gets empty lists and its quotas. Returns
+        `{"scope", "challenges", "courses", "attention", "attention_overflow",
+        "quotas"}`.
 
-        Requires a `creator`-scope token.
+        `challenges`: the challenges you own or assist on, your own first,
+        each group newest first. A row is `{"challenge", "counters",
+        "created_at_ts", "start_blockers", "start_blockers_error"}`:
+        `challenge` and `counters` as `challenge_overview` returns them
+        (`challenge["role"]` is `"owner"`, `"assistant"`, or None on a row an
+        admin gets through `scope="all"`; `challenge["can_edit"]` says
+        whether you may open its workspace). `start_blockers` is served for a
+        `draft` you own or assist on only: every reason `start_challenge`
+        would refuse now (the list `creator_challenge()` serves; `[]` =
+        ready), else None; `start_blockers_error` says why it is unknown when
+        the draft's files could not be read. On a draft of `scope="all"` you
+        neither own nor assist, both are None: the gate is not computed.
+
+        `courses`: the courses you own or assist on, archived ones included.
+        A row carries `id`, `name`, `code`, `slug`, `visibility`,
+        `start_date`, `end_date`, `archived_at_ts`, `enrollment_state`
+        (`open`, `archived` or `ended`: whether the course takes a new
+        enrollment now), `join_code`, `role`, `can_edit` (you may open its
+        workspace: true on every row), `owner_username`, `enrollment_count`,
+        `active_enrollment_count_7d`
+        (enrollments active in the last 7 days), `last_active_at_ts` (the
+        last time a student opened a lesson, deployed, sent a chat message or
+        attempted an exercise in the course), `challenges` (the course's
+        challenges as references, entries hidden from students included, in
+        the course's order), `hidden_challenge_ids`, and
+        `enrolled_without_submission`: enrolled users who handed in nothing
+        on the challenges students see, served while the course is not
+        archived and ends within 7 days, else None.
+
+        `attention`: what needs you, about the rows you have a relation to;
+        each item has a `kind`: `deploy_failed_submissions` (a `started`
+        challenge with submissions whose deploy failed: the count and its
+        split by owner), `draft_blocked` (a draft with `start_blockers`),
+        `draft_unreadable`, `course_ending` (a course ending within 7 days
+        with `enrolled_without_submission` > 0), `course_challenge_closed`
+        (a challenge students see in a course of yours that is still
+        running, not your own, that is `stopped` or `ended`). Items name
+        their object by id (`challenge_id`, `course_id`) and name. At most
+        20 items of each kind are listed, in the rows' order;
+        `attention_overflow` is `{kind: how many more}` (0 when all are
+        there). The rows carry every fact.
+
+        `quotas`: `owned_challenge_count` (no limit on challenges yet),
+        `max_courses_limit`, `active_course_count`, `can_create_course`.
+
+        `scope="all"` lists every challenge and every course: an admin's
+        filter (403 otherwise). Those extra rows carry `role` None, no
+        `start_blockers`, and raise no attention item.
         """
-        resp = self._request("GET",
-            self._url("/creator_challenge/challenges"),
-            headers=self._headers(),
-            timeout=30,
+        return self._course_call(
+            "GET", "/author/workspace", params={"scope": scope}, error_label="workspace",
         )
-        self._handle_response(resp)
-        if resp.status_code != 200:
-            raise _failed(MLArenaError, "creator_challenges", resp)
-        return resp.json()
+
+    def creator_challenges(self) -> list:
+        """Deprecated: use `workspace()["challenges"]`.
+
+        The challenges you own or assist on, built from `workspace()`: each
+        item is the row's challenge reference (`id`, `name`, `slug`,
+        `status`, `end_date_ts`, `is_public`, `kernel_version`, `kind_label`,
+        `user_id`, `owner_username`, `role`, `can_edit`, `statistics`) plus
+        `created_at_ts`. The list route this method called
+        (`GET /api/creator_challenge/challenges`) is gone, and with it
+        `description`, `has_configuration`, `has_environment` and
+        `machine_name` (read them from `creator_challenge(id)`). An admin
+        gets their own challenges; everyone's is `workspace(scope="all")`.
+        """
+        warnings.warn(
+            "MLArenaClient.creator_challenges() is deprecated, "
+            "use .workspace()[\"challenges\"] instead",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return [
+            {**row["challenge"], "created_at_ts": row["created_at_ts"]}
+            for row in self.workspace()["challenges"]
+        ]
 
     def creator_challenge(self, challenge_id: int) -> dict:
         """The challenge as its editor sees it (creator scope).
@@ -753,8 +809,9 @@ class MLArenaClient:
         vm_health_checked_at_ts}`), `role` — what you are to the challenge:
         `"owner"`, `"assistant"`, or None for an admin who is neither —,
         `has_owner_rights` (whether you may do what only its owner may, the
-        assistant roster: the owner and an admin) and `owner_username`, whose
-        challenge it is.
+        assistant roster: the owner and an admin), `owner_username`, whose
+        challenge it is, and `kind_label`, the kind's name as every challenge
+        reference carries it.
 
         `config` is the challenge config as one flat document (the platform's
         modelmanager/PROCESS.md "Challenge config"): `values` — every config key the kind
@@ -767,13 +824,23 @@ class MLArenaClient:
         applied). `config_fields()` describes every key.
 
         `start_blockers` lists every reason `start_challenge` would refuse
-        now, each `{code, message}` (`env_missing`, `configuration_missing`,
+        now, each `{code, message, fix_by, can_fix, place}`: `fix_by` is who
+        fixes it (`"author"`: any editor of the challenge; `"admin"`),
+        `can_fix` whether you can, and `place` the part of the challenge
+        workspace where (`files`, `benchmark`, `chat_agent` under Scoring;
+        `advanced`, `platform` under Settings; None when no part does).
+        Codes: (`env_missing`, `configuration_missing`,
         `image_inconsistent`, `config_not_applied`, `required_file_missing`,
         `runtime` — the size, the run timeout, the agents per run or where
         the challenge is placed —,
         `env_invalid`, `chat_missing`, `llm_not_configured`,
         `ground_truth_missing`, `benchmark_missing`, `benchmark_unscored`);
-        `[]` means ready, None while started. A `runtime` message is worded
+        `[]` means ready, None while started, and None with
+        `start_blockers_error` set (a sentence) when the challenge's files
+        could not be read, so the checklist is unknown. A file you got wrong
+        is a blocker, not such a fault: an `env.py` that is not UTF-8 text is
+        `env_invalid`, a `challenge.toml` that is not is `config_not_applied`.
+        A `runtime` message is worded
         for the caller: what to change (or "ask an admin") for a creator,
         the machine, its limits and the rule that failed for an admin key. `start_recommendations` lists,
         the same way, what participants would miss if it started now — advice
@@ -803,7 +870,7 @@ class MLArenaClient:
         registry the console's Config tab is generated from. Each entry:
         `key` (the column, `update_settings` keyword and `challenge.toml`
         key), `group` (`evaluation` | `participation` | `data_feed` |
-        `resources` | `chat`), `level` (`basic` | `advanced`), `writer`
+        `resources` | `chat` | `exercise` | `partner`), `writer`
         (`creator` | `admin`), `capability` (the `available_kinds()`
         capability a kind needs for it, None = every kind),
         `fixed_capability` (the capability of the kinds that hold the key
@@ -1924,10 +1991,18 @@ class MLArenaClient:
         count suits the kind and the board). These are the checks
         `creator_challenge(id)["start_blockers"]` lists ahead of time. A
         refusal bubbles up as MLArenaError whose message is the first
-        blocker's (409 for a conflict with the platform — image
-        consistency, runtime —, 400 for missing authoring) and whose
+        blocker's (409 when that blocker is a `platform_conflict` — image
+        consistency, or a runtime rule measured against the machine: the
+        machine, its queue, its GPUs, a valid size or timeout above its
+        ceiling —, 400 for missing authoring, which includes a size that is
+        invalid on any machine and a seat count the challenge's own settings
+        refuse) and whose
         `.body["details"]` lists every blocker's message, each worded for
-        the caller as in `start_blockers`.
+        the caller as in `start_blockers`; `.body["start_blockers"]` is that
+        list itself (`code`, `message`, `fix_by`, `can_fix`, `place`,
+        `platform_conflict`). A 503
+        means the challenge's files could not be read: nothing was changed,
+        try again.
         """
         resp = self._request("PUT",
             self._url(
@@ -2208,6 +2283,11 @@ class MLArenaClient:
         [MetricSpec, ...]}` — `metrics` is the challenge's declaration, and
         `rank` follows its ranking spec's `order`; each row carries
         `submission_id`, `submission_name`, `user_id`, `username`,
+        `team_id` and `team_name` (the owner's team on the challenge, None
+        for a solo participant), `failure_owner` and `error_type` (the cause
+        of a `deploy_failed` row, the pair `challenge_deploy_failures()`
+        groups by: filter the rows on them to list a group; both None on a
+        row that is not `deploy_failed` and on the benchmark),
         `created_at_ts`, `last_end_run_ts`, `score` (the ranking value — the
         rating on a rated board), `metrics` (`{key: value}` for every
         declared key), `number_of_runs`, `rank`, `restart_allowed` and the
@@ -2221,7 +2301,7 @@ class MLArenaClient:
         owner is enrolled in it: the population of `leaderboard(course_id=…)`).
         It must be a course holding the challenge that you manage (you own
         or assist it, or you are an admin: the rows of `challenge_courses()`
-        with an `enrollment_count`); any other id raises (400). `rank` stays
+        with `can_edit` true); any other id raises (400). `rank` stays
         the place on the whole board.
         """
         return self._creator_get(
@@ -2239,7 +2319,8 @@ class MLArenaClient:
         that names a challenge carries: `id`, `name`, `slug`, `status`,
         `end_date_ts`, `is_public`, `kernel_version`, `kind_label`,
         `user_id`, `owner_username`, `role` (yours on it: `"owner"`,
-        `"assistant"` or None) and `statistics` (`unique_participants`: teams
+        `"assistant"` or None), `can_edit` (whether you may open its
+        workspace: its owner, an assistant, or an admin) and `statistics` (`unique_participants`: teams
         and solo users with an `active` submission; `running_submissions`).
 
         `counters` (a submission here is neither deleted nor the benchmark):
@@ -2250,7 +2331,8 @@ class MLArenaClient:
         (`[{"day", "submissions_created"}]`, 7 entries);
         `deploy_failed_submissions`, the submissions whose status is
         `deploy_failed` now, and `deploy_failed_submissions_by_owner`
-        (`participant`, `challenge`, `platform`, `unattributed`);
+        (`participant`, `challenge`, `platform`, `unattributed`), both None
+        on a kind that never deploys (chat, exercises: not "zero failures");
         `last_submission_created_at_ts`; `course_count`, how many courses
         hold the challenge, archived ones included (see `challenge_courses`).
         """
@@ -2264,7 +2346,9 @@ class MLArenaClient:
         largest group first. Listed: the submissions whose status is
         `deploy_failed` now (its latest deploy failed and it was not deployed
         again); the benchmark and deleted submissions are left out, and so is
-        an `active` submission whose recent runs fail.
+        an `active` submission whose recent runs fail. On a kind that never
+        deploys (chat, exercises) the count is None and `groups` is empty:
+        the notion does not apply there.
 
         Each group: `failure_owner` (who the latest deploy's verdict blames:
         `participant`, `challenge`, `platform`; None when it carries no
@@ -2282,13 +2366,18 @@ class MLArenaClient:
 
         Mirrors `GET /api/creator_challenge/challenge/{id}/courses`
         (`follow.py`). Returns `{"courses": [...], "other_course_count": N}`.
-        `courses` are the ones you may see: a course you own or assist on
+        `courses` are the ones you may see, those you can open (`can_edit`)
+        first, then by name: a course you own or assist on
         (an admin: every course), and a course you are enrolled in, or a
         public course that is not archived, where students see the
         challenge. Each carries `id`, `name`, `code`, `slug`, `visibility`,
-        `archived_at_ts` (None = active), `role` (what you are to the
-        course: `"owner"`, `"assistant"` or None), `enrollment_count` (None
-        unless you manage the course) and `is_published` (whether students
+        `archived_at_ts` (None = active), `owner_username` (the course
+        owner's account name on a course you manage or are enrolled in, None
+        on any other: a public course you only read), `role` (what you
+        are to the course: `"owner"`, `"assistant"` or None), `can_edit`
+        (whether you may open the course's workspace: its owner, an
+        assistant, or an admin), `enrollment_count` (None unless `can_edit`)
+        and `is_published` (whether students
         see the challenge there). Every other course holding the challenge —
         another teacher's private, unlisted or archived course — is only
         counted in `other_course_count`; archived courses count like the
@@ -2367,8 +2456,11 @@ class MLArenaClient:
 
         Mirrors `GET /api/creator_challenge/challenge/{id}/assistants`
         (`assistants.py`). Each entry carries `user_id`, `username` and
-        `created_at_ts`. An assistant has the creator's editing rights on this
-        challenge; only the owner may change the list.
+        `created_at_ts` (no email). An assistant has the creator's editing
+        rights on this challenge. Every editor of the challenge (its owner,
+        an assistant, an admin) may read the list; only the owner (or an
+        admin) may change it. The owner is not an entry:
+        `creator_challenge(id)["owner_username"]` names them.
         """
         return self._creator_get(
             challenge_id, "/assistants", "challenge_assistants"
@@ -4562,7 +4654,8 @@ class MLArenaClient:
         lookup the console's EnrollPage makes. Returns
         `{course, challenge_names, lesson_count, already_enrolled,
         ask_student_identity, has_student_info}`; the course sits under
-        `course` with its own field names (`id`, `name`, `code`, `slug`, ...).
+        `course` with its own field names (`id`, `name`, `code`, `slug`, ...,
+        `enrollment_state`).
         `ask_student_identity` is the course's setting: when it is False,
         `enroll_in_course` needs no student number or email.
         `already_enrolled` and `has_student_info` stay false for an anonymous
@@ -4610,7 +4703,10 @@ class MLArenaClient:
 
         Mirrors `GET /api/academic_courses/`. With `show_all=True` returns every
         course; with `challenge_id` returns courses attached to that
-        challenge. Each row carries `is_enrolled` for the caller. A private or
+        challenge. Each row carries `is_enrolled` for the caller and
+        `enrollment_state`: `open`, or why the course takes no new enrollment
+        (`archived`, `ended`: its end date is past), decided by the server
+        with the rule `enroll_in_course` refuses by. A private or
         unlisted course is listed only to its members and managers, and
         `join_code` is set only on the courses the caller belongs to or manages
         (None elsewhere). An enrolled row also carries the caller's
@@ -4659,7 +4755,8 @@ class MLArenaClient:
         `is_enrolled`, `can_manage`, and a `progress` summary; managers
         (teacher/TA/admin) additionally see unpublished draft lessons.
         `has_cover` says whether there is a cover image — fetch it with
-        `course_cover(landing["id"])`.
+        `course_cover(landing["id"])`. `enrollment_state` (`open` |
+        `archived` | `ended`) says whether the course takes a new enrollment.
         """
         return self._course_call(
             "GET", f"/academic_courses/{slug}", error_label="course",
@@ -5271,8 +5368,8 @@ class MLArenaClient:
 
         A cell also carries `status` (`not_submitted` | `failed` | `scoring` |
         `scored`: nothing handed in, a failed upload or deploy, a deploy or a
-        first run on its way, a scored line) and `team_name` (the student's
-        team on that challenge, else None). A student row carries
+        first run on its way, a scored line), `team_id` and `team_name` (the
+        student's team on that challenge, else None). A student row carries
         `student_email`, `enrolled_at_ts` and `passed_count` (pass bars
         cleared, out of the payload's `pass_bar_count`).
         `export_course_grades_csv` is this payload as a CSV.
@@ -5305,19 +5402,28 @@ class MLArenaClient:
     # ---- Course administration: roster, assistants, exports ----------------
 
     def teacher_courses(self):
-        """The courses you teach or assist on (admins see them all).
+        """Deprecated: use `workspace()["courses"]`.
 
-        Mirrors `GET /api/teacher/courses` — the console's course-authoring
-        list. Each row is a course plus `role` (what you are to it: `owner`,
-        `assistant`, or None on a course an admin neither owns nor assists),
-        `archived_at_ts`
-        (None for an active course; archived courses are listed too) and
-        `has_cover` (the image itself comes from `course_cover(id)`).
+        The courses you own or assist on (archived ones included), built
+        from `workspace()`: each row keeps the columns the old list had that
+        the workspace serves (`id`, `name`, `code`, `slug`, `visibility`,
+        `join_code`, `start_date`, `end_date`, `archived_at_ts`, `role`). The
+        list route this method called (`GET /api/teacher/courses`) is gone,
+        and with it `description`, `has_cover`, `instructor_name` and
+        `is_enrolled` (read them from `teacher_course(id)`). An admin gets
+        their own courses; everyone's is `workspace(scope="all")`.
         Returns a DataFrame if pandas is installed, else a list of dicts.
         """
-        return _to_dataframe(self._course_call(
-            "GET", "/teacher/courses", error_label="teacher_courses",
-        ))
+        warnings.warn(
+            "MLArenaClient.teacher_courses() is deprecated, "
+            "use .workspace()[\"courses\"] instead",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return _to_dataframe([
+            {key: row[key] for key in _TEACHER_COURSE_KEYS}
+            for row in self.workspace()["courses"]
+        ])
 
     def teacher_course(self, course_id: int) -> dict:
         """One course you own or assist on, as its workspace reads it.
@@ -5325,15 +5431,21 @@ class MLArenaClient:
         Mirrors `GET /api/teacher/course/{id}`. The course row (`id`, `name`,
         `code`, `slug`, `description`, `visibility`, `has_cover`,
         `instructor_name`, `join_code`, `start_date`, `end_date`,
-        `archived_at_ts`, `is_enrolled`) plus `role` (what you are to it:
-        `owner`, `assistant`, or None for an admin who is neither),
+        `archived_at_ts`, `enrollment_state`, `is_enrolled`) plus `role`
+        (what you are to it: `owner`, `assistant`, or None for an admin who
+        is neither), `can_edit` (true: you may open its workspace),
         `has_owner_rights` (whether you may do what only its owner may: the
         assistant roster, archive, duplicate, delete — the owner and an
         admin), `owner_username`, `created_at_ts`, the settings
         (`ask_student_identity`, `report_recipients`, `report_to_assistants`,
         `report_last_sent_at_ts`) and the counts `enrollment_count`,
         `assistant_count`, `module_count`, `challenge_count` (entries hidden
-        from students included). Owner, assistant or admin; 403 otherwise.
+        from students included). It also carries what `workspace()` follows
+        about the course, under the same names and from the same computation:
+        `active_enrollment_count_7d`, `last_active_at_ts` and
+        `enrolled_without_submission` (served while the course is not
+        archived, ends within 7 days and assigns a challenge, else None).
+        Owner, assistant or admin; 403 otherwise.
         """
         return self._course_call(
             "GET", f"/teacher/course/{course_id}", error_label="teacher_course",
@@ -5469,23 +5581,55 @@ class MLArenaClient:
 
     def course_students(self, course_id: int,
                         challenge_id: int | None = None) -> dict:
-        """The course roster, with team membership for one attached challenge.
+        """Deprecated: use `course_progress(course_id)`.
 
-        Mirrors `GET /api/teacher/students/{course_id}`. Enrollment is
-        course-level, so the student list is the same whichever challenge you
-        pass; only `team_id`/`team_name` change. Without `challenge_id` no
-        challenge is picked: `selected_challenge_id` and every `team_*` are
-        None (the route no longer defaults to the course's first challenge).
-        A challenge not attached to the course is a 400. Returns
-        `{challenges, selected_challenge_id, students}`, where each student
-        carries `user_id`, `student_number`, `student_email` and
-        `enrolled_at_ts`.
+        The course roster, with team membership for one attached challenge,
+        built from `course_progress()` in the shape this method always
+        returned: `{challenges, selected_challenge_id, students}`. The route
+        it called (`GET /api/teacher/students/{course_id}`) is gone: the
+        grade sheet is the roster. `challenges` are the course's challenge
+        references; each student carries `user_id`, `username`,
+        `student_number`, `student_email`, `enrolled_at_ts`, and `team_id` /
+        `team_name` on the challenge named by `challenge_id` (None without
+        one; a challenge not attached to the course raises). Students are
+        ordered by enrollment date.
         """
-        params = {"challenge_id": challenge_id} if challenge_id is not None else None
-        return self._course_call(
-            "GET", f"/teacher/students/{course_id}", params=params,
-            error_label="course_students",
+        warnings.warn(
+            "MLArenaClient.course_students() is deprecated, "
+            "use .course_progress() instead",
+            DeprecationWarning,
+            stacklevel=2,
         )
+        progress = self.course_progress(course_id)
+        challenges = [column["challenge"] for column in progress["challenges"]]
+        index = None
+        if challenge_id is not None:
+            ids = [challenge["id"] for challenge in challenges]
+            if challenge_id not in ids:
+                raise MLArenaError(
+                    "course_students failed: challenge_id is not attached to this course")
+            index = ids.index(challenge_id)
+
+        def team(student: dict, key: str):
+            return None if index is None else student["challenges"][index][key]
+
+        return {
+            "challenges": challenges,
+            "selected_challenge_id": challenge_id,
+            "students": [
+                {
+                    "user_id": student["user_id"],
+                    "username": student["username"],
+                    "student_number": student["student_number"],
+                    "student_email": student["student_email"],
+                    "team_id": team(student, "team_id"),
+                    "team_name": team(student, "team_name"),
+                    "enrolled_at_ts": student["enrolled_at_ts"],
+                }
+                for student in sorted(
+                    progress["students"], key=lambda student: student["enrolled_at_ts"] or "")
+            ],
+        }
 
     def remove_student(self, course_id: int, user_id: int) -> dict:
         """Remove a student's enrollment from a course.
@@ -5503,10 +5647,13 @@ class MLArenaClient:
         )
 
     def course_assistants(self, course_id: int):
-        """The assistants on a course (course owner or admin).
+        """The assistants on a course.
 
         Mirrors `GET /api/teacher/course/{id}/assistants`. Each row carries
-        `user_id`, `username` and `created_at_ts`. Returns a DataFrame if
+        `user_id`, `username` and `created_at_ts` (no email). Everyone who
+        manages the course (its owner, an assistant, an admin) may read the
+        list; only the owner (or an admin) may change it. The owner is not a
+        row: `teacher_course(id)["owner_username"]` names them. Returns a DataFrame if
         pandas is installed, else a list of dicts.
         """
         return _to_dataframe(self._course_call(
@@ -5690,7 +5837,11 @@ class MLArenaClient:
         `action`), `modules` (each `slug`, `id`, `action` — `created` |
         `updated` | `unchanged` | `adopted` —, `renamed_from`, `lessons`,
         `orphaned_lessons`, `pruned_lessons`, `assets`), `unmanaged_modules`,
-        `source_revision` and the course's `url`. Manifests written before
+        `source_revision`, the course's `url`, and `warnings`: one sentence
+        per `mlarena:` block whose challenge the students of this course will
+        not see (it is private and the course, as the push leaves it, does
+        not assign it), naming its module and lesson; `[]` when every block
+        is visible. A push with warnings succeeds. Manifests written before
         SDK 2.0 (`competitions:` / `competition_id:`) are still read by the
         server.
         """
@@ -6222,6 +6373,13 @@ _REPLAY_SUFFIXES = {
     "video_mp4": ".mp4",
     "image_png": ".png",
 }
+
+# `teacher_courses()` (deprecated): the columns of the removed list route
+# that a `workspace()` course row carries.
+_TEACHER_COURSE_KEYS = (
+    "id", "name", "code", "slug", "visibility", "join_code",
+    "start_date", "end_date", "archived_at_ts", "role",
+)
 
 _RENAMED_METHODS = {
     "competitions": "challenges",

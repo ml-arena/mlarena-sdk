@@ -14,6 +14,8 @@ import tempfile
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+import warnings
+
 import mlarena
 from mlarena.exceptions import MLArenaError
 
@@ -78,16 +80,120 @@ def _expect(cond, msg):
 # --------------------------------------------------------------------------- #
 
 
-def test_teacher_courses_reads_role_per_row():
-    rows = [{"id": 1, "name": "RL", "role": "owner", "archived_at_ts": None},
-            {"id": 2, "name": "NLP", "role": "assistant",
-             "archived_at_ts": "2026-07-01T00:00:00Z"}]
-    c, rec = make_client(lambda *_: (200, rows))
-    out = c.teacher_courses()
-    _expect(rec.last["method"] == "GET", rec.last["method"])
-    _expect(rec.last["path"] == "/teacher/courses", rec.last["path"])
-    roles = list(out["role"]) if hasattr(out, "columns") else [r["role"] for r in out]
-    _expect(roles == ["owner", "assistant"], roles)
+def _workspace(challenges=(), courses=(), attention=()):
+    """A `GET /author/workspace` body."""
+    return {
+        "scope": "mine", "challenges": list(challenges), "courses": list(courses),
+        "attention": list(attention),
+        "quotas": {"owned_challenge_count": len(challenges), "max_courses_limit": 3,
+                   "active_course_count": len(courses), "can_create_course": True},
+    }
+
+
+def _workspace_course(course_id, name, role, **over):
+    row = {
+        "id": course_id, "name": name, "code": None, "slug": name.lower(),
+        "visibility": "private", "start_date": None, "end_date": None,
+        "archived_at_ts": None, "join_code": f"JOIN{course_id:04d}", "role": role,
+        "owner_username": "ada", "enrollment_count": 12, "active_enrollment_count_7d": 4,
+        "last_active_at_ts": "2026-11-20T09:00:00Z", "challenges": [],
+        "hidden_challenge_ids": [], "enrolled_without_submission": None,
+    }
+    row.update(over)
+    return row
+
+
+def _workspace_challenge(challenge_id, name, role="owner", status="started"):
+    return {
+        "challenge": {
+            "id": challenge_id, "name": name, "slug": name.lower(), "status": status,
+            "end_date_ts": None, "is_public": False, "kernel_version": "file_v1",
+            "kind_label": "File challenge", "user_id": 7, "owner_username": "ada",
+            "role": role, "statistics": {"running_submissions": 2, "unique_participants": 2},
+        },
+        "counters": {"team_count": 0, "submissions_created_7d": 3, "submissions_created_daily": [],
+                     "deploy_failed_submissions": 1,
+                     "deploy_failed_submissions_by_owner": {
+                         "participant": 1, "challenge": 0, "platform": 0, "unattributed": 0},
+                     "last_submission_created_at_ts": None, "course_count": 1},
+        "created_at_ts": "2026-11-01T10:00:00Z",
+        "start_blockers": None, "start_blockers_error": None,
+    }
+
+
+def test_workspace_is_one_read_of_the_author_route():
+    body = _workspace(
+        challenges=[_workspace_challenge(4, "Churn")],
+        courses=[_workspace_course(1, "RL", "owner")],
+        attention=[{"kind": "deploy_failed_submissions", "challenge_id": 4,
+                    "challenge_name": "Churn", "deploy_failed_submissions": 1,
+                    "deploy_failed_submissions_by_owner": {
+                        "participant": 1, "challenge": 0, "platform": 0, "unattributed": 0}}],
+    )
+    c, rec = make_client(lambda *_: (200, body), scope="user")
+    out = c.workspace()
+    _expect((rec.last["method"], rec.last["path"]) == ("GET", "/author/workspace"), rec.last)
+    _expect(rec.last["params"] == {"scope": "mine"}, rec.last["params"])
+    _expect(len(rec.calls) == 1, rec.calls)
+    _expect(out == body, out)
+
+    c.workspace(scope="all")
+    _expect(rec.last["params"] == {"scope": "all"}, rec.last["params"])
+
+
+def test_workspace_scope_all_refused_is_a_permission_error():
+    body = {"error": "Only an admin may list everyone's challenges and courses"}
+    c, _rec = make_client(lambda *_: (403, body))
+    try:
+        c.workspace(scope="all")
+    except MLArenaError as e:
+        _expect("Only an admin" in str(e), str(e))
+    else:
+        raise AssertionError("expected an error")
+
+
+def test_teacher_courses_is_a_deprecated_composition_of_the_workspace():
+    body = _workspace(courses=[
+        _workspace_course(1, "RL", "owner"),
+        _workspace_course(2, "NLP", "assistant", archived_at_ts="2026-07-01T00:00:00Z"),
+    ])
+    c, rec = make_client(lambda *_: (200, body))
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        out = c.teacher_courses()
+    _expect([w.category for w in caught] == [DeprecationWarning], caught)
+    _expect("workspace()" in str(caught[0].message), caught[0].message)
+    _expect((rec.last["method"], rec.last["path"]) == ("GET", "/author/workspace"), rec.last)
+    rows = out.to_dict("records") if hasattr(out, "columns") else out
+    # The old list's columns that the workspace serves, nothing else.
+    _expect(set(rows[0]) == {"id", "name", "code", "slug", "visibility", "join_code",
+                             "start_date", "end_date", "archived_at_ts", "role"}, rows[0])
+    _expect([r["role"] for r in rows] == ["owner", "assistant"], rows)
+    _expect(rows[1]["archived_at_ts"] == "2026-07-01T00:00:00Z", rows[1])
+    _expect(rows[0]["join_code"] == "JOIN0001", rows[0])
+
+
+def test_creator_challenges_is_a_deprecated_composition_of_the_workspace():
+    body = _workspace(challenges=[
+        _workspace_challenge(4, "Churn"), _workspace_challenge(9, "Kart", role="assistant"),
+    ])
+    c, rec = make_client(lambda *_: (200, body), scope="creator")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        out = c.creator_challenges()
+    _expect([w.category for w in caught] == [DeprecationWarning], caught)
+    _expect((rec.last["method"], rec.last["path"]) == ("GET", "/author/workspace"), rec.last)
+    _expect([(r["id"], r["name"], r["role"], r["status"]) for r in out] == [
+        (4, "Churn", "owner", "started"), (9, "Kart", "assistant", "started")], out)
+    # The reference, flat, plus the row's creation time: the old list's shape
+    # without the columns the route no longer serves.
+    _expect(set(out[0]) == set(body["challenges"][0]["challenge"]) | {"created_at_ts"}, out[0])
+    _expect(out[0]["created_at_ts"] == "2026-11-01T10:00:00Z", out[0])
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        c.creator_competitions()
+    _expect(all(w.category is DeprecationWarning for w in caught) and caught, caught)
 
 
 # --------------------------------------------------------------------------- #
@@ -222,33 +328,77 @@ def test_challenges_for_course_lists_the_picker():
 # --------------------------------------------------------------------------- #
 
 
-def test_course_students_scopes_to_a_challenge():
-    payload = {
-        "challenges": [{"id": 42, "name": "CartPole-v1"}],
-        "selected_challenge_id": 42,
-        "students": [{
-            "user_id": 7, "username": "ana", "student_number": "S1",
-            "student_email": "ana@uni.edu",
-            "team_id": None, "team_name": None,
-            "enrolled_at_ts": "2026-02-01T09:00:00Z",
-        }],
+def _progress_payload():
+    def cell(team_id, team_name):
+        return {"challenge": {"id": 42}, "team_id": team_id, "team_name": team_name}
+
+    def other():
+        return {"challenge": {"id": 43}, "team_id": None, "team_name": None}
+
+    def student(user_id, username, enrolled, team):
+        return {"user_id": user_id, "username": username, "student_number": f"S{user_id}",
+                "student_email": f"{username}@uni.edu", "enrolled_at_ts": enrolled,
+                "last_active_at_ts": None, "passed_count": 0,
+                "challenges": [other(), cell(*team)]}
+
+    return {
+        "challenges": [
+            {"challenge": {"id": 43, "name": "Maze"}, "is_published": True},
+            {"challenge": {"id": 42, "name": "CartPole-v1"}, "is_published": True},
+        ],
+        "lesson_total": 0, "pass_bar_count": 0,
+        "students": [
+            student(8, "bob", "2026-02-02T09:00:00Z", (3, "Reds")),
+            student(7, "ana", "2026-02-01T09:00:00Z", (None, None)),
+        ],
     }
-    c, rec = make_client(lambda *_: (200, payload))
-    out = c.course_students(5, challenge_id=42)
+
+
+def _deprecated(call):
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        out = call()
+    _expect(any(issubclass(w.category, DeprecationWarning)
+                and "course_progress" in str(w.message) for w in caught), caught)
+    return out
+
+
+def test_course_students_is_built_from_the_progress_route_in_its_old_shape():
+    """The roster route is gone: `course_students` composes `course_progress`
+    and warns. Same keys, students by enrollment date, the team of the
+    challenge named."""
+    c, rec = make_client(lambda *_: (200, _progress_payload()))
+    out = _deprecated(lambda: c.course_students(5, challenge_id=42))
     _expect(rec.last["method"] == "GET", rec.last["method"])
-    _expect(rec.last["path"] == "/teacher/students/5", rec.last["path"])
-    _expect(rec.last["params"] == {"challenge_id": 42}, rec.last["params"])
-    student = out["students"][0]
-    # The enrollment row is keyed by its FK, and dated by when they enrolled.
-    _expect(student["user_id"] == 7, student)
-    _expect(student["enrolled_at_ts"].endswith("Z"), student)
-    _expect("id" not in student and "created_at" not in student, student)
+    _expect(rec.last["path"] == "/teacher/course/5/progress", rec.last["path"])
+    _expect(sorted(out) == ["challenges", "selected_challenge_id", "students"], out)
+    _expect(out["selected_challenge_id"] == 42, out)
+    _expect([ch["id"] for ch in out["challenges"]] == [43, 42], out["challenges"])
+    _expect(out["students"] == [
+        {"user_id": 7, "username": "ana", "student_number": "S7",
+         "student_email": "ana@uni.edu", "team_id": None, "team_name": None,
+         "enrolled_at_ts": "2026-02-01T09:00:00Z"},
+        {"user_id": 8, "username": "bob", "student_number": "S8",
+         "student_email": "bob@uni.edu", "team_id": 3, "team_name": "Reds",
+         "enrolled_at_ts": "2026-02-02T09:00:00Z"},
+    ], out["students"])
 
 
-def test_course_students_without_a_challenge_sends_no_params():
-    c, rec = make_client(lambda *_: (200, {"students": []}))
-    c.course_students(5)
-    _expect(rec.last["params"] is None, rec.last["params"])
+def test_course_students_without_a_challenge_names_no_team():
+    c, _rec = make_client(lambda *_: (200, _progress_payload()))
+    out = _deprecated(lambda: c.course_students(5))
+    _expect(out["selected_challenge_id"] is None, out)
+    _expect(all(s["team_id"] is None and s["team_name"] is None for s in out["students"]), out)
+
+
+def test_course_students_refuses_a_challenge_the_course_does_not_hold():
+    c, _rec = make_client(lambda *_: (200, _progress_payload()))
+    try:
+        _deprecated(lambda: c.course_students(5, challenge_id=999))
+    except MLArenaError as err:
+        _expect("not attached to this course" in str(err), err)
+    else:
+        raise AssertionError("expected MLArenaError")
 
 
 def test_remove_student_deletes_the_enrollment():
@@ -400,7 +550,7 @@ def test_maintenance_503_is_a_maintenance_error_with_the_admin_message():
     body = {"error": "Back at noon.", "maintenance_mode": True}
     c, _rec = make_client(lambda *_: (503, body))
     try:
-        c.teacher_courses()
+        c.workspace()
     except mlarena.MaintenanceError as e:
         _expect(str(e) == "Back at noon.", str(e))
         _expect(e.status_code == 503 and e.body == body, (e.status_code, e.body))
@@ -413,7 +563,7 @@ def test_a_503_without_the_flag_is_not_maintenance():
     c, _rec = make_client(lambda *_: (503, {"error": "upstream down",
                                              "upstream": "data_collection"}))
     try:
-        c.teacher_courses()
+        c.workspace()
     except mlarena.MaintenanceError:
         raise AssertionError("a plain 503 is not maintenance")
     except MLArenaError as e:
@@ -422,15 +572,14 @@ def test_a_503_without_the_flag_is_not_maintenance():
         raise AssertionError("expected MLArenaError")
 
 
-def test_teacher_courses_says_whether_there_is_a_cover_not_where_it_lives():
+def test_teacher_course_says_whether_there_is_a_cover_not_where_it_lives():
     """A course payload never carries the NFS path — the catalog and the
     landing are public reads (see the backend's `has_cover`)."""
-    rows = [{"id": 1, "name": "RL", "role": "owner", "has_cover": True}]
-    c, _rec = make_client(lambda *_: (200, rows))
-    out = c.teacher_courses()
-    row = out.to_dict("records")[0] if hasattr(out, "columns") else out[0]
-    _expect(row["has_cover"] is True, row)
-    _expect("cover_image_path" not in row, row)
+    row = {"id": 1, "name": "RL", "role": "owner", "has_cover": True}
+    c, _rec = make_client(lambda *_: (200, row))
+    out = c.teacher_course(1)
+    _expect(out["has_cover"] is True, out)
+    _expect("cover_image_path" not in out, out)
 
 
 def test_set_course_cover_answers_the_flag():
@@ -481,9 +630,7 @@ def test_course_cover_404_raises():
 
 def test_all_teacher_admin_methods_send_the_token():
     c, rec = make_client(lambda *_: (200, []))
-    c.teacher_courses()
     c.challenges_for_course()
-    c.course_students(1)
     c.course_assistants(1)
     for call in rec.calls:
         auth = call["headers"]["Authorization"]

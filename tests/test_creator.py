@@ -215,7 +215,7 @@ def test_benchmark_status_is_the_run_and_its_checks():
 # --------------------------------------------------------------------------- #
 
 def test_config_fields_and_schema_are_public_reads():
-    field = {"key": "simulation_timeout_sec", "group": "evaluation", "level": "basic",
+    field = {"key": "simulation_timeout_sec", "group": "evaluation",
              "writer": "creator", "capability": "runs", "running_editable": False,
              "in_file": True, "help": "…"}
     c, rec = make_client(lambda *_: (200, {"fields": [field]}))
