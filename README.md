@@ -2,6 +2,57 @@
 
 Python SDK for [ML Arena](https://ml-arena.com) — make submissions, manage challenges, manage courses, and read leaderboards from any notebook or IDE.
 
+## 4.17.0 — a course's workspace, grade sheet, report and life
+
+Requires a platform at Alembic `b6e1c9f4a7d2` or later.
+
+- New: `teacher_course(course_id)` — one course you own or assist on: the
+  row, your `role`, `has_owner_rights`, the settings and the counts
+  (`GET /api/teacher/course/{id}`).
+- New: `archive_course(id)`, `unarchive_course(id)`,
+  `duplicate_course(id, name=None)`, `delete_course(id)`,
+  `course_deletion(id)` — the owner's (or an admin's). An archived course
+  takes no enrollment and no longer counts in your limit. A duplicate copies
+  the settings and the modules you may read (the challenges stay the same)
+  and nothing of the term; a module you may not read is linked and named in
+  `linked_modules`. Delete needs a course with no enrolled user, removes only
+  the entries the course made for itself and answers what it deleted and
+  kept; `course_deletion` says the same before the fact.
+- New: `export_course_grades_csv(course_id, dest_dir=".")` — the course-wide
+  grade sheet (one row per student, one column per entry), the CSV of
+  `course_progress`.
+- New: `send_course_report(course_id)` — mails the course report now, one
+  message per recipient. `update_course` takes `report_recipients` and
+  `report_to_assistants` (the owner's keys) and `ask_student_identity`.
+- **Changed:** `teacher_courses()` rows say `role: "owner"` where they said
+  `"teacher"` (`"assistant"` is unchanged; None for an admin who is neither),
+  and carry `archived_at_ts`. Every course row does (`list_courses`,
+  `create_course`, `update_course`, `course`).
+- **Changed:** the limit is 3 active (not archived) courses per account, where
+  it was 1 course ever; the refusal states both numbers, and `me()` serves
+  `max_courses_limit` and `active_course_count`.
+- **Changed:** the course CSVs (`export_course_csv`,
+  `export_course_grades_csv`, the report's attachments) are UTF-8 with a
+  byte-order mark, so Excel reads accents: open them with
+  `encoding="utf-8-sig"` (`pandas.read_csv` skips the mark by itself). A text
+  cell a spreadsheet would run as a formula (a student number, an email, a
+  team or submission name starting with `=`, `+`, `-`, `@`) is written with a
+  leading apostrophe, and a student without a submission has rank `N/A`, not
+  `-`.
+- **Changed:** a course `name` and `instructor_name` are one line of text: a
+  line break or a tab is a 400 on `create_course`, `update_course`,
+  `duplicate_course` and in `course.yaml`.
+- `course_progress` / `my_progress` cells carry `status` (`not_submitted` |
+  `failed` | `scoring` | `scored`) and `team_name`; `course_progress` rows
+  carry `student_email`, `enrolled_at_ts`, `passed_count`, and the payload
+  `pass_bar_count`. `update_course` returns the `teacher_course` shape.
+- `enrollment_info` carries `ask_student_identity`; `enroll_in_course` needs
+  no student number or email on a course that does not ask for them. An
+  archived course answers 410 to both, except to someone already enrolled.
+- `exercise_challenge(cid)` and `lesson(...)` serve an exercise set that a
+  public, not archived course assigns to every reader, signed in or not (it
+  was a 404, and a missing card, for a set that is not public).
+
 ## 4.16.0 — lesson media route removed
 
 - **Removed:** `download_lesson_media(lesson_id, filename)`. Its route,
@@ -1386,7 +1437,7 @@ print(c.leaderboard(cid).head())
 
 Everything the console's creator editor does, on the same routes:
 
-- `client.creator_challenges()` / `client.creator_challenge(challenge_id)` — your challenges, and one of them with its three sibling rows: `configuration`, `evaluation` and `environment`, each under its own column names, plus `config` (the flat config document: `values`, `origin` per key, `file_lines`, `file_in_sync`).
+- `client.creator_challenges()` / `client.creator_challenge(challenge_id)` — your challenges (each row is the challenge's reference: `id`, `name`, `slug`, `status`, `end_date_ts`, `is_public`, `kernel_version`, `kind_label`, `user_id`, `owner_username`, `role`, `statistics`, plus the list's own columns), and one of them with its three sibling rows: `configuration`, `evaluation` and `environment`, each under its own column names, plus `config` (the flat config document: `values`, `origin` per key, `file_lines`, `file_in_sync`).
 - The challenge config — one document, two editors. From simple to advanced:
   1. **env.py only**: every key starts at its kind default; change what you need with `update_settings` (or the console's Config tab).
   2. **`challenge.toml`** beside env.py, holding only the keys your env relies on (e.g. `agent_max_time_per_step_second = 60.0`); `upload_env_file(cid, "challenge.toml")` applies it, and those keys become the file's (`update_settings` refuses them).
@@ -1401,7 +1452,8 @@ Everything the console's creator editor does, on the same routes:
 - Presentation: `client.challenge_markdown(challenge_id)` / `set_challenge_markdown`, `client.challenge_image(challenge_id, dest_dir=".")` / `set_challenge_image` / `delete_challenge_image`.
 - Agent template: `client.agent_template(challenge_id)` (the stored template, or the default one), `client.update_agent_template(challenge_id, …)`, `client.csv_ground_truth(challenge_id)` (file challenges).
 - Lifecycle: `client.start_challenge(challenge_id)` (from `draft` or `stopped`) / `stop_challenge(challenge_id)` (from `started` to `stopped`).
-- Participants: `client.creator_runs(challenge_id)` (the last 30 runs with the env's diagnostics), `client.creator_submissions(challenge_id)`, `client.clean_redeploy_submission(challenge_id, submission_id)`, `client.clean_redeploy_all(challenge_id)`, `client.soft_delete_submission(challenge_id, submission_id)`.
+- Follow: `client.challenge_overview(challenge_id)` (`challenge`, the challenge's reference with the participant count in `statistics`, and `counters`: teams, submissions created in the last 7 days with the per-day series, deploy-failed submissions by owner, the last submission, the course count), `client.challenge_deploy_failures(challenge_id)` (the deploy-failed submissions grouped by `failure_owner` and `error_type`, each group with its count, a message head and up to 20 submission ids), `client.challenge_courses(challenge_id)` (the courses using the challenge that you may see, archived ones included, each with your `role` on it and `enrollment_count` when you manage it, and `other_course_count` for the rest, which are never named).
+- Participants: `client.creator_runs(challenge_id, offset=0, limit=30)` (one page of the runs, newest first, with the env's diagnostics and `total`), `client.creator_submissions(challenge_id, course_id=None)` (`course_id`: the submissions of the students enrolled in a course holding the challenge that you manage, the leaderboard's course population), `client.clean_redeploy_submission(challenge_id, submission_id)`, `client.clean_redeploy_all(challenge_id)`, `client.soft_delete_submission(challenge_id, submission_id)`.
 - Assistants: `client.challenge_assistants(challenge_id)`, `client.add_challenge_assistant(challenge_id, username)`, `client.remove_challenge_assistant(challenge_id, user_id)`.
 
 ### Chat challenges (user scope; creator methods need creator scope)
@@ -1469,7 +1521,7 @@ method↔route table for the full surface.
 
 **Create + enroll**
 
-- `client.create_course(name, code=None, start_date, end_date, slug=None, description=None, visibility=None, instructor_name=None)` — any token scope; creating a course makes the account a teacher (capped by `max_courses_limit`, default 1; admins exempt). Attach challenges afterwards: `add_course_challenge` per challenge, or via modules (`create_module` / `attach_challenge` / `link_module`). The response carries the course's `join_code` — the single enrollment token to share with students.
+- `client.create_course(name, code=None, start_date, end_date, slug=None, description=None, visibility=None, instructor_name=None)` — any token scope; creating a course makes the account a teacher (capped by `max_courses_limit`: 3 active, not archived, courses by default; admins exempt). Attach challenges afterwards: `add_course_challenge` per challenge, or via modules (`create_module` / `attach_challenge` / `link_module`). The response carries the course's `join_code` — the single enrollment token to share with students.
 - `client.enroll_in_course(join_code, student_email=None, student_number=None)` — join with the course's short join code (the token in its `/enroll/<join_code>` link).
 - `client.enrollment_info(join_code)` — preview a course before enrolling (public).
 - `client.list_courses(show_all=False, challenge_id=None)` — your enrolled + active courses.
@@ -1524,12 +1576,16 @@ print(student.my_progress(landing["id"]))                # content % + next less
 - `client.attach_challenge(module_id, challenge_id, label=None, position=None, pass_threshold=None)`, `update_challenge_link`, `detach_challenge`, `reorder_module_challenges`.
 - `client.create_lesson(module_id, title, kind="lesson", slug=None, parent_lesson_id=None, body_md="", gated=False)`, `get_lesson`, `update_lesson(id, **fields)`, `delete_lesson`, `reorder_lessons`.
 - `client.upload_module_asset(module_id, file_path, path=None)` (returns `{path, url}`; link it from a lesson body by its `path`: `![fig](media/fig.png)`), `list_module_assets(module_id)`, `delete_module_asset(module_id, path)`.
-- `client.preview_lesson(lesson_id, body_md=None)` — validates `mlarena:` directives (fails loud on unknown).
+- `client.preview_lesson(lesson_id, body_md=None)` — validates `mlarena:` directives as you (fails loud on unknown, and on a challenge you may not see as on one that does not exist); `warnings` names the courses whose students would not see a block's challenge.
 - `client.push_course(path, slug=None, subpath=None, dry_run=False, prune=False)`, `client.import_course_from_github(slug, repository, ref=None, path=None, dry_run=False, prune=False)`, `client.export_course_to_dir(slug, path)` — a course as a directory (above).
 - `client.add_course_challenge(course_id, challenge_id, title=None, summary=None, pass_threshold=None, is_published=True)` — the console's "Add challenge": one transactional call creates a private module (title defaults to the challenge's name, `summary` is the student page), links it at the end of the course and attaches the challenge; nothing is written if any part is refused.
 - `client.remove_course_challenge(course_id, module_id)` — the console's "Remove": one transactional call unlinks the entry and deletes its module when it is a simple module you may edit that no other course links; answers `{"message", "module_deleted"}`.
 - `client.update_course(id, **fields)`, `set_course_cover`, `list_course_modules`, `link_module(course_id, module_id, position=None)`, `unlink_module`, `reorder_modules`, `course_progress(course_id)` — teacher follow dashboard.
-- `client.teacher_courses()` — the courses you teach or assist on, each with its `role`; `client.challenges_for_course()` — the challenges you may attach, each with `metric`, the ranking MetricSpec (the scale and direction of a `pass_threshold`), and `default_pass_threshold`, the bar an attach that names none is stored with (70 for an exercise set, `None` otherwise).
+- `client.teacher_course(course_id)` — one course for its workspace: the row, your `role` (what you are to it: `owner` | `assistant` | `None` for an admin who is neither), `has_owner_rights` (whether you may do what only the owner may: the owner and an admin), `owner_username`, the settings (`ask_student_identity`, `report_recipients`, `report_to_assistants`, `report_last_sent_at_ts`) and the counts (`enrollment_count`, `assistant_count`, `module_count`, `challenge_count`). `update_course` writes the settings too and returns the same shape.
+- `client.archive_course(id)` / `unarchive_course(id)` — the owner's: an archived course takes no enrollment, leaves the catalog and stops counting in the limit of 3 active courses; its students and staff keep it. `client.duplicate_course(id, name=None)` — a new course of yours with the settings and a copy of every module you may read (the challenges stay the same challenges; no enrollment, progress, dates or assistants; private, fresh join code); a module you may not read is linked instead and named in `linked_modules`. `client.delete_course(id)` — needs a course with no enrolled user; removes the course and the entries it made for itself (a private module of the owner with no lesson and at most one challenge, linked nowhere else), never another module or a challenge, and answers `{can_delete, enrollment_count, deleted_modules, kept_modules}`; `client.course_deletion(id)` serves that list before the fact.
+- `client.send_course_report(id)` — mails the course report now (two leaderboard CSVs per challenge) to the owner, the assistants (`report_to_assistants`) and `report_recipients`; one send per course every 10 minutes.
+- `client.export_course_grades_csv(course_id, dest_dir=".")` — the course-wide grade sheet, `course_progress` as a CSV (writes `grades_course_<id>.csv`).
+- `client.teacher_courses()` — the courses you own or assist on (archived ones included, `archived_at_ts`), each with its `role` (`owner` | `assistant`, `None` on a course an admin neither owns nor assists); `client.challenges_for_course()` — the challenges you may attach, each with `metric`, the ranking MetricSpec (the scale and direction of a `pass_threshold`), and `default_pass_threshold`, the bar an attach that names none is stored with (70 for an exercise set, `None` otherwise).
 - `client.course_students(course_id, challenge_id=None)` — the roster (`user_id`, `student_number`, `student_email`, `enrolled_at_ts`, plus the team columns for the attached challenge you name — `None` without `challenge_id`); `client.remove_student(course_id, user_id)` deletes the enrollment only (account, submissions, teams and lesson progress are kept; the student can enroll again).
 - `client.course_assistants(course_id)`, `add_course_assistant(course_id, username)`, `remove_course_assistant(course_id, user_id)` — assistants (course owner or admin).
 - `client.export_course_csv(course_id, challenge_id, by_participant=False, dest_dir=".")` — one attached challenge's leaderboard CSV, as the console's Students tab downloads it (writes `leaderboard_course_<cid>_comp_<challenge_id>.csv`); `client.course_cover(course_id, dest_dir=".")` — a course's cover image (course payloads carry `has_cover`, not a path).

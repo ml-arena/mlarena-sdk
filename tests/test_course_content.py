@@ -626,7 +626,7 @@ def _export_router(method, path, kwargs):
                     {"challenge": {"id": 42, "name": "CartPole-v1",
                                    "slug": "cartpole-v1"},
                      "label": "CartPole", "pass_threshold": 195.0, "metric": None},
-                    {"challenge": {"id": 43, "name": "Old", "slug": None},
+                    {"challenge": {"id": 43, "name": "Old", "slug": "old"},
                      "label": None, "pass_threshold": None, "metric": None},
                 ],
                 "lessons": [
@@ -703,10 +703,10 @@ def test_export_course_to_dir():
     }, manifest["course"])
     module = manifest["modules"][0]
     _expect(module["visibility"] == "unlisted", module)
-    # By slug when the challenge has one: the same on every deployment.
+    # By slug (every challenge has one): the same on every deployment.
     _expect(module["challenges"] == [
         {"slug": "cartpole-v1", "label": "CartPole", "pass_threshold": 195.0},
-        {"challenge_id": 43, "label": None, "pass_threshold": None},
+        {"slug": "old", "label": None, "pass_threshold": None},
     ], module["challenges"])
     _expect(module["lessons"] == [{
         "title": "What is RL?", "slug": "what-is-rl", "kind": "lesson",
@@ -799,3 +799,18 @@ def _run_all():
 
 if __name__ == "__main__":
     sys.exit(1 if _run_all() else 0)
+
+
+def test_a_link_without_its_challenge_is_a_clear_export_error():
+    """An authoring link serves `challenge: None` for a challenge the caller
+    may not see: the manifest entry names the id, it does not crash."""
+    from mlarena.client import _manifest_challenge_entry
+
+    try:
+        _manifest_challenge_entry(
+            {"id": 3, "challenge_id": 43, "challenge": None, "label": None,
+             "pass_threshold": None})
+    except MLArenaError as exc:
+        _expect("challenge 43" in str(exc), str(exc))
+    else:
+        raise AssertionError("a link without its challenge must raise MLArenaError")

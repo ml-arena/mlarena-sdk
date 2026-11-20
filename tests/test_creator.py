@@ -111,9 +111,41 @@ READS = [
     ("challenge_assistants", (7,), CREATOR + "/assistants"),
     ("csv_ground_truth", (7,), CREATOR + "/csv-ground-truth"),
     ("agent_template", (7,), CREATOR + "/agent-template"),
+    ("challenge_overview", (7,), CREATOR + "/overview"),
+    ("challenge_deploy_failures", (7,), CREATOR + "/deploy-failures"),
+    ("challenge_courses", (7,), CREATOR + "/courses"),
     ("available_kinds", (), "/creator_challenge/available_kinds"),
     ("copyable_challenges", (), "/creator_challenge/copyable_challenges"),
 ]
+
+
+def test_creator_runs_pages_with_offset_and_limit():
+    """`creator_runs` sends the route's paging names; the default is the
+    first page of 30."""
+    c, rec = make_client(lambda *_: (200, {"runs": [], "total": 0, "offset": 0, "limit": 30}))
+    c.creator_runs(7)
+    _expect(rec.last["params"] == {"offset": 0, "limit": 30}, rec.last["params"])
+    c.creator_runs(7, offset=30, limit=100)
+    _expect(rec.last["path"] == CREATOR + "/runs", rec.last["path"])
+    _expect(rec.last["params"] == {"offset": 30, "limit": 100}, rec.last["params"])
+
+
+def test_creator_submissions_filters_on_a_course():
+    """`course_id` is sent only when named; a refused course is the route's 400."""
+    c, rec = make_client(lambda *_: (200, {"submissions": [], "metrics": [], "window_days": None}))
+    c.creator_submissions(7)
+    _expect(rec.last["params"] is None, rec.last["params"])
+    c.creator_submissions(7, course_id=3)
+    _expect(rec.last["path"] == CREATOR + "/submissions", rec.last["path"])
+    _expect(rec.last["params"] == {"course_id": 3}, rec.last["params"])
+
+    c, _ = make_client(lambda *_: (400, {"error": "Invalid course_id for this challenge"}))
+    try:
+        c.creator_submissions(7, course_id=99)
+    except MLArenaError as exc:
+        _expect("Invalid course_id" in str(exc), str(exc))
+    else:
+        raise AssertionError("a refused course_id must raise")
 
 
 def test_creator_reads_hit_their_routes():

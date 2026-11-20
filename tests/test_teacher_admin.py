@@ -79,14 +79,127 @@ def _expect(cond, msg):
 
 
 def test_teacher_courses_reads_role_per_row():
-    rows = [{"id": 1, "name": "RL", "role": "teacher"},
-            {"id": 2, "name": "NLP", "role": "assistant"}]
+    rows = [{"id": 1, "name": "RL", "role": "owner", "archived_at_ts": None},
+            {"id": 2, "name": "NLP", "role": "assistant",
+             "archived_at_ts": "2026-07-01T00:00:00Z"}]
     c, rec = make_client(lambda *_: (200, rows))
     out = c.teacher_courses()
     _expect(rec.last["method"] == "GET", rec.last["method"])
     _expect(rec.last["path"] == "/teacher/courses", rec.last["path"])
     roles = list(out["role"]) if hasattr(out, "columns") else [r["role"] for r in out]
-    _expect(roles == ["teacher", "assistant"], roles)
+    _expect(roles == ["owner", "assistant"], roles)
+
+
+# --------------------------------------------------------------------------- #
+# One course: workspace read, settings, archive / duplicate / delete, report
+# --------------------------------------------------------------------------- #
+
+
+def test_teacher_course_reads_one_course():
+    row = {"id": 7, "name": "RL", "role": "assistant", "enrollment_count": 12,
+           "report_recipients": ["dean@example.com"], "archived_at_ts": None}
+    c, rec = make_client(lambda *_: (200, row))
+    out = c.teacher_course(7)
+    _expect(out == row, out)
+    _expect((rec.last["method"], rec.last["path"]) == ("GET", "/teacher/course/7"), rec.last)
+    _expect(len(rec.calls) == 1, rec.calls)
+
+
+def test_update_course_sends_the_settings_keys():
+    c, rec = make_client(lambda *_: (200, {"id": 7}))
+    c.update_course(7, ask_student_identity=False, report_to_assistants=False,
+                    report_recipients=["dean@example.com"])
+    _expect((rec.last["method"], rec.last["path"]) == ("PUT", "/teacher/course/7"), rec.last)
+    _expect(rec.last["json"] == {"ask_student_identity": False,
+                                 "report_to_assistants": False,
+                                 "report_recipients": ["dean@example.com"]}, rec.last["json"])
+
+
+def test_archive_and_unarchive_are_one_post_each():
+    c, rec = make_client(lambda *_: (200, {"id": 7, "archived_at_ts": "2026-07-01T00:00:00Z"}))
+    out = c.archive_course(7)
+    _expect(out["archived_at_ts"] is not None, out)
+    _expect((rec.last["method"], rec.last["path"]) == ("POST", "/teacher/course/7/archive"),
+            rec.last)
+    c.unarchive_course(7)
+    _expect((rec.last["method"], rec.last["path"]) == ("POST", "/teacher/course/7/unarchive"),
+            rec.last)
+
+
+def test_duplicate_course_sends_the_name_only_when_given():
+    c, rec = make_client(lambda *_: (201, {
+        "id": 8, "name": "RL (copy)", "linked_modules": [{"id": 3, "title": "TA notes"}]}))
+    out = c.duplicate_course(7)
+    _expect(out["id"] == 8, out)
+    _expect(out["linked_modules"] == [{"id": 3, "title": "TA notes"}], out)
+    _expect((rec.last["method"], rec.last["path"]) == ("POST", "/teacher/course/7/duplicate"),
+            rec.last)
+    _expect(rec.last["json"] == {}, rec.last["json"])
+    c.duplicate_course(7, name="RL 2027")
+    _expect(rec.last["json"] == {"name": "RL 2027"}, rec.last["json"])
+
+
+def test_the_course_limit_refusal_raises_with_the_platform_reason():
+    reason = ("Course limit reached: you own 3 active courses and may own 3. "
+              "Archive or delete a course to create another.")
+    c, _ = make_client(lambda *_: (403, {"error": reason}))
+    for call in (lambda: c.duplicate_course(7), lambda: c.unarchive_course(7)):
+        try:
+            call()
+        except mlarena.MLArenaError as exc:
+            _expect(reason in str(exc), str(exc))
+        else:
+            raise AssertionError("a refused course action did not raise")
+
+
+def test_delete_course_is_one_delete_and_a_409_says_why():
+    plan = {"can_delete": True, "enrollment_count": 0,
+            "deleted_modules": [{"id": 4, "title": "Week 2"}],
+            "kept_modules": [{"id": 9, "title": "Lessons"}]}
+    c, rec = make_client(lambda *_: (200, plan))
+    _expect(c.course_deletion(7) == plan, "course_deletion")
+    _expect((rec.last["method"], rec.last["path"]) == ("GET", "/teacher/course/7/deletion"),
+            rec.last)
+    _expect(c.delete_course(7) == plan, "delete_course")
+    _expect((rec.last["method"], rec.last["path"]) == ("DELETE", "/teacher/course/7"), rec.last)
+
+    reason = "The course has 4 enrolled user(s): remove them first, or archive the course instead"
+    c, _ = make_client(lambda *_: (409, {"error": reason, "enrollment_count": 4}))
+    try:
+        c.delete_course(7)
+    except mlarena.MLArenaError as exc:
+        _expect(reason in str(exc), str(exc))
+    else:
+        raise AssertionError("delete_course on a course with students did not raise")
+
+
+def test_send_course_report_posts_and_returns_who_got_it():
+    sent = {"recipients": ["owner@example.com"], "challenge_count": 2,
+            "attachment_count": 4, "report_last_sent_at_ts": "2026-11-20T10:00:00Z"}
+    c, rec = make_client(lambda *_: (200, sent))
+    _expect(c.send_course_report(7) == sent, "send_course_report")
+    _expect((rec.last["method"], rec.last["path"])
+            == ("POST", "/teacher/course/7/report/send"), rec.last)
+
+    c, _ = make_client(lambda *_: (429, {"error": "The report was sent a moment ago",
+                                         "retry_after_sec": 540}))
+    try:
+        c.send_course_report(7)
+    except mlarena.MLArenaError as exc:
+        _expect("sent a moment ago" in str(exc), str(exc))
+    else:
+        raise AssertionError("a rate-limited send did not raise")
+
+
+def test_export_course_grades_csv_writes_the_file():
+    c, rec = make_client(_csv_router)
+    with tempfile.TemporaryDirectory() as d:
+        out = c.export_course_grades_csv(5, dest_dir=d)
+        _expect(os.path.basename(out) == "grades_course_5.csv", out)
+        with open(out) as fh:
+            _expect("ana" in fh.read(), "csv body not written")
+    _expect(rec.last["path"] == "/teacher/course/5/progress.csv", rec.last["path"])
+    _expect(not rec.last["params"], rec.last["params"])
 
 
 def test_challenges_for_course_lists_the_picker():
@@ -192,7 +305,7 @@ def test_assistant_errors_surface():
 
 
 def _csv_router(method, path, kwargs):
-    if path.startswith("/teacher/export-csv/"):
+    if path.startswith("/teacher/export-csv/") or path.endswith("/progress.csv"):
         return FakeResponse(200, content=b"Rank,Username\n1,ana\n")
     return None
 
@@ -312,7 +425,7 @@ def test_a_503_without_the_flag_is_not_maintenance():
 def test_teacher_courses_says_whether_there_is_a_cover_not_where_it_lives():
     """A course payload never carries the NFS path — the catalog and the
     landing are public reads (see the backend's `has_cover`)."""
-    rows = [{"id": 1, "name": "RL", "role": "teacher", "has_cover": True}]
+    rows = [{"id": 1, "name": "RL", "role": "owner", "has_cover": True}]
     c, _rec = make_client(lambda *_: (200, rows))
     out = c.teacher_courses()
     row = out.to_dict("records")[0] if hasattr(out, "columns") else out[0]
