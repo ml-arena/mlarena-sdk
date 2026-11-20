@@ -2,6 +2,12 @@
 
 Python SDK for [ML Arena](https://ml-arena.com) — make submissions, manage challenges, manage courses, and read leaderboards from any notebook or IDE.
 
+## 4.13.0 — latest replays
+
+- New: `latest_replays(limit=1)`, the newest replays across the public
+  challenges (the landing page's "Latest replay"). `replays()` / `replay()`
+  are now open to anyone who can see the challenge.
+
 ## 4.12.0 — GitHub Actions, the `mlarena` command, bundles
 
 Requires a platform with the GitHub integration; on an older one the new
@@ -10,9 +16,6 @@ routes answer 404.
 - New: the **`mlarena` command** (`mlarena submit`, `mlarena challenge push`,
   `mlarena course push`, `mlarena whoami`), installed with the package. See
   [GitHub Actions and the mlarena CLI](#github-actions-and-the-mlarena-cli).
-- New: `latest_replays(limit=1)`, the newest replays across the public
-  challenges (the landing page's "Latest replay"). `replays()` / `replay()`
-  are now open to anyone who can see the challenge.
 - New: **no stored secret in CI.** `mlarena.connect()` takes its credential
   from `api_key`, else `MLARENA_API_KEY`, else — in a GitHub Actions job with
   `permissions: id-token: write` — from the job's OIDC token, exchanged for a
