@@ -820,7 +820,25 @@ _ENVELOPE = {
     "me": {"rank": 4, "percentile": 66.7, "row": {}, "neighbors": []},
     "around": None,
     "matches": [{"rank": 1, "username": "jo"}],
-    "course_context": {"course_id": 3, "pass_threshold": 0.5},
+    "course_context": {"course_id": 3, "pass_threshold": 0.5, "names_withheld": False},
+}
+
+# The same board as the backend serves it to a caller who is not a member of
+# course 3: every key, the identity ones None.
+_WITHHELD_ENVELOPE = {
+    "challenge": _CHALLENGE_BLOCK,
+    "total": 1,
+    "leaders": [{"rank": 1, "username": None, "avatar_key": None,
+                 "submission_id": None, "submission_name": None,
+                 "score": 0.7, "score_ci95": None,
+                 "metrics": {"reward": 0.7}, "metrics_window": None,
+                 "is_my_submission": False, "can_open": False,
+                 "team_id": None, "team_name": None, "team_members": None,
+                 "datagouv_reuse": None, "passed": True}],
+    "me": None,
+    "around": None,
+    "matches": None,
+    "course_context": {"course_id": 3, "pass_threshold": 0.5, "names_withheld": True},
 }
 
 
@@ -872,6 +890,37 @@ def test_leaderboard_is_one_shape_whatever_the_parameters():
             assert out.attrs["me"]["rank"] == 4
         else:
             assert out == _ENVELOPE, kwargs
+
+
+def test_leaderboard_with_names_withheld_keeps_every_column():
+    """A course board read from outside the course: the rows as served, their
+    identity columns present and empty, and the flag on `course_context`."""
+    c, _ = make_client(lambda *_: (200, _WITHHELD_ENVELOPE))
+    out = c.leaderboard(4, course_id=3)
+    if _has_pandas():
+        (row,) = out.to_dict("records")
+        assert out.attrs["course_context"]["names_withheld"] is True
+    else:
+        (row,) = out["leaders"]
+        assert out["course_context"]["names_withheld"] is True
+    for key in ("username", "avatar_key", "submission_id", "submission_name",
+                "team_id", "team_name", "team_members", "datagouv_reuse"):
+        assert key in row and row[key] is None, key
+    assert row["can_open"] is False
+    assert row["rank"] == 1 and row["score"] == 0.7 and row["passed"] is True
+
+
+def test_leaderboard_search_on_a_withheld_board_carries_the_refusal():
+    reason = ("q and around are not available on a course leaderboard whose "
+              "names are withheld: only the course's members may search it")
+    c, _ = make_client(lambda *_: (400, {"error": reason}))
+    for kwargs in ({"q": "jo"}, {"around": 11}):
+        try:
+            c.leaderboard(4, course_id=3, **kwargs)
+        except MLArenaError as exc:
+            assert exc.status_code == 400 and reason in str(exc)
+        else:
+            raise AssertionError("expected MLArenaError")
 
 
 def test_leaderboard_without_course_context_attaches_none():

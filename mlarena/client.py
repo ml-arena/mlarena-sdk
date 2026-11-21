@@ -3680,7 +3680,16 @@ class MLArenaClient:
           students are listed, rows gain ``passed`` when the course sets a bar
           (tri-state: None while the row has no ranked value), and the
           envelope carries a ``course_context`` block (`course_id`,
-          `pass_threshold`).
+          `pass_threshold`, `names_withheld`). Names go to the course's
+          members only: unless you are enrolled in the course, own it,
+          assist it or are an admin, ``course_context["names_withheld"]`` is
+          True and every row comes with its rank, score and metrics but
+          with `username`, `avatar_key`, `submission_id`,
+          `submission_name`, `team_id`, `team_name`, `team_members` and
+          `datagouv_reuse` set to None and `can_open` False (the keys
+          stay). On such a read ``q`` and ``around`` are refused
+          (`MLArenaError`, 400): each would say whether a given person is
+          in the course. The board without ``course_id`` is unchanged.
         - ``top=N``: the first N rows (every ranked row without it);
           ``offset=K`` starts the page at the K-th row (0-based), so
           ``top=50, offset=100`` is rows 101-150 — the console's page 3.
@@ -3722,7 +3731,9 @@ class MLArenaClient:
         reuse, see `link_datagouv_reuse`, or None), `action_time_max_sec`,
         `agent_metric_total_ram_max_bytes`, `agent_metric_vram_max_bytes`,
         `is_public` (None when the row is not yours to know) and, through a
-        course with a bar, `passed`. With pandas, each row's `metrics`
+        course with a bar, `passed`. `username`, `submission_id`,
+        `submission_name` and `team_members` are None only under
+        ``course_context["names_withheld"]`` (see ``course_id`` above). With pandas, each row's `metrics`
         (`{key: value}`) becomes one column per declared key, named by the
         key, and — when `window_days` is set — its `metrics_window` becomes
         one `metrics_window_<key>` column per key. Rows come in server rank

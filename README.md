@@ -2,6 +2,25 @@
 
 Python SDK for [ML Arena](https://ml-arena.com) — make submissions, manage challenges, manage courses, and read leaderboards from any notebook or IDE.
 
+## 4.17.1 — a course's leaderboard names its participants to the course's members only
+
+- **`leaderboard(challenge_id, course_id=…)` read from outside the course
+  comes without names.** Unless your key is enrolled in the course, owns it,
+  assists it or is an admin's, the rows are the same (rank, `score`, metrics,
+  `passed`) and every field that says who a row is — `username`,
+  `avatar_key`, `submission_id`, `submission_name`, `team_id`, `team_name`,
+  `team_members`, `datagouv_reuse` — is `None`, with `can_open` `False`.
+  Every key (DataFrame column) stays. The envelope says so once:
+  `df.attrs["course_context"]["names_withheld"]` is `True` (`False` for a
+  member; the key is new in `course_context`, next to `course_id` and
+  `pass_threshold`).
+- On such a read `q=` and `around=` are refused with a 400
+  (`MLArenaError`) instead of answered: each would tell whether a given
+  person is in the course.
+- The board without `course_id` is unchanged, and so is a course board read
+  by one of its members. No method signature changes; the SDK code change is
+  documentation only (the rule is the platform's).
+
 ## 4.17.0 — your workspace in one read; a course's workspace, grade sheet, report and life
 
 Requires a platform at Alembic `d4a8c2f6e0b5` or later.
@@ -1706,7 +1725,7 @@ print(student.my_progress(landing["id"]))                # content % + next less
   - `df.attrs["challenge"]` — what every row shares: `challenge_id`, `metrics` (the declaration, see [Metrics](#metrics)), `window_days`, `has_gpu`. `df.attrs["metrics"]` is the same declaration.
   - Columns — the backend's names: `rank`, `username`, `avatar_key`, `submission_id`, `submission_name`, `score` (the ranking spec's value, `None` = unranked), `score_ci95`, `n_episodes_total`, `elo_variance`, `number_of_runs`, `created_at_ts`, `last_end_run_ts`, `is_my_submission`, `team_id`, `team_name`, `team_members`, `action_time_max_sec`, `agent_metric_total_ram_max_bytes`, `agent_metric_vram_max_bytes`, `is_public` (`None` when the row is not yours to know) and, through a course with a bar, `passed`; then **one column per declared key** (the row's `metrics[key]`) and, when `window_days` is set, one `metrics_window_<key>` column per key (the same fold over the last `window_days` days). On a chat challenge `score` (and the `loot` column) is the team's euro total. Without pandas the rows keep `metrics` / `metrics_window` as `{key: value}` dicts.
   - `aggregate="user"` — one row per participant (their best submission). This is what the console shows by default; omitted, every ranked submission is a row.
-  - `course_id=…` — the board as a course sees it: only its students, per-row `passed` (tri-state: `None` while the row has no ranked value), and `df.attrs["course_context"]` = `{course_id, pass_threshold}`.
+  - `course_id=…` — the board as a course sees it: only its students, per-row `passed` (tri-state: `None` while the row has no ranked value), and `df.attrs["course_context"]` = `{course_id, pass_threshold, names_withheld}`. Unless you are a member of the course (enrolled, its owner, an assistant, an admin), `names_withheld` is `True`: the rows keep every column, with `username`, `avatar_key`, `submission_id`, `submission_name`, `team_id`, `team_name`, `team_members`, `datagouv_reuse` set to `None` and `can_open` `False`, and `q` / `around` are refused (400).
   - `top=N` — the first N rows (all of them without it). `me=True` puts your own row and its `window` neighbours (default 3) on `df.attrs["me"]`; `q="jo"` puts the matching usernames on `df.attrs["matches"]`; `df.attrs["total"]` counts every ranked row.
   - A refused query (an `aggregate` other than `"user"`, a `course_id` that does not hold the challenge) is an `MLArenaError` with the server's reason, `status_code` and `body`.
 - A challenge's direction is its ranking spec's `order`, set through `metrics` before it starts. Course pass bars follow it: `passed` means `value >= pass_threshold` under `"desc"` and `value <= pass_threshold` under `"asc"` (see `metric` — the ranking spec — in `my_progress` / `course_progress`).
