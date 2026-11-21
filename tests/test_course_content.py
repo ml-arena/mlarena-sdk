@@ -814,3 +814,72 @@ def test_a_link_without_its_challenge_is_a_clear_export_error():
         _expect("challenge 43" in str(exc), str(exc))
     else:
         raise AssertionError("a link without its challenge must raise MLArenaError")
+
+
+# --------------------------------------------------------------------------- #
+# Phase 2: copy a module from another course, view as student
+# --------------------------------------------------------------------------- #
+
+
+def test_copy_module_into_course_body_and_status():
+    row = {"id": 9, "module_id": 12, "title": "Week 1", "can_edit": True, "is_owned": True,
+           "dropped_challenges": [{"challenge_id": 4, "name": None}]}
+    c, rec = make_client(lambda *_: (201, row))
+    out = c.copy_module_into_course(7, 3)
+    _expect(out == row, out)
+    _expect((rec.last["method"], rec.last["path"]) ==
+            ("POST", "/teacher/course/7/modules/copy"), rec.last)
+    _expect(rec.last["json"] == {"module_id": 3}, rec.last["json"])
+
+
+def test_create_course_module_sends_only_what_is_given():
+    c, rec = make_client(lambda *_: (201, {"id": 9, "module_id": 12}))
+    out = c.create_course_module(7, "Week 3")
+    _expect(out["module_id"] == 12, out)
+    _expect((rec.last["method"], rec.last["path"]) ==
+            ("POST", "/teacher/course/7/modules/create"), rec.last)
+    _expect(rec.last["json"] == {"title": "Week 3"}, rec.last["json"])
+    c.create_course_module(7, "Week 3", slug="w3", summary="s", icon="book",
+                           visibility="private", is_published=False)
+    _expect(rec.last["json"] == {"title": "Week 3", "slug": "w3", "summary": "s",
+                                 "icon": "book", "visibility": "private",
+                                 "is_published": False}, rec.last["json"])
+
+
+def test_copy_module_into_course_a_module_the_caller_may_not_read():
+    c, _rec = make_client(lambda *_: (404, {"error": "Module not found"}))
+    try:
+        c.copy_module_into_course(7, 3)
+    except mlarena.MLArenaError as exc:
+        _expect("Module not found" in str(exc), str(exc))
+    else:
+        raise AssertionError("a 404 must raise")
+
+
+def test_list_copyable_modules_path():
+    rows = [{"module_id": 3, "title": "Week 1", "summary": None, "lesson_count": 4,
+             "challenge_count": 1, "course": {"id": 5, "name": "RL 2025"}}]
+    c, rec = make_client(lambda *_: (200, rows))
+    _expect(c.list_copyable_modules(7) == rows, "rows")
+    _expect((rec.last["method"], rec.last["path"]) ==
+            ("GET", "/teacher/course/7/copyable-modules"), rec.last)
+
+
+def test_the_learner_reads_take_as_student():
+    c, rec = make_client()
+    c.course("intro")
+    _expect(rec.last["params"] is None, rec.last["params"])
+    c.course("intro", as_student=True)
+    _expect(rec.last["path"] == "/academic_courses/intro", rec.last["path"])
+    _expect(rec.last["params"] == {"as_student": "true"}, rec.last["params"])
+    c.module_overview("intro", "week-1", as_student=True)
+    _expect(rec.last["path"] == "/academic_courses/intro/modules/week-1", rec.last["path"])
+    _expect(rec.last["params"] == {"as_student": "true"}, rec.last["params"])
+    c.module_overview("intro", "week-1")
+    _expect(rec.last["params"] is None, rec.last["params"])
+    c.lesson("intro", "week-1", "open", as_student=True)
+    _expect(rec.last["path"] == "/academic_courses/intro/modules/week-1/lessons/open",
+            rec.last["path"])
+    _expect(rec.last["params"] == {"as_student": "true"}, rec.last["params"])
+    c.lesson("intro", "week-1", "open")
+    _expect(rec.last["params"] is None, rec.last["params"])

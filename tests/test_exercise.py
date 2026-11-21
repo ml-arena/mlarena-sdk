@@ -365,7 +365,7 @@ def test_format_attempt_lines():
 def test_exercise_names_are_exported_at_package_level():
     assert mlarena.ExerciseAttemptNotFoundError is ExerciseAttemptNotFoundError
     assert issubclass(mlarena.ExerciseAttemptNotFoundError, mlarena.NotFoundError)
-    assert mlarena.__version__ == "4.17.1"
+    assert mlarena.__version__ == "4.18.0"
 
 
 def test_update_settings_sends_the_exercise_limits_passed(monkeypatch):
@@ -389,3 +389,152 @@ def test_exercise_admin_of_a_challenge_you_do_not_manage_is_a_challenge_not_foun
     c, _ = make_client(monkeypatch, lambda *_: (404, {"error": "Not an exercise challenge"}))
     with pytest.raises(ChallengeNotFoundError):
         c.exercise_admin(42)
+
+
+# --------------------------------------------------------------------------- #
+# Exercises as data, the self-test before start, "Add exercises" (4.18.0)
+# --------------------------------------------------------------------------- #
+
+EXERCISES = [
+    {"key": "bmi", "kind": "code", "title": "Body-mass index", "points": 1,
+     "check": "assert student.function('bmi')(70, 1.75) == 22.9\n",
+     "solution": "def bmi(w, h):\n    return round(w / h ** 2, 1)\n"},
+    {"key": "floor-div", "kind": "text", "title": "What does 7 // 2 print?", "points": 1,
+     "accept": ["3"]},
+]
+
+
+def _self_test(status, passed=None, results=None, message=None):
+    return {"status": status, "self_test_requested_at_ts": "2026-11-21T10:00:00Z",
+            "self_test_at_ts": "2026-11-21T10:00:40Z" if status == "done" else None,
+            "passed": passed, "self_test_error": message, "self_test": results}
+
+
+def test_exercise_definition_routes(monkeypatch):
+    c, rec = make_client(monkeypatch)
+    c.exercise_definition(7)
+    assert (rec.last["method"], rec.last["path"]) == ("GET", "/exercise/challenge/7/definition")
+    c.update_exercise_definition(7, EXERCISES)
+    assert (rec.last["method"], rec.last["path"]) == ("PUT", "/exercise/challenge/7/definition")
+    # The body is the exercises.json document itself.
+    assert rec.last["json"] == {"version": 1, "exercises": EXERCISES}
+
+
+def test_update_exercise_definition_refusals_carry_the_reason(monkeypatch):
+    blocked = {"error": "Cannot modify the exercises of a started set: stop it first",
+               "write_blocked_by": "started"}
+    c, _ = make_client(monkeypatch, lambda m, p, k: (409, blocked))
+    with pytest.raises(MLArenaError) as raised:
+        c.update_exercise_definition(7, EXERCISES)
+    assert raised.value.status_code == 409 and raised.value.body["write_blocked_by"] == "started"
+    c, _ = make_client(monkeypatch, lambda m, p, k: (404, {"error": "Not an exercise challenge"}))
+    with pytest.raises(ChallengeNotFoundError):
+        c.exercise_definition(7)
+
+
+def test_self_test_exercises_polls_until_done(monkeypatch, clock):
+    states = iter([_self_test("requested"), _self_test("running"),
+                   _self_test("done", True, [{"key": "bmi", "passed": True, "message": None}])])
+
+    def router(method, path, kwargs):
+        assert path == "/exercise/challenge/7/self-test"
+        return (202 if method == "POST" else 200, next(states))
+
+    c, rec = make_client(monkeypatch, router)
+    done = c.self_test_exercises(7)
+    assert done["passed"] is True and done["self_test"][0]["key"] == "bmi"
+    assert [call["method"] for call in rec.calls] == ["POST", "GET", "GET"]
+    assert clock.sleeps == [2, 2]
+
+
+def test_self_test_exercises_without_wait_returns_the_202(monkeypatch, clock):
+    c, rec = make_client(monkeypatch, lambda m, p, k: (202, _self_test("requested")))
+    assert c.self_test_exercises(7, wait=False)["status"] == "requested"
+    assert len(rec.calls) == 1 and clock.sleeps == []
+
+
+def test_self_test_exercises_raises_on_timed_out_and_on_its_own_timeout(monkeypatch, clock):
+    answers = {"POST": (202, _self_test("requested")), "GET": (200, _self_test("timed_out"))}
+    c, _ = make_client(monkeypatch, lambda m, p, k: answers[m])
+    with pytest.raises(MLArenaError, match="timed_out") as raised:
+        c.self_test_exercises(7)
+    assert raised.value.body["status"] == "timed_out"
+
+    answers["GET"] = (200, _self_test("running"))
+    with pytest.raises(MLArenaError, match="timed out after 10s") as raised:
+        c.self_test_exercises(7, timeout=10)
+    assert raised.value.body["status"] == "running"
+
+
+def test_self_test_exercises_refused_on_a_started_set(monkeypatch, clock):
+    c, _ = make_client(monkeypatch, lambda m, p, k: (409, {"error": "The set is started"}))
+    with pytest.raises(MLArenaError) as raised:
+        c.self_test_exercises(7)
+    assert raised.value.status_code == 409 and clock.sleeps == []
+
+
+def test_exercise_self_test_reads_the_state(monkeypatch):
+    c, rec = make_client(monkeypatch, lambda m, p, k: (200, _self_test("done", False, None, "boom")))
+    assert c.exercise_self_test(7)["self_test_error"] == "boom"
+    assert (rec.last["method"], rec.last["path"]) == ("GET", "/exercise/challenge/7/self-test")
+
+
+def test_add_course_exercise_set_sends_only_what_was_named(monkeypatch):
+    link = {"id": 4, "challenge_id": 91, "pass_threshold": 70.0}
+    c, rec = make_client(monkeypatch, lambda m, p, k: (201, link))
+    assert c.add_course_exercise_set(3, 12, "Week 1 exercises")["challenge_id"] == 91
+    assert (rec.last["method"], rec.last["path"]) == ("POST", "/teacher/course/3/modules/12/exercise-sets")
+    # No pass_threshold key: the server applies the kind's default (70).
+    assert rec.last["json"] == {"name": "Week 1 exercises"}
+    c.add_course_exercise_set(3, 12, "Ungraded", pass_threshold=None, label="Practice")
+    assert rec.last["json"] == {"name": "Ungraded", "label": "Practice", "pass_threshold": None}
+    c.add_course_exercise_set(3, 12, "Half", pass_threshold=50)
+    assert rec.last["json"] == {"name": "Half", "pass_threshold": 50}
+
+
+def test_self_test_exercises_refusals_carry_the_cap_and_the_blockers(monkeypatch, clock):
+    capped = {"error": "You already have 2 self-tests running (the limit per author): wait for one to finish.",
+              "limit": 2}
+    c, _ = make_client(monkeypatch, lambda m, p, k: (429, capped))
+    with pytest.raises(MLArenaError) as raised:
+        c.self_test_exercises(7)
+    assert raised.value.status_code == 429 and raised.value.body["limit"] == 2
+    blocked = {"error": "The set has no exercise yet: add one before starting", "details": ["…"],
+               "start_blockers": [{"code": "env_invalid"}]}
+    c, _ = make_client(monkeypatch, lambda m, p, k: (400, blocked))
+    with pytest.raises(MLArenaError) as raised:
+        c.self_test_exercises(7)
+    assert raised.value.body["start_blockers"][0]["code"] == "env_invalid" and clock.sleeps == []
+
+
+def test_exercise_list_reads_the_authors_listing(monkeypatch):
+    listing = {"source": "file", "reason": None,
+               "exercises": [{"key": "bmi", "title": "Body-mass index", "kind": "code", "points": 2}]}
+    c, rec = make_client(monkeypatch, lambda m, p, k: (200, listing))
+    assert c.exercise_list(7)["exercises"][0]["key"] == "bmi"
+    assert (rec.last["method"], rec.last["path"]) == ("GET", "/exercise/challenge/7/exercises")
+    c, _ = make_client(monkeypatch, lambda m, p, k: (404, {"error": "Challenge not found or unauthorized"}))
+    with pytest.raises(ChallengeNotFoundError):
+        c.exercise_list(7)
+
+
+def test_python_checks_without_creator_access_are_a_permission_error(monkeypatch, clock):
+    from mlarena.exceptions import PermissionDeniedError
+
+    body = {"error": "Exercises checked by Python code need creator access for now; "
+                     "short-answer and multiple-choice exercises do not",
+            "reason": "code_needs_creator_access"}
+    c, rec = make_client(monkeypatch, lambda m, p, k: (403, body))
+    for call in (lambda: c.update_exercise_definition(7, EXERCISES), lambda: c.self_test_exercises(7)):
+        with pytest.raises(PermissionDeniedError, match="need creator access for now"):
+            call()
+    assert clock.sleeps == []
+
+
+def test_the_self_test_cooldown_carries_the_seconds_left(monkeypatch, clock):
+    body = {"error": "A self-test starts a checker: wait 42 s before asking for another "
+                     "(one request per 60 s per author).", "retry_after_sec": 42}
+    c, _ = make_client(monkeypatch, lambda m, p, k: (429, body))
+    with pytest.raises(MLArenaError) as raised:
+        c.self_test_exercises(7)
+    assert raised.value.status_code == 429 and raised.value.body["retry_after_sec"] == 42

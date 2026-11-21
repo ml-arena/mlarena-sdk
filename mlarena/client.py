@@ -564,8 +564,9 @@ class MLArenaClient:
         ``statistics`` (``running_submissions`` and
         ``unique_participants``: a team counts once, a user in no team
         once), ``kernel_version`` and ``kind_label`` (the kind and
-        its one label, ``"Code challenge"`` | ``"File challenge"`` |
-        ``"Chat challenge"``; None without a configuration), ``my_rank``
+        its one label, ``"Python agent"`` | ``"Upload a file"`` |
+        ``"Chat with an AI agent"`` | ``"Exercises"``; None without a
+        configuration), ``my_rank``
         (your participant's rank on the challenge's board; None when
         anonymous or with nothing on the board) and ``course``
         (``{id, name, code}`` of the course you are enrolled in that holds
@@ -626,8 +627,14 @@ class MLArenaClient:
         runs under is `number_of_agents`, `agent_cpu_limit`,
         `agent_memory_limit`, `gpu_memory_limit` and `has_gpu`.
 
-        `kind_label` is the kind's one label (`"Code challenge"` |
-        `"File challenge"` | `"Chat challenge"`). `agent_template` (the code
+        `can_reuse` says whether you may add the challenge to a course of
+        yours (`attach_challenge`, `add_course_challenge`): a public
+        challenge, one you own or assist, any for an admin; False for a
+        private challenge you only see through a course.
+
+        `kind_label` is the kind's one label (`"Python agent"` |
+        `"Upload a file"` | `"Chat with an AI agent"` | `"Exercises"`).
+        `agent_template` (the code
         a participant starts `agent.py` from) is served for code challenges
         only, None for a file or chat challenge. `submission_layout` is the
         CSV a file challenge's submission must follow — `columns`,
@@ -761,7 +768,11 @@ class MLArenaClient:
         `attention_overflow` is `{kind: how many more}` (0 when all are
         there). The rows carry every fact.
 
-        `quotas`: `owned_challenge_count` (no limit on challenges yet),
+        A challenge row carries `archived_at_ts` (null unless
+        `archive_challenge` stamped it).
+
+        `quotas`: `owned_challenge_count` (the challenges you own that are
+        not archived; no limit on challenges yet),
         `max_courses_limit`, `active_course_count`, `can_create_course`.
         """
         return self._course_call("GET", "/author/workspace", error_label="workspace")
@@ -793,6 +804,10 @@ class MLArenaClient:
 
     def creator_challenge(self, challenge_id: int) -> dict:
         """The challenge as its editor sees it (creator scope).
+
+        An exercise set you may edit (the one
+        `add_course_exercise_set` made for your course) also takes a
+        `teacher` key; every other kind takes the `creator` scope.
 
         Mirrors `GET /api/creator_challenge/challenge/{id}`
         (`lifecycle.py`, `get_creator_challenge`). Returns the challenge plus
@@ -852,8 +867,9 @@ class MLArenaClient:
         `cover_missing` (no cover image); `[]` when nothing is missing, None
         while started. `running_editable_fields` names
         what stays editable once started, for you and this kind (among
-        `description`, `is_public`, `metrics`, `is_stop_after_deployment`,
-        `render_delay_second`, the chat LLM keys and limits, and
+        `description`, `is_public`, `metrics`, a code challenge's
+        `is_stop_after_deployment` and `render_delay_second`, the upload and
+        active-submission limits, the chat LLM keys and limits, and
         `machine_id` for an admin); anything else needs stop → edit →
         restart. `miniature` is the image route, None when none was
         uploaded.
@@ -1352,13 +1368,14 @@ class MLArenaClient:
         A kind accepts only the settings it has: the keywords of a
         capability flag that is false on the challenge's kind
         (`available_kinds()[i]["capabilities"]`) are refused with 400 —
-        `runs` (simulation_timeout_sec, is_stop_after_deployment, the
+        `runs` (simulation_timeout_sec, the
         deployment_nb_* runs), `submission_upload` (max_upload_size_bytes,
         max_upload_files, max_active_submissions_per_participant),
         `submission_filename`, `elo` (a `metrics` spec with
         `agg: "rating"`),
         `episode_budget_brackets`, `run_limits`, `agent_containers`
-        (the agent_* sizing, agent_gpu_count), `multi_agent`
+        (the agent_* sizing, agent_gpu_count, is_stop_after_deployment,
+        render_delay_second: a file challenge has neither), `multi_agent`
         (number_of_agents) and `exercises` (time_limit_sec, memory_limit_mb,
         max_concurrent_attempts, max_attempts_per_minute). The others apply to every kind, the runtime
         included (machine_id, the env_* sizing, env_gpu_count,
@@ -1415,7 +1432,12 @@ class MLArenaClient:
                 again, which pins an ELO leaderboard to its bootstrap ratings
                 forever. Set False to let the matchmaker keep pairing agents
                 (~10 matches per challenge every 2h). Editable on a running
-                challenge.
+                challenge. Code challenges only: a file is scored once.
+            deployment_nb_constraint_run, deployment_nb_initial_score_run:
+                the unscored check runs, then the scored runs, of each
+                deploy. A new code challenge has 2 and 10, a new file
+                challenge 0 and 1 (scoring the same file again gives the
+                same score; raise them when your env draws at random).
             episode_budget_brackets: episode budget tiers, a list of
                 `[threshold, n_episodes]` pairs from the worst threshold to
                 the best. A submission whose running mean is worse than a
@@ -1532,7 +1554,8 @@ class MLArenaClient:
                 1..600 (default 20); past it `submit_exercise` gets a 429.
 
         Requires a `creator`-scope token and ownership (or admin) of the
-        target challenge.
+        target challenge; an exercise set you may edit also takes a `teacher`
+        key.
         """
         sent = {
             "simulation_timeout_sec": simulation_timeout_sec,
@@ -1980,11 +2003,33 @@ class MLArenaClient:
             raise _failed(MLArenaError, "benchmark_status", resp)
         return resp.json()
 
-    def start_challenge(self, challenge_id: int) -> dict:
+    def start_challenge(self, challenge_id: int, *,
+                        clean_redeploy_all: bool = False) -> dict:
         """Move a creator challenge to ``status="started"``.
 
         Mirrors `PUT /api/creator_challenge/challenge/{id}/start`. Accepted
-        from ``draft``, ``stopped`` or ``ended`` (400 when already started).
+        from ``draft``, ``stopped`` or ``ended`` (400 when already started;
+        409 for an archived challenge, `unarchive_challenge` it first).
+        Returns `{"message", "clean_redeploy"}`.
+
+        An exercise set you may edit (the one
+        `add_course_exercise_set` made for your course) also takes a
+        `teacher` key; every other kind takes the `creator` scope. The start gate is the same for both.
+
+        `clean_redeploy_all=True` restarts a stopped or ended challenge and
+        re-scores every eligible submission in one transaction (the last step
+        of an update of the scoring: `stop_challenge`, edit, benchmark, then
+        this), all or nothing: no deploy and no scheduled run lands between
+        the restart and the re-score, and `clean_redeploy` then holds what
+        `clean_redeploy_all` answers (`total`, `redeployed`; `failed` is
+        empty). Stopping cancels no run, so while a submission to re-score
+        still has a run pending or running the call is a 409
+        (`.body["runs_in_flight"]`) and nothing is changed: wait for
+        `scoring_update(id)["rescore"]["runs_in_flight"]` to reach 0, then
+        call again. Read the count of submissions first with
+        `scoring_update(id)["rescore"]["submissions"]`. 400 on a draft and on
+        a kind without runs. Without it `clean_redeploy` is None.
+
         The first start sets ``start_date_ts``; a restart keeps it, and clears
         an ``end_date_ts`` already past (the restarted challenge is open-ended
         until `update_challenge(end_date_ts=…)` sets a new end).
@@ -2012,8 +2057,9 @@ class MLArenaClient:
             self._url(
                 f"/creator_challenge/challenge/{challenge_id}/start"
             ),
+            params={"clean_redeploy_all": "true"} if clean_redeploy_all else None,
             headers=self._headers(),
-            timeout=30,
+            timeout=300 if clean_redeploy_all else 30,
         )
         self._handle_response(resp)
         if resp.status_code != 200:
@@ -2027,7 +2073,15 @@ class MLArenaClient:
         only from ``started`` (400 otherwise). Stopping leaves submissions,
         results, the benchmark record and ``start_date_ts`` untouched, and
         unlocks the authoring fields like a draft, so the challenge can be
-        fixed and restarted with `start_challenge()`.
+        fixed and restarted with `start_challenge()`. It changes the status
+        and nothing else: runs already pending or running still finish and
+        count, no new deploy is accepted, and the challenge leaves the
+        catalog's started list while its page and results stay
+        (`scoring_update(id)["stop"]` counts what is in flight).
+
+        An exercise set you may edit (the one
+        `add_course_exercise_set` made for your course) also takes a
+        `teacher` key; every other kind takes the `creator` scope.
         """
         resp = self._request("PUT",
             self._url(
@@ -2063,6 +2117,145 @@ class MLArenaClient:
         if resp.status_code != 200:
             raise _failed(MLArenaError, "end_challenge", resp)
         return resp.json()
+
+    def scoring_update(self, challenge_id: int) -> dict:
+        """What stopping a challenge and re-scoring its submissions would do now.
+
+        Mirrors `GET /api/creator_challenge/challenge/{id}/scoring_update`:
+        the facts to read before `stop_challenge` → edit → `run_benchmark` →
+        `start_challenge(clean_redeploy_all=True)`. Returns
+
+        - `status`;
+        - `can_cancel_runs_in_flight`: the challenge is stopped or ended and has
+          runs `cancel_runs_in_flight` would cancel (`stop.cancellable_runs`);
+        - `stop`: `pending_runs`, `running_runs`, `deploys_in_flight`. Stop
+          cancels none of them: the runs still finish and count, the deploy
+          attempts still settle. After it no deploy, chat message or exercise
+          check is accepted, no further run is scheduled (a run queued before
+          the stop still plays, with the env folder as it is when its pod
+          starts), and the challenge
+          leaves the catalog's started list (only `challenges(status="all")`
+          still lists it) while its page and results stay;
+        - `rescore` (None on a chat challenge or an exercise set, which have
+          no runs): `submissions` (how many a re-score takes: the active and
+          the deploy-failed ones), `includes_benchmark`, `deleted_results`
+          (their result rows, all deleted), `runs_in_flight` (runs of theirs
+          still pending or running: the restart that re-scores is refused
+          until it is 0). Each of them gets a fresh deploy on the staff's
+          account and has no score until it settles;
+        - `env_takes_effect`: `next_run` (every run claimed after an edit of
+          the env folder uses it) or `pod_restart` (a chat agent or exercise
+          checker loads env.py when its pod is created, and every start
+          replaces the pod).
+        """
+        return self._course_call(
+            "GET", f"/creator_challenge/challenge/{challenge_id}/scoring_update",
+            error_label="scoring_update",
+        )
+
+    def cancel_runs_in_flight(self, challenge_id: int) -> dict:
+        """Cancel the runs a stopped challenge still has on their way and nobody will play.
+
+        Mirrors `POST
+        /api/creator_challenge/challenge/{id}/runs/cancel_in_flight`. The way
+        out when `start_challenge(id, clean_redeploy_all=True)` answers 409
+        because of runs that will never end: a pending run on a queue with no
+        poller or a disabled machine, a running row the platform lost track
+        of. A stopped or ended challenge only (409 otherwise). Cancels every
+        pending run and those lost running rows; a cancelled run scores
+        nothing and moves no rating. A participant's deploy that was open
+        fails as the platform's (`failure_owner: "platform"`, the submission
+        `deploy_failed`) and stays charged to their daily deploy quota
+        (`failed_participant_deploys` in the reply;
+        `scoring_update(id)["stop"]["participant_deploys_in_flight"]`
+        beforehand): follow with `start_challenge(id,
+        clean_redeploy_all=True)`, which redeploys those submissions as
+        staff, or the participant spends another deploy. A run a worker
+        still holds is left to end. Returns `{"cancelled_pending_runs", "cancelled_running_runs",
+        "failed_participant_deploys", "runs_in_flight"}` (the last: still on
+        their way after the call).
+        `scoring_update(id)["can_cancel_runs_in_flight"]` says whether the
+        call would do something.
+        """
+        return self._course_call(
+            "POST", f"/creator_challenge/challenge/{challenge_id}/runs/cancel_in_flight",
+            error_label="cancel_runs_in_flight",
+        )
+
+    def archive_challenge(self, challenge_id: int) -> dict:
+        """Archive a stopped or ended challenge — its owner or an admin.
+
+        Mirrors `POST /api/creator_challenge/challenge/{id}/archive`. The
+        challenge no longer counts among your challenges
+        (`workspace()["quotas"]["owned_challenge_count"]`) and its workspace
+        row carries `archived_at_ts`. Nothing else changes: every result, the
+        leaderboard and the public URL stay, and its editors still open it.
+        Returns the challenge (the `creator_challenge` shape, `archived_at_ts`
+        set). 409 when it is already archived, started (stop or end it first)
+        or a draft (`delete_challenge` instead). Archiving is about your
+        side only: an ended challenge stays among the past challenges of the
+        public catalog.
+        """
+        return self._course_call(
+            "POST", f"/creator_challenge/challenge/{challenge_id}/archive",
+            error_label="archive_challenge",
+        )
+
+    def unarchive_challenge(self, challenge_id: int) -> dict:
+        """Take a challenge out of the archive — its owner or an admin.
+
+        Mirrors `POST /api/creator_challenge/challenge/{id}/unarchive`. It
+        counts among your challenges again and can be restarted. Returns the
+        challenge; 409 when it is not archived.
+        """
+        return self._course_call(
+            "POST", f"/creator_challenge/challenge/{challenge_id}/unarchive",
+            error_label="unarchive_challenge",
+        )
+
+    def challenge_deletion(self, challenge_id: int) -> dict:
+        """What `delete_challenge` would do, without doing it — owner or admin.
+
+        Mirrors `GET /api/creator_challenge/challenge/{id}/deletion`. Returns
+        `can_delete` and what decides it: `status` (only a `draft` is
+        deleted), `submission_count` (submissions other than the benchmark),
+        `team_count`, `module_link_count` (course modules linking it),
+        `lesson_count` (lessons naming it in a directive), `runs_in_flight`
+        (a benchmark test on its way); and what goes with the challenge:
+        `env_files` (names in its env folder), `benchmark_files` (names in
+        its benchmark folder), `has_benchmark`, `run_count`
+        (every run of its environment), `exercise_count`,
+        `chat_session_count`, `deleted_datasets` (`[{id, label,
+        file_count}]`, attached to this challenge alone: deleted with their
+        stored files) and `kept_datasets` (attached to another challenge
+        too). `replay_count` replay files of those runs are not removed:
+        they expire from storage after 365 days. `storage_left` is `[]` here.
+        """
+        return self._course_call(
+            "GET", f"/creator_challenge/challenge/{challenge_id}/deletion",
+            error_label="challenge_deletion",
+        )
+
+    def delete_challenge(self, challenge_id: int) -> dict:
+        """Delete your own draft challenge — its owner or an admin.
+
+        Mirrors `DELETE /api/creator_challenge/challenge/{id}`. Only a draft
+        with no submission but the benchmark, no team, no course module
+        linking it, no lesson naming it and no run on its way (409 otherwise,
+        the counts in `.body`; a challenge that ran is archived instead,
+        `archive_challenge`). Deletes its rows (configuration, environment,
+        evaluation, tags, assistants, an exercise set's exercises), its
+        benchmark submission, every run of its environment, its folder (env
+        files, overview, cover, benchmark files) and the datasets attached
+        to it alone with their stored files. Returns what
+        `challenge_deletion` announced, with `storage_left`: what could not
+        be removed from storage although the rows are gone (`[]` when all of
+        it went; check it).
+        """
+        return self._course_call(
+            "DELETE", f"/creator_challenge/challenge/{challenge_id}",
+            error_label="delete_challenge",
+        )
 
     def agent_template(self, challenge_id: int) -> dict:
         """The agent.py template handed to the challenge's participants.
@@ -2112,6 +2305,140 @@ class MLArenaClient:
         return self._creator_get(
             challenge_id, "/csv-ground-truth", "csv_ground_truth"
         )
+
+    def scoring_form(self, challenge_id: int) -> dict:
+        """The scoring form of a file challenge: everything the form shows.
+
+        Mirrors `GET /api/creator_challenge/challenge/{id}/scoring-form`
+        (`scoring_form.py`). The form generates a plain `env.py` from a
+        metric, the scored column and the id column, so a file challenge
+        needs no Python. Returns:
+
+        - `metrics`: the metrics offered, each `{scoring_metric, label,
+          order, prediction, prediction_help}`: `accuracy`, `f1_macro`,
+          `rmse`, `mae`, `auc`, `log_loss`. `order` (`asc` / `desc`) is the
+          board's direction and comes with the metric; `prediction` is what a
+          participant writes in the scored column (`label`, `number`,
+          `probability`).
+        - `scoring_metric`, `scoring_target_column`, `scoring_id_column`: the
+          last choice env.py was generated from (all None before the first),
+          and `submission_filename`.
+        - `env_state`: `absent`, `default` (the untouched starting template),
+          `generated` (still the form's text) or `edited` (your own code).
+          `can_generate` says whether `set_scoring_form` would be accepted;
+          when not, `read_only_reason` (`started`, `env_edited`,
+          `config_file`) and `read_only_message` say why.
+        - `ground_truth`: `{filename, columns, separator,
+          suggested_id_column}` of the uploaded `y_test.csv`
+          (`ground_truth_filename`), None until it is uploaded.
+          `suggested_id_column` is the id column to pass to
+          `set_scoring_form` when it is obvious: the only column whose name
+          says "id" (`id`, `row_id`, `PassengerId`) and whose values name
+          each row once, else None;
+          `ground_truth_error` when the file there cannot be read or does not
+          fit the recorded choice. `ground_truth_max_rows`: the most rows the
+          form reads (a larger ground truth is refused at upload).
+        - `can_generate_baseline`: `generate_scoring_baseline` will succeed.
+        - `participant_messages_notice`: what a refused submission is told
+          (the row count, the first missing id, whether an id exists: so the
+          ground truth's ids are visible to participants; no value of the
+          scored column ever is).
+
+        A 400 on a challenge that is not a file challenge.
+        """
+        return self._creator_get(challenge_id, "/scoring-form", "scoring_form")
+
+    def set_scoring_form(self, challenge_id: int, scoring_metric: str,
+                         scoring_target_column: str, scoring_id_column: str,
+                         *, submission_filename: str | None = None) -> dict:
+        """Generate a file challenge's `env.py` from a metric and two columns.
+
+        Mirrors `PUT /api/creator_challenge/challenge/{id}/scoring-form`.
+        Writes `env.py` into the env folder (standard library only: rows of
+        the submission are matched to `y_test.csv` on `scoring_id_column`
+        and `scoring_target_column` is scored with `scoring_metric`), and
+        sets the board's label and direction for that metric. Returns the
+        form's new state (`scoring_form`).
+
+            client.set_scoring_form(cid, "rmse", "price", "house_id")
+            client.upload_env_file(cid, "y_test.csv")
+            client.generate_scoring_baseline(cid)
+            client.run_benchmark(cid)
+
+        What the generated file accepts, a participant's upload accepts: the
+        upload is checked by the same reader. Each file's separator is
+        detected (comma, semicolon, tab, pipe), a byte-order mark and other
+        columns are ignored, rows come in any order, and a whole-number id
+        or class label has one spelling (`1` = `1.0`; any other text must
+        match exactly, so `007` is not `7`). A number is finite and at most
+        1e100 in magnitude. A file keeps to fixed limits: a line of at most
+        1 000 000 characters, 1 000 columns each named once (`id,y,y` is
+        refused), 1 000 empty lines. A column name may hold any character: it reaches
+        the file as a string literal only.
+
+        `submission_filename` (a `.csv` name) is optional; the challenge
+        keeps its own otherwise. The ground truth may come before or after:
+        whichever comes second is checked against the other, and a missing
+        column is a 400 that names it.
+
+        The generated file is yours. Calling this again (another metric,
+        another column) rewrites it only while it is byte-identical to what
+        was generated: after a hand edit the call is a 409 (`MLArenaError`)
+        and nothing changes; delete `env.py` to use the form again. A 400
+        while the challenge is started (stop it first), when `challenge.toml`
+        holds `metrics`, or for a bad name.
+        """
+        body = {
+            "scoring_metric": scoring_metric,
+            "scoring_target_column": scoring_target_column,
+            "scoring_id_column": scoring_id_column,
+        }
+        if submission_filename is not None:
+            body["submission_filename"] = submission_filename
+        resp = self._request("PUT",
+            self._url(
+                f"/creator_challenge/challenge/{challenge_id}/scoring-form"
+            ),
+            headers=self._headers(json_body=True),
+            json=body,
+            timeout=30,
+        )
+        self._handle_response(resp)
+        if resp.status_code != 200:
+            raise _failed(MLArenaError, "set_scoring_form", resp)
+        return resp.json()
+
+    def generate_scoring_baseline(self, challenge_id: int) -> dict:
+        """Write the scoring form's baseline into the benchmark files.
+
+        Mirrors `POST /api/creator_challenge/challenge/{id}/scoring-form/baseline`.
+        The baseline is a submission that predicts one constant on every row:
+        the most frequent class (`accuracy`, `f1_macro`), the mean (`rmse`,
+        `mae`) or the share of the positive class (`auc`, `log_loss`). It is
+        never the ground truth. It replaces the benchmark's submission file;
+        `run_benchmark` then scores it, which is what Start asks for.
+
+        Returns `{message, filename, prediction, row_count,
+        replaced_previous}`: `replaced_previous` is True when a benchmark
+        file with rows was there and was overwritten. Needs the form
+        applied (`set_scoring_form`) and `y_test.csv` uploaded (400
+        otherwise); a 409 once `env.py` was edited by hand.
+
+        The benchmark is your reference, not a participant: it is on no
+        leaderboard. Read its score with `benchmark_status` or
+        `creator_submissions`.
+        """
+        resp = self._request("POST",
+            self._url(
+                f"/creator_challenge/challenge/{challenge_id}/scoring-form/baseline"
+            ),
+            headers=self._headers(),
+            timeout=60,
+        )
+        self._handle_response(resp)
+        if resp.status_code != 200:
+            raise _failed(MLArenaError, "generate_scoring_baseline", resp)
+        return resp.json()
 
     def create_dataset(self, challenge_id: int, label: str,
                        description: str | None = None) -> dict:
@@ -2417,20 +2744,30 @@ class MLArenaClient:
             raise _failed(MLArenaError, "clean_redeploy_submission", resp)
         return resp.json()
 
-    def clean_redeploy_all(self, challenge_id: int) -> dict:
+    def clean_redeploy_all(self, challenge_id: int, *, dry_run: bool = False) -> dict:
         """Re-score every eligible submission of a challenge (wipe its runs, deploy it again).
 
         Mirrors `POST
         /api/creator_challenge/challenge/{id}/submissions/clean_redeploy_all`
-        (`submissions.py`). Returns `{"total", "redeployed": [...],
-        "failed": [{"submission_id", "error"}]}` — a per-submission failure
-        does not stop the others, so retry only what `failed` names.
+        (`submissions.py`). Returns `{"dry_run", "total", "runs_in_flight",
+        "redeployed": [...], "failed": [{"submission_id", "error"}]}` — a
+        per-submission failure does not stop the others, so retry only what
+        `failed` names. `runs_in_flight` is how many runs of those
+        submissions were pending or running when the call began: a
+        submission with one is not re-scored (it is under `failed`).
+
+        `dry_run=True` writes nothing and returns the counts: `total` is the
+        number of submissions the call would re-score now (both lists empty),
+        in any status. The real call needs a started challenge (409
+        otherwise): to restart a stopped one and re-score it in one step use
+        `start_challenge(id, clean_redeploy_all=True)`.
         """
         resp = self._request("POST",
             self._url(
                 f"/creator_challenge/challenge/{challenge_id}"
                 "/submissions/clean_redeploy_all"
             ),
+            params={"dry_run": "true"} if dry_run else None,
             headers=self._headers(),
             timeout=300,
         )
@@ -4521,6 +4858,184 @@ class MLArenaClient:
             error_label="exercise_admin",
         )
 
+    def exercise_list(self, challenge_id: int) -> dict:
+        """An exercise set's exercises, for writing a lesson — `ExerciseListOut`.
+
+        Mirrors `GET /api/exercise/challenge/{cid}/exercises`. Returns
+        `exercises`, each `{key, title, kind, points}` (the `key` is what a
+        lesson's `mlarena:exercise id=<cid> key=<key>` directive names; never
+        a check, a solution or an accepted answer), `source` and `reason`:
+
+        - `source="file"`: read from the set's `exercises.json` (its env.py
+          loads it), whatever the set's status;
+        - `source="manifest"`: the exercises its checker registered the last
+          time the set was started (a hand-written env.py);
+        - `source="none"`: nothing known yet; `reason` says why (start the
+          set once).
+
+        `reason` is also set when the file holds no exercise or does not fit
+        the format. For whoever may edit the set, and for the owner and
+        assistants of a course that links it; `ChallengeNotFoundError` (404)
+        otherwise. Reading it is not activity: it wakes no checker.
+        """
+        return self._exercise_call(
+            "GET", f"/exercise/challenge/{challenge_id}/exercises",
+            error_label="exercise_list",
+        )
+
+    def exercise_definition(self, challenge_id: int) -> dict:
+        """An exercise set's exercises as data — `ExerciseDefinitionOut`.
+
+        Mirrors `GET /api/exercise/challenge/{cid}/definition`. Returns
+        `file` (the env folder's `exercises.json`, the document itself:
+        `{"version": 1, "exercises": [...]}`; None when there is none or
+        when it does not fit the format, `file_problem` then says why),
+        `env_py` (`generated`: the two-line loader the platform wrote;
+        `edited`: your own Python; `missing`), `loads_exercises_file`
+        (whether env.py calls `load_exercises("exercises.json")`, that
+        literal: when False the set serves what env.py declares, the file is
+        not read and the form does not write it), `write_blocked_by`
+        (None, `started` or `env_py`) and `can_write_code_exercises` (whether
+        you may write `code` exercises, whose `check` is Python the checker
+        runs: creator access, for now; `text` and `choice` exercises need
+        none).
+
+        Each exercise has `key`, `kind`, `title` (the prompt), `points`
+        (0 = practice) and `examples`, then by kind — `code`: `starter`,
+        `check` (Python run with `student` and `forbid` defined; it passes
+        when it raises nothing), `solution`, `wrong`; `text`: `accept` (the
+        accepted answers), `case_sensitive`, `wrong`; `choice`: `choices`,
+        `solution`. The format is documented in the platform's
+        `workers/exercise_v1/PROCESS.md` ("exercises.json").
+
+        For whoever may edit the set (owner, assistants, admins), with a
+        session or a creator / teacher key; anyone else gets
+        `ChallengeNotFoundError` (404), as for a challenge of another kind.
+        """
+        return self._exercise_call(
+            "GET", f"/exercise/challenge/{challenge_id}/definition",
+            error_label="exercise_definition",
+        )
+
+    def update_exercise_definition(self, challenge_id: int, exercises: list[dict]) -> dict:
+        """Write an exercise set's exercises (the whole list) — no Python file needed.
+
+        Mirrors `PUT /api/exercise/challenge/{cid}/definition`: the body is
+        the `exercises.json` document, `{"version": 1, "exercises":
+        exercises}`, validated strictly (an unknown field, a `check` that
+        does not compile, a `wrong` answer that is accepted, a repeated key
+        are a 400 naming the exercise and the field) and written to the env
+        folder; a folder without env.py gets the generated loader. Returns
+        `ExerciseDefinitionOut` (see `exercise_definition`). The stored
+        self-test is forgotten: run `self_test_exercises` again.
+
+            client.update_exercise_definition(cid, [
+                {"key": "bmi", "kind": "code", "title": "Body-mass index", "points": 1,
+                 "starter": "def bmi(weight_kg, height_m):\n    return ...\n",
+                 "check": "assert student.function('bmi')(70, 1.75) == 22.9\n",
+                 "solution": "def bmi(w, h):\n    return round(w / h ** 2, 1)\n",
+                 "wrong": ["def bmi(w, h):\n    return w / h ** 2\n"]},
+                {"key": "floor-div", "kind": "text", "title": "What does 7 // 2 print?",
+                 "points": 1, "accept": ["3"], "wrong": ["3.5"]},
+                {"key": "mutable", "kind": "choice", "title": "Which one is mutable?",
+                 "points": 1, "choices": ["tuple", "list"], "solution": "list"},
+            ])
+
+        Raises `PermissionDeniedError` (403) when the list has a `code`
+        exercise and you have no creator access ("Exercises checked by
+        Python code need creator access for now; short-answer and
+        multiple-choice exercises do not");
+        `MLArenaError` (409, `.body["write_blocked_by"]`) while the set
+        is started (`started`: stop it first) or when its hand-written env.py
+        does not load `exercises.json` (`env_py`); `MLArenaError` (400) for a
+        document that does not fit the format, or whose file would be larger
+        than 1 000 000 bytes (`.body["size"]`).
+        """
+        return self._exercise_call(
+            "PUT", f"/exercise/challenge/{challenge_id}/definition",
+            json_body={"version": 1, "exercises": exercises},
+            error_label="update_exercise_definition",
+        )
+
+    def exercise_self_test(self, challenge_id: int) -> dict:
+        """Where an exercise set's self-test stands — `ExerciseSelfTestOut`.
+
+        Mirrors `GET /api/exercise/challenge/{cid}/self-test`. Returns
+        `status` (`none` | `requested` | `running` | `done` | `timed_out`),
+        `self_test_requested_at_ts`, `self_test_at_ts` and, once `done`:
+        `passed` (the env loaded and every exercise's solution passed and
+        every `wrong` failed), `self_test_error` (the first failure, or why
+        the env did not load; None on a pass) and `self_test`, one `{key,
+        passed, message}` per exercise (None when the env did not load; a
+        check that does not finish in time fails with a timeout message). On
+        a started set, `done` is its checker's last load.
+        """
+        return self._exercise_call(
+            "GET", f"/exercise/challenge/{challenge_id}/self-test",
+            error_label="exercise_self_test",
+        )
+
+    def self_test_exercises(self, challenge_id: int, *, wait: bool = True,
+                            timeout: float = 300, poll_interval: float = 2) -> dict:
+        """Self-test an exercise set before starting it.
+
+        Mirrors `POST /api/exercise/challenge/{cid}/self-test` (202): the
+        platform starts a checker for the set, which loads the env, runs
+        every exercise's `solution` (it must pass) and `wrong` answers (each
+        must fail), reports and goes away; it serves no participant and
+        changes no score, no exercise and no status of the set. The checker
+        has to start first: expect 20–60 s, more on a cold machine. For a
+        draft or a stopped set.
+
+        With `wait=True` (default) the call then polls `exercise_self_test`
+        every `poll_interval` seconds (a client-side composition of the two
+        public routes) until `status` is `done`, and returns that
+        `ExerciseSelfTestOut`: read `passed` and `self_test`. `timed_out`,
+        or no result after `timeout` seconds, raises `MLArenaError` with the
+        last state as `.body`. With `wait=False` the 202 body is returned.
+
+        Raises `PermissionDeniedError` (403) when the set holds Python
+        checks (a `code` exercise, a hand-written env.py) and you have no
+        creator access (the same holds for `start_challenge`); `MLArenaError`
+        with the server's reason: 409 on a started set
+        (its checker self-tests at load: stop the set to self-test an edit),
+        on an ended one (restart it), and while a self-test of this set is
+        already pending (one at a time; it settles or times out after 10
+        minutes); the start gate's refusal, since a self-test starts a
+        checker where a start would (400 for authoring still to do, such as
+        an `exercises.json` that is missing, invalid or empty; 409 when the
+        set cannot run on its machine; `.body["start_blockers"]` lists them);
+        429 when you already have 2 self-tests pending, or the platform 4
+        (`.body["limit"]`), and, without creator access, within 60 s of your
+        previous self-test request (`.body["retry_after_sec"]`).
+        """
+        state = self._exercise_call(
+            "POST", f"/exercise/challenge/{challenge_id}/self-test", ok=(202,),
+            error_label="self_test_exercises",
+        )
+        if not wait:
+            return state
+        deadline = time.monotonic() + timeout
+        while True:
+            if state["status"] == "done":
+                return state
+            if state["status"] == "timed_out":
+                raise MLArenaError(
+                    f"self_test_exercises: no checker reported for challenge "
+                    f"{challenge_id} (status 'timed_out'): its machine may have no "
+                    f"room; ask again later.",
+                    body=state,
+                )
+            if time.monotonic() > deadline:
+                raise MLArenaError(
+                    f"self_test_exercises timed out after {timeout}s: the self-test "
+                    f"is still {state['status']!r}. Poll "
+                    f"exercise_self_test({challenge_id}) or raise timeout.",
+                    body=state,
+                )
+            time.sleep(poll_interval)
+            state = self.exercise_self_test(challenge_id)
+
     def check(self, challenge_id: int, key: str, obj, *, timeout: float = 60,
               echo: bool = True) -> dict:
         """Check a function, a class or a str of code against a `code` exercise.
@@ -4762,7 +5277,7 @@ class MLArenaClient:
             error_label="course_catalog",
         )
 
-    def course(self, slug: str) -> dict:
+    def course(self, slug: str, as_student: bool = False) -> dict:
         """Course landing: meta + ordered modules + lesson TOC + own progress.
 
         Mirrors `GET /api/academic_courses/{slug}`. Lesson bodies are omitted
@@ -4772,22 +5287,42 @@ class MLArenaClient:
         `has_cover` says whether there is a cover image — fetch it with
         `course_cover(landing["id"])`. `enrollment_state` (`open` |
         `archived` | `ended`) says whether the course takes a new enrollment.
+        `show_module_headings` is False when you are served a single module:
+        the course is then its content, with no module heading. Each lesson
+        of the TOC carries `visible_to_students` (it is published and so is
+        its module), next to its own `is_published`.
+
+        `as_student=True` ("View as student", `?as_student=true`) serves a
+        manager of the course what an enrolled student gets: no module or
+        lesson hidden from students, gated lessons open, `can_manage` False
+        and `as_student` True in the answer. The answer describes an
+        enrolled student who has done nothing yet: `is_enrolled` is True and
+        `progress` is the empty summary (`completed` 0 of the lessons
+        students see), whatever your own enrollment and progress. Nothing is
+        written (a progress write still needs your own enrollment) and it
+        changes nothing for anyone who does not manage the course. The
+        same flag is on `module_overview` and `lesson`.
         """
         return self._course_call(
-            "GET", f"/academic_courses/{slug}", error_label="course",
+            "GET", f"/academic_courses/{slug}", params=_as_student(as_student),
+            error_label="course",
         )
 
-    def module_overview(self, slug: str, module_slug: str) -> dict:
+    def module_overview(self, slug: str, module_slug: str,
+                        as_student: bool = False) -> dict:
         """A course module's overview: lesson list + attached challenge cards.
 
         Mirrors `GET /api/academic_courses/{slug}/modules/{module_slug}`.
+        `as_student=True`: as on `course` (a module hidden from students is
+        then a 404).
         """
         return self._course_call(
             "GET", f"/academic_courses/{slug}/modules/{module_slug}",
-            error_label="module_overview",
+            params=_as_student(as_student), error_label="module_overview",
         )
 
-    def lesson(self, slug: str, module_slug: str, lesson_slug: str) -> dict:
+    def lesson(self, slug: str, module_slug: str, lesson_slug: str,
+               as_student: bool = False) -> dict:
         """Full lesson body + server-resolved `mlarena:` directive payloads.
 
         Mirrors
@@ -4799,12 +5334,14 @@ class MLArenaClient:
         warning of a challenge that does not exist. A `challenge` /
         `competition` directive's payload is `{challenge_id, challenge,
         description}`, `challenge` being the challenge's reference (see
-        `challenge_overview`).
+        `challenge_overview`). `as_student=True`: as on `course` (a lesson
+        hidden from students is then a 404, and a block whose challenge the
+        course's students do not see is left out, with its warning).
         """
         return self._course_call(
             "GET",
             f"/academic_courses/{slug}/modules/{module_slug}/lessons/{lesson_slug}",
-            error_label="lesson",
+            params=_as_student(as_student), error_label="lesson",
         )
 
     def mark_lesson_viewed(self, lesson_id: int,
@@ -4919,16 +5456,34 @@ class MLArenaClient:
         )
 
     def get_module(self, module_id: int) -> dict:
-        """Module detail + lesson TOC + challenge links (owner or public).
+        """Module detail + lesson TOC + challenge links.
 
-        Mirrors `GET /api/teacher/modules/{id}`.
+        Mirrors `GET /api/teacher/modules/{id}`. For a module you may read as
+        an author: yours, a public one, or one linked into a course you are
+        the owner or an assistant of. `can_edit` says whether you may edit it
+        (see `update_module`), `is_owned` whether you hold its owner's rights
+        (delete, `visibility`, `detach_module`).
         """
         return self._course_call(
             "GET", f"/teacher/modules/{module_id}", error_label="get_module",
         )
 
     def update_module(self, module_id: int, **fields) -> dict:
-        """Update module meta — owner only. Mirrors `PUT /api/teacher/modules/{id}`.
+        """Update module meta. Mirrors `PUT /api/teacher/modules/{id}`.
+
+        A module is edited by its owner, an admin, and the assistants of a
+        course that links it and that the module's owner owns: a course's
+        assistants edit the modules, lessons, assets and challenge
+        attachments of the course's owner (`can_edit` on the module
+        payloads). What is created from inside a course
+        (`create_course_module`, `add_course_challenge`,
+        `copy_module_into_course`, `push_course`) belongs to the course's
+        owner, whoever of its staff creates it, so the owner edits what an
+        assistant added. A module a course only borrows (another teacher's
+        public module, or a module an assistant linked from their own
+        library with `link_module`) is read-only there:
+        `copy_module_into_course` it. `visibility` (library sharing) is the
+        owner's: a 403 for another editor.
 
         Accepts `title`, `slug`, `summary`, `icon`, `visibility`,
         `is_published`. Only the fields you pass are changed, so
@@ -4947,7 +5502,8 @@ class MLArenaClient:
         )
 
     def delete_module(self, module_id: int, force: bool = False) -> dict:
-        """Delete a module — owner only.
+        """Delete a module — its owner or an admin (403 for an editor who is
+        neither: removing it from a course is `unlink_module`).
 
         Mirrors `DELETE /api/teacher/modules/{id}`. Blocked (409) if any course
         links the module; pass `force=True` (`?force`) to detach those links
@@ -4960,11 +5516,18 @@ class MLArenaClient:
         )
 
     def fork_module(self, module_id: int) -> dict:
-        """Deep-copy a readable (owned or public) module into a new owned module.
+        """Deep-copy a module into a new module you own: a public module, or
+        one of yours (an admin: any). A module you only read as the staff of
+        a course is a 403 (the fork would be yours to share); to reuse it in
+        another course of its owner, use `copy_module_into_course`.
 
         Mirrors `POST /api/teacher/modules/{id}/fork`. Copies lessons (nesting
         preserved) + challenge attachments; the fork starts `private` and
-        records provenance via `forked_from_module_id`.
+        records provenance via `forked_from_module_id`. An attachment of a
+        challenge you may not attach yourself (`attach_challenge` would
+        refuse it: not public, not yours, not one you assist) is left out;
+        the answer names them in `dropped_challenges`
+        (`[{challenge_id, name}]`, `name` None when you may not see it).
         """
         return self._course_call(
             "POST", f"/teacher/modules/{module_id}/fork",
@@ -4972,7 +5535,8 @@ class MLArenaClient:
         )
 
     def detach_module(self, module_id: int) -> dict:
-        """Hand a bundle-managed module back to the editor — owner only.
+        """Hand a bundle-managed module back to the editor — its owner or an
+        admin (403 for an editor who is neither).
 
         Mirrors `POST /api/teacher/modules/{id}/detach`. A module last
         written by a course bundle (`push_course`, `mlarena course push`) has
@@ -5274,7 +5838,10 @@ class MLArenaClient:
         )
 
     def list_course_modules(self, course_id: int) -> list:
-        """List a course's linked modules in order, each with an owned/borrowed flag.
+        """List a course's linked modules in order, each with your rights on
+        it (`can_edit` and `is_owned`, see `get_module`), its `lessons` (the
+        lesson summaries of `get_module`, in order, each with
+        `visible_to_students`) and its `challenges`.
 
         Mirrors `GET /api/teacher/course/{id}/modules`.
         """
@@ -5296,6 +5863,81 @@ class MLArenaClient:
         return self._course_call(
             "POST", f"/teacher/course/{course_id}/modules", json_body=body,
             ok=(200, 201), error_label="link_module",
+        )
+
+    def create_course_module(self, course_id: int, title: str, *,
+                             slug: str | None = None,
+                             summary: str | None = None,
+                             icon: str | None = None,
+                             visibility: str | None = None,
+                             is_published: bool | None = None) -> dict:
+        """Create a module in a course: `create_module` and `link_module` in
+        one call, with one difference that matters for a team.
+
+        Mirrors `POST /api/teacher/course/{id}/modules/create` (the body of
+        `create_module`). The module belongs to the course's owner, whoever
+        of its staff creates it: created by an assistant, it is edited by the
+        owner and by the assistant alike; `visibility` (library sharing) is
+        then the owner's to set, so an assistant creates it `private` (any
+        other value is a 403). (`create_module` followed by
+        `link_module` makes a module of your own library: in a course you
+        only assist, its owner could not edit it.) Linked at the end of the
+        course, with a slug no module of the course uses. Returns the
+        course's new module row (the `list_course_modules` shape). Owner,
+        assistant or admin of the course.
+        """
+        body: dict = {"title": title}
+        for key, value in (("slug", slug), ("summary", summary), ("icon", icon),
+                           ("visibility", visibility), ("is_published", is_published)):
+            if value is not None:
+                body[key] = value
+        return self._course_call(
+            "POST", f"/teacher/course/{course_id}/modules/create", json_body=body,
+            ok=(201,), error_label="create_course_module",
+        )
+
+    def copy_module_into_course(self, course_id: int, module_id: int) -> dict:
+        """Copy a module from another course into this one.
+
+        Mirrors `POST /api/teacher/course/{id}/modules/copy`. Deep-copies a
+        module you may read as an author (yours, a public one, or one linked
+        into a course you are the owner or an assistant of; 404 otherwise).
+        Since the copy belongs to the target course's owner, a module that is
+        not public is copied only by its owner (or an admin) or into a course
+        of its owner (403 otherwise; `fork_module` asks the same question).
+        What is copied:
+        lessons, challenge attachments with their pass bars and assets, as
+        `fork_module` does (and with its `dropped_challenges`: an attachment
+        of a challenge you may not attach yourself is left out and named).
+        The copy belongs to the course's owner (yours in your own course; in
+        a course you assist, the owner's, and you edit it as its assistant),
+        `private`, editor-written, linked at the end of the course, with a
+        slug no module of the course uses; the source is untouched. Returns
+        the course's new module row (the `list_course_modules` shape) plus
+        `dropped_challenges`. Owner, assistant or admin of the target course.
+        """
+        return self._course_call(
+            "POST", f"/teacher/course/{course_id}/modules/copy",
+            json_body={"module_id": module_id},
+            ok=(201,), error_label="copy_module_into_course",
+        )
+
+    def list_copyable_modules(self, course_id: int) -> list:
+        """The modules `copy_module_into_course(course_id, …)` is offered:
+        those of the other courses you are the owner or an assistant of
+        (archived ones included) that the copy accepts into this course
+        (public, yours, or owned by this course's owner), by course name then
+        module order.
+
+        Mirrors `GET /api/teacher/course/{id}/copyable-modules`. Each row is
+        `{module_id, title, summary, lesson_count, challenge_count,
+        course: {id, name}}`; a module two of your courses link is listed
+        under each. A module outside the list (a public one) is still copied
+        by id.
+        """
+        return self._course_call(
+            "GET", f"/teacher/course/{course_id}/copyable-modules",
+            error_label="list_copyable_modules",
         )
 
     def add_course_challenge(self, course_id: int, challenge_id: int, *,
@@ -5324,6 +5966,90 @@ class MLArenaClient:
         return self._course_call(
             "POST", f"/teacher/course/{course_id}/challenges", json_body=body,
             ok=(200, 201), error_label="add_course_challenge",
+        )
+
+    def use_challenge_with_class(self, challenge: int | str, course: int | None = None, *,
+                                 name: str | None = None,
+                                 end_date: str | None = None) -> dict:
+        """Run a challenge with your class: put it in a course, get the join code.
+
+        The console's "Use with my class" (the Studio's New › "Run a challenge
+        with my class"), composed client-side from the public routes; no
+        route of its own. `challenge` is the challenge's id or its slug (the
+        `/challenges/<slug>` of its page; a slug is resolved with
+        `challenge_by_slug`).
+
+        - `course` given: the challenge is added to that course of yours
+          (`add_course_challenge`), then the course is read back
+          (`teacher_course`). `name` and `end_date` describe a new course and
+          are refused with it (`TypeError`).
+        - `course` None: a new course is created (`create_course`), named
+          `name` or, without one, after the challenge, with the optional
+          `end_date` (`YYYY-MM-DD`; a course without one never closes), and
+          the challenge is added to it. Creating a course is self-serve: any
+          token scope, and it makes the account a teacher (up to
+          `max_courses_limit` active courses).
+
+        The entry gets the route's defaults: titled after the challenge,
+        visible to students, the kind's default pass bar (70 for an exercise
+        set, none otherwise); `add_course_challenge` sets them otherwise. The
+        console offers only a started or draft challenge; the server accepts
+        any challenge you may reuse (public, yours, or one you assist on).
+        If the course is created but the challenge is refused, the course
+        stays and the refusal is raised.
+
+        Returns the course as `create_course` / `teacher_course` serve it:
+        its `join_code` is what students enroll with (`enroll_in_course`, or
+        the console's `/enroll/<join_code>` page).
+        """
+        if course is not None and (name is not None or end_date is not None):
+            raise TypeError(
+                "use_challenge_with_class: name and end_date describe a new course; "
+                "pass course= or them, not both"
+            )
+        if isinstance(challenge, str):
+            detail = self.challenge_by_slug(challenge)
+            challenge_id = detail["id"]
+        else:
+            detail = None
+            challenge_id = challenge
+        if course is not None:
+            self.add_course_challenge(course, challenge_id)
+            return self.teacher_course(course)
+        if name is None:
+            name = (detail if detail is not None else self.challenge(challenge_id))["name"]
+        created = self.create_course(name, end_date=end_date)
+        self.add_course_challenge(created["id"], challenge_id)
+        return created
+
+    def add_course_exercise_set(self, course_id: int, module_id: int, name: str, *,
+                                label: str | None = None,
+                                pass_threshold: float | None | _Unset = _UNSET) -> dict:
+        """Create an exercise set in a course's module, in one transaction.
+
+        Mirrors `POST /api/teacher/course/{id}/modules/{module_id}/exercise-sets`
+        — the console's "Add exercises". The server creates an exercise set
+        (a private draft named `name`, a challenge name: unique on the
+        platform) holding no exercise yet. It belongs to the course's owner;
+        the course's assistants edit, self-test, start and stop it through
+        the course. The server links it into the module
+        with `pass_threshold`, the percentage of points to solve: left out,
+        the kind's default (70); `None`, not graded. Returns the new link
+        (`ModuleChallengeLinkOut`): `challenge_id` is the set. Then write its
+        exercises with `update_exercise_definition`, check them with
+        `self_test_exercises`, and start it.
+
+        Requires teacher/TA/admin on the course and a module of that course
+        (`NotFoundError` otherwise); a taken name raises `MLArenaError` (409).
+        """
+        body: dict = {"name": name}
+        if label is not None:
+            body["label"] = label
+        if pass_threshold is not _UNSET:
+            body["pass_threshold"] = pass_threshold
+        return self._course_call(
+            "POST", f"/teacher/course/{course_id}/modules/{module_id}/exercise-sets",
+            json_body=body, ok=(201,), error_label="add_course_exercise_set",
         )
 
     def remove_course_challenge(self, course_id: int, module_id: int) -> dict:
@@ -5388,6 +6114,13 @@ class MLArenaClient:
         `student_email`, `enrolled_at_ts` and `passed_count` (pass bars
         cleared, out of the payload's `pass_bar_count`).
         `export_course_grades_csv` is this payload as a CSV.
+
+        An exercise set (the in-lesson exercises) is an entry like the
+        others: its `value` is the % of points solved. Its cells also carry
+        `exercises`: `{solved, attempted, total}` counted over the set's
+        active exercises (the student's, or their team's; zeros before the
+        first Check), and its challenge meta `exercise_count`. Both are None
+        for every other kind of challenge.
         """
         return self._course_call(
             "GET", f"/teacher/course/{course_id}/progress",
@@ -5402,8 +6135,9 @@ class MLArenaClient:
         column per challenge or exercise set of the course (entries hidden
         from students included, headed `<name> (hidden)`) holding the score,
         or `Not submitted` / `Scoring` / `Failed`; a `passed` column per
-        challenge with a pass bar, a `team` column per challenge with teams,
-        and `Passed` (`cleared/total` pass bars). Writes
+        challenge with a pass bar, `solved` and `attempted` columns
+        (`n/total` exercises) per exercise set, a `team` column per challenge
+        with teams, and `Passed` (`cleared/total` pass bars). Writes
         `grades_course_<id>.csv`: UTF-8 with a byte-order mark, formula-like
         text cells prefixed with an apostrophe (as `export_course_csv`).
         Owner, assistant or admin.
@@ -5456,7 +6190,10 @@ class MLArenaClient:
         (`ask_student_identity`, `report_recipients`, `report_to_assistants`,
         `report_last_sent_at_ts`) and the counts `enrollment_count`,
         `assistant_count`, `module_count`, `challenge_count` (entries hidden
-        from students included). It also carries what `workspace()` follows
+        from students included), `show_module_headings` (False for a course
+        with a single module: its entries are then the course's, with no
+        module heading) and `exercise_default_pass_threshold` (the pass bar
+        `add_course_exercise_set` applies when you name none). It also carries what `workspace()` follows
         about the course, under the same names and from the same computation:
         `active_enrollment_count_7d`, `last_active_at_ts` and
         `enrolled_without_submission` (served while the course is not
@@ -5500,16 +6237,18 @@ class MLArenaClient:
         Mirrors `POST /api/teacher/course/{id}/duplicate`. The copy is yours
         and counts in your limit (403 when it is reached). It gets the
         settings (code, description, instructor, cover, enrollment and report
-        settings) and a copy of every module you may read (yours, or a public
-        one: what `fork_module` accepts): lessons, assets, challenge links
-        with their pass bars and labels. Modules are copied, not linked, so
-        editing the copy never changes the source; the challenges stay the
-        same challenges. A module you may not read (an assistant's private
-        module) is linked instead, live, and named in `linked_modules`
-        (`[{id, title}]`). Not copied: enrollments, progress, dates,
-        assistants; the copy is `private` and has a fresh `join_code`. `name`
-        defaults to the source's name followed by " (copy)". Returns the new
-        course (the `teacher_course` shape) plus `linked_modules`. 409 when
+        settings) and a copy of every module it links that you may copy (a
+        public module, or one of yours: what `fork_module` accepts): lessons,
+        assets, challenge links with their pass bars and labels. Modules are
+        copied, not linked, so editing the copy never changes the source; the
+        challenges stay the same challenges. Another teacher's private module
+        linked in the course (an assistant's own library module) is neither
+        copied nor linked: it is named in `left_out_modules`
+        (`[{id, title}]`), and its owner copies it into the new course
+        (`copy_module_into_course`). Not copied: enrollments, progress, dates, assistants; the copy is
+        `private` and has a fresh `join_code`. `name` defaults to the
+        source's name followed by " (copy)". Returns the new course (the
+        `teacher_course` shape) plus `left_out_modules`. 409 when
         another course took the copy's address at the same moment (call it
         again) or when the source's cover file is missing from storage.
         """
@@ -5812,7 +6551,8 @@ class MLArenaClient:
                 slug: foundations
                 summary: "..."       # optional
                 icon: book           # optional
-                visibility: public   # optional (default private): teacher reuse
+                visibility: public   # optional: teacher reuse. Left out: private for a
+                                     # new module, unchanged for an existing one
                 is_published: true   # optional (default true): false = hidden from students
                 challenges:          # optional
                   - slug: cartpole-v1       # the challenge's URL slug (or challenge_id:)
@@ -6096,6 +6836,12 @@ class MLArenaClient:
         head = self._token.split("_")
         masked = "_".join(head[:-1] + ["…"]) if len(head) in (3, 4) else "…"
         return f"MLArenaClient(base_url='{self._base_url}', token='{masked}')"
+
+
+def _as_student(as_student: bool) -> dict | None:
+    """The query string of a learner read: ``?as_student=true`` when asked,
+    nothing otherwise."""
+    return {"as_student": "true"} if as_student else None
 
 
 def _filtered_fields(fields: dict, allowed: set, method_name: str) -> dict:

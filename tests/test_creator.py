@@ -110,6 +110,7 @@ READS = [
     ("creator_submissions", (7,), CREATOR + "/submissions"),
     ("challenge_assistants", (7,), CREATOR + "/assistants"),
     ("csv_ground_truth", (7,), CREATOR + "/csv-ground-truth"),
+    ("scoring_form", (7,), CREATOR + "/scoring-form"),
     ("agent_template", (7,), CREATOR + "/agent-template"),
     ("challenge_overview", (7,), CREATOR + "/overview"),
     ("challenge_deploy_failures", (7,), CREATOR + "/deploy-failures"),
@@ -798,6 +799,66 @@ def test_agent_template_returns_the_served_template():
             == ("GET", CREATOR + "/agent-template"), rec.last["path"])
 
 
+def test_set_scoring_form_sends_the_choice_under_the_column_names():
+    state = {"scoring_metric": "rmse", "env_state": "generated", "can_generate": True}
+    c, rec = make_client(lambda *_: (200, state))
+    _expect(c.set_scoring_form(7, "rmse", "price", "house_id") == state, "reply as served")
+    _expect((rec.last["method"], rec.last["path"]) == ("PUT", CREATOR + "/scoring-form"),
+            rec.last["path"])
+    _expect(rec.last["json"] == {
+        "scoring_metric": "rmse", "scoring_target_column": "price",
+        "scoring_id_column": "house_id",
+    }, rec.last["json"])
+
+    c.set_scoring_form(7, "accuracy", "label", "id", submission_filename="predictions.csv")
+    _expect(rec.last["json"] == {
+        "scoring_metric": "accuracy", "scoring_target_column": "label",
+        "scoring_id_column": "id", "submission_filename": "predictions.csv",
+    }, rec.last["json"])
+
+
+def test_set_scoring_form_on_an_edited_env_raises_with_the_reason():
+    """After a hand edit of env.py the route answers 409 and writes nothing."""
+    c, _ = make_client(lambda *_: (409, {"error": "env.py was edited by hand"}))
+    try:
+        c.set_scoring_form(7, "mae", "price", "house_id")
+    except MLArenaError as exc:
+        _expect(exc.status_code == 409, exc.status_code)
+        _expect("edited by hand" in str(exc), str(exc))
+    else:
+        raise AssertionError("a 409 must raise")
+
+
+def test_a_ground_truth_missing_a_column_raises_with_the_column():
+    c, _ = make_client(lambda *_: (
+        400, {"error": "y_test.csv has no column 'price' (the scored column)"}))
+    try:
+        c.set_scoring_form(7, "rmse", "price", "house_id")
+    except MLArenaError as exc:
+        _expect("no column 'price'" in str(exc), str(exc))
+    else:
+        raise AssertionError("a 400 must raise")
+
+
+def test_generate_scoring_baseline_posts_and_returns_the_reply():
+    reply = {"message": "Baseline submission.csv written to the benchmark files",
+             "filename": "submission.csv", "prediction": "200.0", "row_count": 3,
+             "replaced_previous": False}
+    c, rec = make_client(lambda *_: (200, reply))
+    _expect(c.generate_scoring_baseline(7) == reply, "reply as served")
+    _expect((rec.last["method"], rec.last["path"])
+            == ("POST", CREATOR + "/scoring-form/baseline"), rec.last["path"])
+    _expect(rec.last.get("json") is None, rec.last.get("json"))
+
+    c, _ = make_client(lambda *_: (400, {"error": "Upload the ground truth (y_test.csv) first"}))
+    try:
+        c.generate_scoring_baseline(7)
+    except MLArenaError as exc:
+        _expect("y_test.csv" in str(exc), str(exc))
+    else:
+        raise AssertionError("a 400 must raise")
+
+
 def test_public_stats_reads_the_landing_counters():
     stats = {"users": 12, "challenges": 3, "submissions": 40}
     c, rec = make_client(lambda *_: (200, stats))
@@ -838,6 +899,60 @@ def test_challenges_passes_the_ended_status():
         "has_next": False, "has_prev": False}}))
     c.challenges(status="ended", page=1)
     _expect(rec.last["params"]["status"] == "ended", rec.last["params"])
+
+
+def test_start_challenge_can_restart_and_rescore_in_one_call():
+    c, rec = make_client(lambda *_: (200, {"message": "ok", "clean_redeploy": None}))
+    c.start_challenge(7)
+    _expect(rec.last["method"] == "PUT", rec.last["method"])
+    _expect(rec.last["path"] == CREATOR + "/start", rec.last["path"])
+    _expect(rec.last["params"] is None, rec.last["params"])
+
+    c.start_challenge(7, clean_redeploy_all=True)
+    _expect(rec.last["path"] == CREATOR + "/start", rec.last["path"])
+    _expect(rec.last["params"] == {"clean_redeploy_all": "true"}, rec.last["params"])
+
+
+def test_clean_redeploy_all_dry_run_is_a_query_parameter():
+    c, rec = make_client(lambda *_: (200, {"dry_run": True, "total": 3,
+                                           "redeployed": [], "failed": []}))
+    out = c.clean_redeploy_all(7, dry_run=True)
+    _expect(rec.last["method"] == "POST", rec.last["method"])
+    _expect(rec.last["path"] == CREATOR + "/submissions/clean_redeploy_all", rec.last["path"])
+    _expect(rec.last["params"] == {"dry_run": "true"}, rec.last["params"])
+    _expect(out["total"] == 3, out)
+    c.clean_redeploy_all(7)
+    _expect(rec.last["params"] is None, rec.last["params"])
+
+
+def test_the_scoring_update_archive_and_delete_methods_hit_their_routes():
+    c, rec = make_client(lambda *_: (200, {"ok": True}))
+    for method, verb, suffix in (
+        ("scoring_update", "GET", "/scoring_update"),
+        ("cancel_runs_in_flight", "POST", "/runs/cancel_in_flight"),
+        ("archive_challenge", "POST", "/archive"),
+        ("unarchive_challenge", "POST", "/unarchive"),
+        ("challenge_deletion", "GET", "/deletion"),
+        ("delete_challenge", "DELETE", ""),
+    ):
+        getattr(c, method)(7)
+        _expect(rec.last["method"] == verb, (method, rec.last["method"]))
+        _expect(rec.last["path"] == CREATOR + suffix, (method, rec.last["path"]))
+        _expect(rec.last.get("json") is None, (method, rec.last.get("json")))
+
+
+def test_a_refused_delete_carries_the_counts():
+    body = {"error": "The challenge cannot be deleted while it has 2 submission(s).",
+            "status": "draft", "submission_count": 2, "team_count": 0,
+            "module_link_count": 0, "runs_in_flight": 0}
+    c, _rec = make_client(lambda *_: (409, body))
+    try:
+        c.delete_challenge(7)
+    except MLArenaError as exc:
+        _expect(exc.status_code == 409, exc.status_code)
+        _expect(exc.body["submission_count"] == 2, exc.body)
+    else:
+        raise AssertionError("delete_challenge did not raise on a 409")
 
 
 def _run_all():

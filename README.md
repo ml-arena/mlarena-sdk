@@ -2,6 +2,240 @@
 
 Python SDK for [ML Arena](https://ml-arena.com) — make submissions, manage challenges, manage courses, and read leaderboards from any notebook or IDE.
 
+## 4.18.0 — a file challenge without Python
+
+Requires a platform at Alembic `c1f5a9d3e7b2` or later.
+
+- **`challenge(id)["can_reuse"]`.** Whether you may add the challenge to a
+  course of yours (the rule of `attach_challenge` / `add_course_challenge`
+  and of `challenges_for_course()`); attaching a private challenge you only
+  see through a course now says so instead of "does not match any
+  challenge". `challenges_for_course()` takes a creator key too.
+- **Kind labels.** `kind_label` (and `available_kinds()` `label`) say what
+  participants do: `"Python agent"`, `"Upload a file"`, `"Chat with an AI
+  agent"`, `"Exercises"` (were "Code challenge", "File challenge", "Chat
+  challenge", "Exercise set"). `kernel_version` is unchanged: match on it,
+  not on the label.
+- **Exercise sets without Python.** A set's exercises are data
+  (`exercises.json` in its env folder, loaded by
+  `exercisekit.load_exercises`): `exercise_definition(cid)` reads them,
+  `update_exercise_definition(cid, exercises)` writes the whole list, each
+  exercise `{key, kind, title, points, examples}` plus, by kind, `code`:
+  `starter`, `check` (Python run with `student` and `forbid` defined),
+  `solution`, `wrong`; `text`: `accept`, `case_sensitive`, `wrong`; `choice`:
+  `choices`, `solution`. A document that does not fit is a 400 naming the
+  exercise and the field; a started set and a hand-written env.py that does
+  not load the file are a 409 (`.body["write_blocked_by"]`). A set with its
+  own env.py works as before.
+- **Self-test before start.** `self_test_exercises(cid)` asks the platform to
+  start a checker for a set that is not started, waits (expect 20–60 s) and
+  returns `ExerciseSelfTestOut`: `passed` and `self_test`, one `{key, passed,
+  message}` per exercise, with `self_test_error` (the first failure, or why
+  the env did not load). `exercise_self_test(cid)` reads the state
+  (`none` | `requested` | `running` | `done` | `timed_out`). A self-test is
+  for a draft or a stopped set, is held to the start gate, runs one at a
+  time per set (10 minutes at most), and is capped at 2 pending per author
+  and 4 on the platform (429), and to one request per minute without
+  creator access (429, `.body["retry_after_sec"]`). It writes nothing but its
+  result: no score, no exercise, no status. Without creator access an owner
+  has at most 15 exercise sets started at once (a `started_sets_cap` start
+  blocker), and stopping or ending a set with Python checks needs what
+  starting it needs. Needs Alembic `f3c7b1d5a9e4`.
+- **Python checks need creator access, for now.** A `code` exercise's
+  `check` runs on the platform's checker: writing one, and self-testing or
+  starting a set that holds one (or a hand-written env.py), is a 403 without
+  creator access; `exercise_definition(cid)["can_write_code_exercises"]` says
+  which you are. `text` and `choice` exercises are open to every author.
+- **A set's exercises for the lesson editor.** `exercise_list(cid)` returns
+  `{source, reason, exercises: [{key, title, kind, points}]}` for the set's
+  editors and the staff of a course that links it.
+- **Add exercises from a course.**
+  `add_course_exercise_set(course_id, module_id, name)` creates an exercise
+  set owned by the course's owner (the course's assistants edit, self-test,
+  start and stop it through the course) and links it into the module with the default pass
+  bar (70; `pass_threshold=None` = not graded), in one transaction. The definition and
+  self-test methods take a teacher key for a set you own, and so do
+  `creator_challenge`, `update_settings`, `start_challenge` and
+  `stop_challenge` on an exercise set you may edit (every other kind keeps
+  the `creator` scope).
+- **A course's team edits the course's modules.** A module is edited by its
+  owner, an admin, and the assistants of a course that links it and that the
+  module's owner owns (`update_module`, the lesson, asset and
+  challenge-attachment methods). What is made from inside a course belongs
+  to the course's owner, whoever of the staff makes it:
+  `create_course_module(course_id, title, …)` (new; `private` unless the
+  course's owner or an admin calls it), `add_course_challenge`,
+  `copy_module_into_course` and `push_course`; so the owner edits what an
+  assistant added. A module an assistant links from their own library
+  (`create_module` + `link_module`) stays theirs and is read-only for the
+  course's owner, like any borrowed module: copy it. Module payloads carry
+  `can_edit` next to `is_owned`, which means the owner's rights:
+  `delete_module`, `update_module(visibility=…)` and `detach_module` are a
+  403 for an editor who is not the owner (or an admin).
+- **Copy a module from another course.**
+  `copy_module_into_course(course_id, module_id)` deep-copies a module you may
+  read as an author (lessons, challenge links with pass bars, assets) into the
+  course, as a module of the course's owner (so a module that is not public
+  is copied only by its owner, or into a course of its owner: 403 otherwise);
+  `list_copyable_modules(course_id)` lists the modules of your other courses
+  with their course name, lesson and challenge counts. A copy and
+  `fork_module` leave out the attachments of challenges you may not attach
+  yourself and name them in `dropped_challenges`. `fork_module`,
+  `copy_module_into_course` and `duplicate_course` ask one question: the
+  module is public, or yours, or (for a copy into a course) already the
+  course owner's. `fork_module` on a module you only read as the staff of a
+  course is now a 403. `duplicate_course` leaves out another teacher's
+  private module linked in the course and names it in `left_out_modules`
+  (it replaces `linked_modules`).
+- **`push_course` and a module's owner.** A push writes the modules the
+  course links that the pusher may edit; an assistant's push no longer
+  reaches a module of the course's owner that the course does not link
+  (400), does not change a module's `visibility` and does not take an
+  editor-written module over for the bundle (400 each: the module's owner
+  pushes it once). A manifest that leaves a module's `visibility` out now
+  leaves an existing module's as it is (it used to reset it to `private`);
+  the key's default applies to a module the push creates.
+- **A course's content in two reads.** Each row of
+  `list_course_modules(course_id)` carries the module's `lessons` (summaries,
+  with `visible_to_students`); `teacher_course(course_id)` carries
+  `show_module_headings` and `exercise_default_pass_threshold`.
+- **View as student.** `course(slug, as_student=True)`,
+  `module_overview(…, as_student=True)` and `lesson(…, as_student=True)` serve
+  a manager of the course what an enrolled student gets: nothing hidden from
+  students, gated lessons open, challenge cards and lesson blocks only for
+  the challenges a student of the course sees. The answers carry
+  `as_student`; a course
+  landing and a module overview carry `show_module_headings` (False for a
+  single module); every lesson row carries `visible_to_students`.
+- **Exercise results in the grade sheet.** In `course_progress` a cell of an
+  exercise set carries `exercises` (`{solved, attempted, total}`) and its
+  column `exercise_count`; `export_course_grades_csv` adds `solved` and
+  `attempted` columns for each set.
+
+- **The scoring form: a file challenge without Python.**
+  `set_scoring_form(challenge_id, scoring_metric, scoring_target_column,
+  scoring_id_column, submission_filename=None)` generates a plain `env.py`
+  (standard library only) that matches a submission's rows to `y_test.csv` on
+  the id column and scores the scored column, and sets the board's label and
+  direction. Six metrics: `accuracy`, `f1_macro`, `auc` (higher is better),
+  `rmse`, `mae`, `log_loss` (lower is better). `scoring_form(challenge_id)`
+  reads the form's whole state: the metrics with their label and direction,
+  the current choice, the columns of the uploaded ground truth, and whether
+  `env.py` is still the generated file.
+
+  ```python
+  cid = client.create_challenge("House prices", kernel_version="file_v1")["challenge_id"]
+  client.set_scoring_form(cid, "rmse", "price", "house_id")
+  client.upload_env_file(cid, "y_test.csv")      # checked: both columns must be there
+  client.generate_scoring_baseline(cid)           # predicts the mean on every row
+  client.run_benchmark(cid)                       # then poll benchmark_status(cid)
+  client.start_challenge(cid)
+  ```
+
+  The generated file is yours: open it, edit it, keep it. The form rewrites
+  it (another metric, another column) only while it is byte-identical to what
+  was generated; after a hand edit `set_scoring_form` is a 409
+  (`MLArenaError`), `scoring_form()["env_state"]` is `edited` and
+  `can_generate` is `False`. Delete `env.py` to use the form again.
+- **`y_test.csv` is checked at upload** on a challenge whose `env.py` the
+  form generated: a missing id or scored column, a repeated id, a value the
+  metric cannot read (a word under `rmse`, three classes under `auc`), or
+  more than `scoring_form()["ground_truth_max_rows"]` rows (500 000) is a
+  400 that names the column, and the file already there stays. The same
+  check applies to a ground truth that arrives in `push_challenge`.
+- **A participant's upload is checked by the generated `env.py`'s own
+  reader**, so what the upload accepts is what the run scores: any of the
+  four separators, a byte-order mark, extra columns, any row order, ids
+  written `1` or `1.0`. A value the run would refuse (a missing or unknown
+  id, a word where a number is expected, a number beyond 1e100) is refused
+  at upload with the row named. `scoring_form()["participant_messages_notice"]`
+  says what those messages reveal: the ground truth's ids, never a value of
+  the scored column.
+- **`generate_scoring_baseline(challenge_id)`** writes the benchmark's
+  submission file: one constant on every row (the most frequent class, the
+  mean, or the share of the positive class), never the ground truth. Its
+  reply says `replaced_previous` when it overwrote a benchmark file.
+- **The benchmark is on no leaderboard.** `leaderboard()` no longer returns
+  the challenge's `__benchmark__` row, ranks start at the first participant,
+  and `challenge()["statistics"]` does not count it. Its score is on
+  `benchmark_status()` and `creator_submissions()` (where its `rank` is
+  `None`).
+- **More saves without a stop.** On a started challenge `update_settings`
+  now also takes `max_active_submissions_per_participant`,
+  `max_upload_size_bytes` and `max_upload_files`: they gate the next upload or
+  deploy only. `config_fields()` (`running_editable`) and
+  `creator_challenge()["running_editable_fields"]` say which keys are open.
+- **Updating the scoring of a started challenge, with the consequences
+  stated.** `scoring_update(challenge_id)` returns what a stop leaves in
+  flight (`stop`: pending and running runs, deploys in flight; none is
+  cancelled) and what a re-score takes (`rescore`: `submissions`,
+  `includes_benchmark`, `deleted_results`, `runs_in_flight`).
+  `clean_redeploy_all(challenge_id, dry_run=True)` returns the counts without
+  writing. `start_challenge(challenge_id, clean_redeploy_all=True)` restarts a
+  stopped or ended challenge and re-scores every eligible submission in one
+  transaction, all or nothing: while one of them still has a run pending or
+  running (a stop cancels none) it is a 409 with `runs_in_flight` and
+  nothing changes, so the board never reopens with two scorings.
+
+  ```python
+  plan = client.scoring_update(cid)
+  print(plan["stop"], plan["rescore"]["submissions"])
+  client.stop_challenge(cid)
+  client.upload_env_file(cid, "env.py")
+  client.run_benchmark(cid)                       # then poll benchmark_status(cid)
+  while client.scoring_update(cid)["rescore"]["runs_in_flight"]:
+      time.sleep(10)                              # runs queued before the stop still play
+  restarted = client.start_challenge(cid, clean_redeploy_all=True)
+  print(restarted["clean_redeploy"]["total"])
+  ```
+
+  `cancel_runs_in_flight(challenge_id)` is the way out when that 409 is
+  caused by runs that will never end (a queue with no poller, a run the
+  platform lost): on a stopped or ended challenge it cancels the pending runs
+  and the lost running rows, and leaves a run a worker still holds. An open
+  deploy it cancels fails as the platform's and stays charged to the
+  participant's daily quota (`failed_participant_deploys` in the reply): the
+  re-scoring restart redeploys those submissions as staff;
+  `scoring_update()["can_cancel_runs_in_flight"]` says when it applies.
+
+  Changed: `clean_redeploy_all` and `clean_redeploy_submission` on a
+  challenge that is not started are a 409 (`MLArenaError`); the bulk call
+  used to answer 200 with every submission under `failed`. Both replies of
+  `clean_redeploy_all` carry `dry_run` and `runs_in_flight`; `start_challenge` returns
+  `{"message", "clean_redeploy"}`.
+- **Delete your own draft.** `delete_challenge(challenge_id)` deletes a draft
+  with no submission but the benchmark, no team, no course module linking it,
+  no lesson naming it in a directive and no run on its way: its rows, its
+  benchmark and every run, its folder and the datasets attached to it alone.
+  `challenge_deletion(challenge_id)` says beforehand what would go and what
+  blocks (`can_delete`, the counts, `env_files`, `run_count`,
+  `exercise_count`, `deleted_datasets`, `kept_datasets`; `replay_count`
+  replay files are left to the 365-day expiry). The reply's `storage_left`
+  lists what could not be removed from storage. Owner or admin, and the
+  author of an exercise set made from a course (a `teacher` key works for
+  it, as for its start and stop); 409 otherwise, with the counts in `.body`.
+- **Archive a closed challenge.** `archive_challenge(challenge_id)` /
+  `unarchive_challenge(challenge_id)` for a stopped or ended challenge of
+  yours: it leaves `workspace()["quotas"]["owned_challenge_count"]` and its
+  workspace row carries `archived_at_ts`; results, leaderboard and URL stay,
+  and an ended challenge is still among the past challenges of the catalog.
+  `start_challenge` on an archived challenge is a 409 until it is unarchived.
+  Needs Alembic `e2b6d0f4a8c3`.
+
+- **Run a challenge with your class.**
+  `use_challenge_with_class(challenge, course=None, *, name=None, end_date=None)`
+  is the console's "Use with my class": with `course`, it adds the challenge
+  (id or slug) to that course of yours and reads the course back; without,
+  it creates a course named `name` or after the challenge (optional
+  `end_date`, `YYYY-MM-DD`) and adds the challenge to it. Returns the course
+  with its `join_code`. A composition of `create_course`,
+  `add_course_challenge` and `teacher_course`: no new route.
+
+  ```python
+  course = client.use_challenge_with_class("titanic", end_date="2027-06-30")
+  print(course["join_code"])                      # students: enroll_in_course(code)
+  ```
+
 ## 4.17.1 — a course's leaderboard names its participants to the course's members only
 
 - **`leaderboard(challenge_id, course_id=…)` read from outside the course
@@ -1573,6 +1807,7 @@ Everything the console's creator editor does, on the same routes:
 - Benchmark: `client.list_benchmark_files(challenge_id)`, `upload_benchmark_file`, `update_benchmark_file_content`, `delete_benchmark_file(challenge_id, filename)`, `run_benchmark`, `benchmark_status` (`{run, checks}`: the run and the config's budgets checked against it).
 - Presentation: `client.challenge_markdown(challenge_id)` / `set_challenge_markdown`, `client.challenge_image(challenge_id, dest_dir=".")` / `set_challenge_image` / `delete_challenge_image`.
 - Agent template: `client.agent_template(challenge_id)` (the stored template, or the default one), `client.update_agent_template(challenge_id, …)`, `client.csv_ground_truth(challenge_id)` (file challenges).
+- Scoring form (file challenges, no Python): `client.scoring_form(challenge_id)` (the metrics with label and direction, the current choice, the ground truth's columns, `env_state`), `client.set_scoring_form(challenge_id, scoring_metric, scoring_target_column, scoring_id_column, submission_filename=None)` (generates `env.py`; a 409 once the file was edited by hand), `client.generate_scoring_baseline(challenge_id)` (a constant-prediction benchmark file, never the ground truth).
 - Lifecycle: `client.start_challenge(challenge_id)` (from `draft` or `stopped`) / `stop_challenge(challenge_id)` (from `started` to `stopped`).
 - Follow: `client.challenge_overview(challenge_id)` (`challenge`, the challenge's reference with the participant count in `statistics`, and `counters`: teams, submissions created in the last 7 days with the per-day series, deploy-failed submissions by owner, the last submission, the course count), `client.challenge_deploy_failures(challenge_id)` (the deploy-failed submissions grouped by `failure_owner` and `error_type`, each group with its count, a message head and up to 20 submission ids), `client.challenge_courses(challenge_id)` (the courses using the challenge that you may see, archived ones included, each with your `role` on it and `enrollment_count` when you manage it, and `other_course_count` for the rest, which are never named).
 - Participants: `client.creator_runs(challenge_id, offset=0, limit=30)` (one page of the runs, newest first, with the env's diagnostics and `total`), `client.creator_submissions(challenge_id, course_id=None)` (`course_id`: the submissions of the students enrolled in a course holding the challenge that you manage, the leaderboard's course population), `client.clean_redeploy_submission(challenge_id, submission_id)`, `client.clean_redeploy_all(challenge_id)`, `client.soft_delete_submission(challenge_id, submission_id)`.
@@ -1701,10 +1936,11 @@ print(student.my_progress(landing["id"]))                # content % + next less
 - `client.preview_lesson(lesson_id, body_md=None)` — validates `mlarena:` directives as you (fails loud on unknown, and on a challenge you may not see as on one that does not exist); `warnings` names the courses whose students would not see a block's challenge.
 - `client.push_course(path, slug=None, subpath=None, dry_run=False, prune=False)`, `client.import_course_from_github(slug, repository, ref=None, path=None, dry_run=False, prune=False)`, `client.export_course_to_dir(slug, path)` — a course as a directory (above).
 - `client.add_course_challenge(course_id, challenge_id, title=None, summary=None, pass_threshold=None, is_published=True)` — the console's "Add challenge": one transactional call creates a private module (title defaults to the challenge's name, `summary` is the student page), links it at the end of the course and attaches the challenge; nothing is written if any part is refused.
+- `client.use_challenge_with_class(challenge, course=None, *, name=None, end_date=None)` — the console's "Use with my class", composed client-side: the challenge (id or slug) added to `course`, or to a new course named `name` or after the challenge (optional `end_date`); returns the course with its `join_code`.
 - `client.remove_course_challenge(course_id, module_id)` — the console's "Remove": one transactional call unlinks the entry and deletes its module when it is a simple module you may edit that no other course links; answers `{"message", "module_deleted"}`.
 - `client.update_course(id, **fields)`, `set_course_cover`, `list_course_modules`, `link_module(course_id, module_id, position=None)`, `unlink_module`, `reorder_modules`, `course_progress(course_id)` — teacher follow dashboard.
 - `client.teacher_course(course_id)` — one course for its workspace: the row, your `role` (what you are to it: `owner` | `assistant` | `None` for an admin who is neither), `has_owner_rights` (whether you may do what only the owner may: the owner and an admin), `owner_username`, the settings (`ask_student_identity`, `report_recipients`, `report_to_assistants`, `report_last_sent_at_ts`) and the counts (`enrollment_count`, `assistant_count`, `module_count`, `challenge_count`). `update_course` writes the settings too and returns the same shape.
-- `client.archive_course(id)` / `unarchive_course(id)` — the owner's: an archived course takes no enrollment, leaves the catalog and stops counting in the limit of 3 active courses; its students and staff keep it. `client.duplicate_course(id, name=None)` — a new course of yours with the settings and a copy of every module you may read (the challenges stay the same challenges; no enrollment, progress, dates or assistants; private, fresh join code); a module you may not read is linked instead and named in `linked_modules`. `client.delete_course(id)` — needs a course with no enrolled user; removes the course and the entries it made for itself (a private module of the owner with no lesson and at most one challenge, linked nowhere else), never another module or a challenge, and answers `{can_delete, enrollment_count, deleted_modules, kept_modules}`; `client.course_deletion(id)` serves that list before the fact.
+- `client.archive_course(id)` / `unarchive_course(id)` — the owner's: an archived course takes no enrollment, leaves the catalog and stops counting in the limit of 3 active courses; its students and staff keep it. `client.duplicate_course(id, name=None)` — a new course of yours with the settings and a copy of every module it links (the challenges stay the same challenges; no enrollment, progress, dates or assistants; private, fresh join code). `client.delete_course(id)` — needs a course with no enrolled user; removes the course and the entries it made for itself (a private module of the owner with no lesson and at most one challenge, linked nowhere else), never another module or a challenge, and answers `{can_delete, enrollment_count, deleted_modules, kept_modules}`; `client.course_deletion(id)` serves that list before the fact.
 - `client.send_course_report(id)` — mails the course report now (two leaderboard CSVs per challenge) to the owner, the assistants (`report_to_assistants`) and `report_recipients`; one send per course every 10 minutes.
 - `client.export_course_grades_csv(course_id, dest_dir=".")` — the course-wide grade sheet, `course_progress` as a CSV (writes `grades_course_<id>.csv`).
 - `client.workspace()["courses"]` — the courses you own or assist on (archived ones included, `archived_at_ts`), each with its `role` (`owner` | `assistant`), `enrollment_count`, `active_enrollment_count_7d`, `last_active_at_ts` and its `challenges` (`client.teacher_courses()` is the deprecated form); `client.challenges_for_course()` — the challenges you may attach, each with `metric`, the ranking MetricSpec (the scale and direction of a `pass_threshold`), and `default_pass_threshold`, the bar an attach that names none is stored with (70 for an exercise set, `None` otherwise).

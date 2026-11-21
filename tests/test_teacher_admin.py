@@ -108,7 +108,7 @@ def _workspace_challenge(challenge_id, name, role="owner", status="started"):
         "challenge": {
             "id": challenge_id, "name": name, "slug": name.lower(), "status": status,
             "end_date_ts": None, "is_public": False, "kernel_version": "file_v1",
-            "kind_label": "File challenge", "user_id": 7, "owner_username": "ada",
+            "kind_label": "Upload a file", "user_id": 7, "owner_username": "ada",
             "role": role, "statistics": {"running_submissions": 2, "unique_participants": 2},
         },
         "counters": {"team_count": 0, "submissions_created_7d": 3, "submissions_created_daily": [],
@@ -247,10 +247,10 @@ def test_archive_and_unarchive_are_one_post_each():
 
 def test_duplicate_course_sends_the_name_only_when_given():
     c, rec = make_client(lambda *_: (201, {
-        "id": 8, "name": "RL (copy)", "linked_modules": [{"id": 3, "title": "TA notes"}]}))
+        "id": 8, "name": "RL (copy)", "left_out_modules": [{"id": 3, "title": "TA notes"}]}))
     out = c.duplicate_course(7)
     _expect(out["id"] == 8, out)
-    _expect(out["linked_modules"] == [{"id": 3, "title": "TA notes"}], out)
+    _expect(out["left_out_modules"] == [{"id": 3, "title": "TA notes"}], out)
     _expect((rec.last["method"], rec.last["path"]) == ("POST", "/teacher/course/7/duplicate"),
             rec.last)
     _expect(rec.last["json"] == {}, rec.last["json"])
