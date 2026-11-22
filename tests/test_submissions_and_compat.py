@@ -519,15 +519,24 @@ def test_tail_logs_raises_on_timeout_instead_of_returning_silently():
 # --------------------------------------------------------------------------- #
 
 
+# The keys `submit()` reads off `challenge()` before it creates anything.
+_CODE_CHALLENGE = {
+    "entry_filename": "agent.py",
+    "max_upload_files": 3,
+    "max_upload_size_bytes": 1024,
+    "runtime_options": [
+        {"id": 6, "name": "python", "language": "python", "framework": "none"},
+        {"id": 7, "name": "torch", "language": "python", "framework": "torch"}],
+}
+
+
 def _submit_router(is_deployable=True):
     """Fake backend for submit(): `submission()` answers with the block."""
     def router(method, path, kwargs):
         if method == "POST" and path == "/submissions/challenge/4":
             return (201, {"submission_id": 11, "status": "created"})
         if path == "/challenges/4":
-            return (200, {"runtime_options": [
-                {"id": 6, "name": "python", "language": "python", "framework": "none"},
-                {"id": 7, "name": "torch", "language": "python", "framework": "torch"}]})
+            return (200, _CODE_CHALLENGE)
         if path.endswith("/file"):
             return (200, {"message": "File operation successful",
                           "validation_message": "bad name"})
@@ -591,16 +600,17 @@ def test_submit_with_agent_class_returns_submission_id_and_deploy():
     assert out == {"submission_id": 11, "deploy": {"message": "queued"}}
     assert rec.calls[2]["json"] == {"docker_image_agent_runtime_id": 7}
 
+    # The challenge is read (runtime, limits) before anything is created.
     seq = [(call["method"], call["path"]) for call in rec.calls]
     assert seq == [
-        ("POST", "/submissions/challenge/4"),
         ("GET", "/challenges/4"),
+        ("POST", "/submissions/challenge/4"),
         ("PUT", "/submissions/agent_runtime/11"),
         ("PUT", "/submissions/challenge/4/11/file"),
         ("GET", "/submissions/submission/11"),
         ("PUT", "/submissions/challenge/4/11/deploy"),
     ], seq
-    assert rec.calls[0]["json"] == {"submission_name": "MyAgent"}
+    assert rec.calls[1]["json"] == {"submission_name": "MyAgent"}
     assert rec.calls[3]["files"]["file"][0] == "agent.py"
 
     # status() defaults to the last submission.
@@ -628,7 +638,7 @@ def test_submit_with_files_uses_submission_name():
     with tempfile.TemporaryDirectory() as d:
         f1 = _tmp_file(d, "submission.csv", b"id,y\n1,0\n")
         out = c.submit(4, files=[f1])
-        assert rec.calls[0]["json"] == {"submission_name": "submission"}
+        assert rec.calls[1]["json"] == {"submission_name": "submission"}
         c.submit(4, files=[f1], submission_name="named")
         # create, upload, status, deploy — the create body is four calls back.
         assert rec.calls[-4]["json"] == {"submission_name": "named"}
@@ -645,6 +655,7 @@ def test_submit_not_deployable_raises_before_deploy():
         assert "delete_submission(4, 11)" in str(exc)
         # Not an HTTP refusal: the status payload rides on `.body` instead.
         assert exc.status_code is None
+        assert exc.submission_id == 11
         assert exc.body["is_deployable"] is False
     assert not any(call["path"].endswith("/deploy") for call in rec.calls)
 
@@ -664,12 +675,121 @@ def test_submit_propagates_a_refused_deploy_with_the_servers_limits():
         c.submit(4, agent=MyAgent)
         raise AssertionError("expected SubmissionError")
     except SubmissionError as exc:
-        assert str(exc) == "deploy_submission failed: Daily deployment limit (5) reached"
+        # The submission exists and is not deployed: the error names it, and
+        # how to deploy it later or delete it; nothing is deleted.
+        assert str(exc) == (
+            "deploy_submission failed: Daily deployment limit (5) reached "
+            "(submission 11 was created and is not deployed: deploy it with "
+            "deploy_submission(4, 11) or delete it with delete_submission(4, 11))")
+        assert exc.submission_id == 11
         assert exc.status_code == 409
         assert exc.body == _DEPLOY_409
         assert exc.body["deployment_limits"]["daily_deploys_remaining"] == 0
         assert exc.body["active_submission_limits"]["active_submissions_remaining"] == 2
     assert (c._last_submission_id, c._last_challenge) == (11, 4)
+
+
+# submit() checks everything that needs no submission before it creates one:
+# a refusal there leaves nothing behind on the server.
+
+
+def _created(rec):
+    return [call for call in rec.calls
+            if call["method"] == "POST" and call["path"] == "/submissions/challenge/4"]
+
+
+def _challenge_router(**overrides):
+    """`_submit_router` whose `challenge()` serves `overrides` on top."""
+    base = _submit_router()
+
+    def router(method, path, kwargs):
+        if path == "/challenges/4":
+            return (200, {**_CODE_CHALLENGE, **overrides})
+        return base(method, path, kwargs)
+    return router
+
+
+def test_submit_refuses_an_unknown_runtime_before_creating_anything():
+    c, rec = make_client(_submit_router())
+    with pytest.raises(MLArenaError, match="no runtime named 'pytorch'"):
+        c.submit(4, agent=MyAgent, runtime="pytorch")
+    with pytest.raises(SubmissionError, match=r"no runtime with id 99; its runtimes: 6 \(python\), 7 \(torch\)"):
+        c.submit(4, agent=MyAgent, runtime_id=99)
+    assert _created(rec) == []
+
+
+def test_submit_refuses_a_path_or_an_instance_as_agent_before_any_request():
+    c, rec = make_client(_submit_router())
+    with pytest.raises(SubmissionError, match=r"not a path .*files=\['agent.py'\]"):
+        c.submit(4, agent="agent.py")
+    with pytest.raises(SubmissionError, match="got an instance of MyAgent: pass the class itself"):
+        c.submit(4, agent=MyAgent())
+    with pytest.raises(SubmissionError, match=r"files= takes a list of paths: files=\['agent.py'\]"):
+        c.submit(4, files="agent.py")
+    assert rec.calls == []
+
+
+def test_submit_refuses_agent_on_a_challenge_without_agent_py():
+    c, rec = make_client(_challenge_router(entry_filename="submission.csv"))
+    with pytest.raises(SubmissionError, match="its submission is 'submission.csv'"):
+        c.submit(4, agent=MyAgent)
+    assert _created(rec) == []
+
+
+def test_submit_refuses_files_over_the_served_limits_before_creating_anything():
+    c, rec = make_client(_submit_router())  # 3 files, 1024 bytes
+    with tempfile.TemporaryDirectory() as d:
+        small = [_tmp_file(d, name) for name in ("a.py", "b.py", "c.py")]
+        # agent.py, already in every new submission of a code challenge,
+        # counts: 3 helpers + agent.py = 4 files.
+        with pytest.raises(SubmissionError, match=r"at most 3 file\(s\).*would hold 4"):
+            c.submit(4, files=small)
+        big = _tmp_file(d, "agent.py", b"x" * 2000)
+        with pytest.raises(SubmissionError, match="at most 1024 bytes.*total 2000 bytes"):
+            c.submit(4, files=[big])
+        with pytest.raises(SubmissionError, match="File not found"):
+            c.submit(4, files=[os.path.join(d, "missing.py")])
+        os.mkdir(os.path.join(d, "sub"))
+        twin = _tmp_file(os.path.join(d, "sub"), "a.py")
+        with pytest.raises(SubmissionError, match="Two files share the name a.py"):
+            c.submit(4, files=[small[0], twin])
+    assert _created(rec) == []
+
+
+def test_submit_names_the_submission_when_an_upload_is_refused_after_the_create():
+    base = _submit_router()
+
+    def router(method, path, kwargs):
+        if path.endswith("/file"):
+            return (400, {"error": "Total upload size exceeds 1 MB limit"})
+        return base(method, path, kwargs)
+
+    c, rec = make_client(router)
+    with pytest.raises(SubmissionError) as raised:
+        c.submit(4, agent=MyAgent)
+    assert raised.value.submission_id == 11
+    assert raised.value.status_code == 400
+    assert "Total upload size exceeds 1 MB limit (submission 11 was created" in str(raised.value)
+    assert "delete_submission(4, 11)" in str(raised.value)
+    # Nothing is deleted for the caller.
+    assert not any(call["method"] == "DELETE" for call in rec.calls)
+
+
+def test_submit_uploads_the_class_source_only():
+    # `inspect.getsource(cls)`: the class body, not the module around it.
+    uploaded = {}
+    base = _submit_router()
+
+    def router(method, path, kwargs):
+        if path.endswith("/file"):
+            name, fh = kwargs["files"]["file"]
+            uploaded[name] = fh.read().decode()
+        return base(method, path, kwargs)
+
+    c, _ = make_client(router)
+    c.submit(4, agent=MyAgent)
+    assert uploaded["agent.py"].startswith("class MyAgent:"), uploaded
+    assert "import" not in uploaded["agent.py"]
 
 
 def _deploy_failed_status(failure_message, last_status_message="deploy failed",
@@ -697,6 +817,7 @@ def test_submit_wait_raises_when_the_deploy_fails():
     except SubmissionError as exc:
         assert str(exc) == "Traceback: ModuleNotFoundError: torch"
         assert exc.status_code is None
+        assert exc.submission_id == 11
         assert exc.body == final
     assert rec.last["path"] == "/submissions/submission/11"
 
@@ -1293,7 +1414,7 @@ def test_old_upload_names_and_status_agent_id():
 def test_old_submit_kwarg_and_both_spellings_rejected():
     c, rec = make_client(_submit_router())
     out, msgs = _call_warns(c.submit, 4, agent=MyAgent, agent_name="legacy")
-    assert rec.calls[0]["json"] == {"submission_name": "legacy"}
+    assert rec.calls[1]["json"] == {"submission_name": "legacy"}
     assert out == {"submission_id": 11, "deploy": {"message": "queued"}}
     assert any("agent_name= is deprecated" in m for m in msgs), msgs
 
@@ -1426,6 +1547,7 @@ def test_a_refused_deploy_carries_the_servers_limits():
         raise AssertionError("expected SubmissionError")
     except SubmissionError as exc:
         assert str(exc) == "deploy_submission failed: Daily deployment limit (5) reached"
+        assert exc.submission_id is None  # set by submit() only
         assert exc.status_code == 409
         assert exc.body["deployment_limits"]["next_deploy_available_at"] == "2026-09-23T00:00:00+00:00"
         assert exc.body["active_submission_limits"]["max_active_submissions"] == 3

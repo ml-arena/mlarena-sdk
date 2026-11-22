@@ -725,9 +725,11 @@ class MLArenaClient:
         (`scope=all`) is an admin's listing in the console, which no key
         reads.
 
-        `challenges`: the challenges you own or assist on, your own first,
-        each group newest first. A row is `{"challenge", "counters",
-        "created_at_ts", "start_blockers", "start_blockers_error"}`:
+        `challenges`: the challenges you own or assist on (archived ones
+        included), your own first, each group newest first. A row is
+        `{"challenge", "counters", "created_at_ts", "archived_at_ts",
+        "start_blockers", "start_blockers_error"}` (`archived_at_ts` is null
+        unless `archive_challenge` stamped it):
         `challenge` and `counters` as `challenge_overview` returns them
         (`challenge["role"]` is `"owner"` or `"assistant"`;
         `challenge["can_edit"]` says whether you may open its workspace;
@@ -758,8 +760,13 @@ class MLArenaClient:
         `attention`: what needs you, about the rows you have a relation to;
         each item has a `kind`: `deploy_failed_submissions` (a `started`
         challenge with submissions whose deploy failed: the count and its
-        split by owner), `draft_blocked` (a draft with `start_blockers`),
-        `draft_unreadable`, `course_ending` (a course ending within 7 days
+        split by owner), `draft_blocked` (a draft whose `start_blockers`
+        include a platform conflict — `platform_conflict` true: its machine
+        or queue, its size against the machine's ceilings, its image rows;
+        the item's `start_blockers` are those conflicts only, the row has
+        the full list; a draft that only lacks authoring raises nothing),
+        `draft_unreadable` (the gate could not run: the row's
+        `start_blockers_error`), `course_ending` (a course ending within 7 days
         with `enrolled_without_submission` > 0), `course_challenge_closed`
         (a challenge students see in a course of yours that is still
         running, not your own, that is `stopped` or `ended`). Items name
@@ -768,14 +775,11 @@ class MLArenaClient:
         `attention_overflow` is `{kind: how many more}` (0 when all are
         there). The rows carry every fact.
 
-        A challenge row carries `archived_at_ts` (null unless
-        `archive_challenge` stamped it).
-
         `quotas`: `owned_challenge_count` (the challenges you own that are
         not archived; no limit on challenges yet),
         `max_courses_limit`, `active_course_count`, `can_create_course`.
         """
-        return self._course_call("GET", "/author/workspace", error_label="workspace")
+        return self._json_call("GET", "/author/workspace", error_label="workspace")
 
     def creator_challenges(self) -> list:
         """Deprecated: use `workspace()["challenges"]`.
@@ -2148,7 +2152,7 @@ class MLArenaClient:
           checker loads env.py when its pod is created, and every start
           replaces the pod).
         """
-        return self._course_call(
+        return self._json_call(
             "GET", f"/creator_challenge/challenge/{challenge_id}/scoring_update",
             error_label="scoring_update",
         )
@@ -2177,7 +2181,7 @@ class MLArenaClient:
         `scoring_update(id)["can_cancel_runs_in_flight"]` says whether the
         call would do something.
         """
-        return self._course_call(
+        return self._json_call(
             "POST", f"/creator_challenge/challenge/{challenge_id}/runs/cancel_in_flight",
             error_label="cancel_runs_in_flight",
         )
@@ -2196,7 +2200,7 @@ class MLArenaClient:
         side only: an ended challenge stays among the past challenges of the
         public catalog.
         """
-        return self._course_call(
+        return self._json_call(
             "POST", f"/creator_challenge/challenge/{challenge_id}/archive",
             error_label="archive_challenge",
         )
@@ -2208,7 +2212,7 @@ class MLArenaClient:
         counts among your challenges again and can be restarted. Returns the
         challenge; 409 when it is not archived.
         """
-        return self._course_call(
+        return self._json_call(
             "POST", f"/creator_challenge/challenge/{challenge_id}/unarchive",
             error_label="unarchive_challenge",
         )
@@ -2231,7 +2235,7 @@ class MLArenaClient:
         too). `replay_count` replay files of those runs are not removed:
         they expire from storage after 365 days. `storage_left` is `[]` here.
         """
-        return self._course_call(
+        return self._json_call(
             "GET", f"/creator_challenge/challenge/{challenge_id}/deletion",
             error_label="challenge_deletion",
         )
@@ -2252,7 +2256,7 @@ class MLArenaClient:
         be removed from storage although the rows are gone (`[]` when all of
         it went; check it).
         """
-        return self._course_call(
+        return self._json_call(
             "DELETE", f"/creator_challenge/challenge/{challenge_id}",
             error_label="delete_challenge",
         )
@@ -3092,36 +3096,17 @@ class MLArenaClient:
         calls. The keyword form (`language=` / `framework=` /
         `framework_version=`, first match) is deprecated (4.8.0).
         """
-        opts = self.runtime_options(challenge_id)
-        # Normalize back to list[dict] in case pandas converted it.
-        rows = opts.to_dict("records") if hasattr(opts, "to_dict") else list(opts)
-        if name is not None:
-            if (language, framework, framework_version) != (None, None, None):
-                raise MLArenaError("Pass a runtime name or the deprecated keywords, not both")
-            for r in rows:
-                if r["name"] == name:
-                    return r
-            raise MLArenaError(
-                f"Challenge {challenge_id} offers no runtime named {name!r}; "
-                f"its runtimes: {', '.join(sorted(r['name'] for r in rows))}"
+        if name is None:
+            warnings.warn(
+                "resolve_runtime(language=, framework=, framework_version=) is deprecated, "
+                "pass the runtime's name: resolve_runtime(challenge_id, \"sklearn\")",
+                DeprecationWarning,
+                stacklevel=2,
             )
-        warnings.warn(
-            "resolve_runtime(language=, framework=, framework_version=) is deprecated, "
-            "pass the runtime's name: resolve_runtime(challenge_id, \"sklearn\")",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        for r in rows:
-            if language is not None and r.get("language") != language:
-                continue
-            if framework is not None and r.get("framework") != framework:
-                continue
-            if framework_version is not None and r.get("framework_version") != framework_version:
-                continue
-            return r
-        raise MLArenaError(
-            f"No runtime found for language={language!r} framework={framework!r} "
-            f"framework_version={framework_version!r}. Available: {rows}"
+        return _match_runtime(
+            challenge_id, self.challenge(challenge_id)["runtime_options"], name,
+            language=language, framework=framework,
+            framework_version=framework_version,
         )
 
     # ---- File listing / reading / editing / deleting ----
@@ -3812,23 +3797,39 @@ class MLArenaClient:
                poll_sec: float = 5.0, *,
                deploy: bool = True,
                allow_same_commit: bool = False) -> dict:
-        """Convenience: create submission → (pick runner) → upload files → deploy.
+        """Convenience: check → create submission → (pick runner) → upload
+        files → deploy.
 
-        Either pass `agent=<class>` (its source is uploaded as `agent.py`) or
-        `files=[...]` (each path is uploaded under its basename).
+        Either pass `agent=<class>` or `files=[...]` (a list of paths, each
+        uploaded under its base name). `agent=` takes a class (or a module),
+        never a path: the class's source, `inspect.getsource(agent)`, is
+        uploaded as `agent.py`, and that is the class body only — imports,
+        constants and helpers outside the class are not in it. An agent that
+        needs them is a file: pass `files=["agent.py", ...]`.
         `submission_name` defaults to the class name, or to the first file's
         base name without extension.
 
-        Optional runner selection (between create and deploy):
+        Optional runner selection:
             runtime:    the runtime's name, one the challenge offers
                         (`runtime_options(challenge_id)["name"]`, listed on the
                         challenge page): "python", "sklearn", "torch", ...
-                        Resolved by `resolve_runtime()`. A dict spec
+                        Resolved like `resolve_runtime()`. A dict spec
                         (`{"framework": "torch"}`) is deprecated (4.8.0).
-            runtime_id: the runtime's numeric id.
+            runtime_id: the runtime's numeric id, one of the challenge's
+                        `runtime_options`.
         Pass at most one of `runtime_id` / `runtime`. With neither, the
         submission runs on the challenge's default runtime
         (`challenge(challenge_id)["default_agent_runtime_id"]`).
+
+        Before anything is created, one `challenge()` read checks what needs
+        no submission, and raises `SubmissionError` (`MLArenaError` for an
+        unknown runtime name) with no submission left behind: the runtime
+        (a name or an id the challenge does not offer), the `agent=`
+        argument (a path, an instance, a class without readable source, a
+        challenge whose entry file is not `agent.py`), the files (a missing
+        path, two files with one base name, more files than
+        `max_upload_files` or more bytes than `max_upload_size_bytes`).
+        The server still validates every upload.
 
         After the uploads, the submission's `is_deployable` is checked (one
         `submission()` call) and a `SubmissionError` carrying the
@@ -3847,13 +3848,16 @@ class MLArenaClient:
         call that returns is a submission that is `active`. `timeout_sec`
         caps the wait and raises `SubmissionError` when it runs out;
         `poll_sec` is the polling interval. The default `wait=False` returns
-        as soon as the deploy is accepted (202), exactly as before.
+        as soon as the deploy is accepted (202).
 
-        The submission is remembered for `status()` as soon as it is created,
-        so after any of those errors `status()` reads the submission that was
-        left behind; a refused deploy (409 — quota, active-submission limit,
-        state) propagates as the `SubmissionError` `deploy_submission()`
-        raises, with the server's limits on `.body`.
+        Any error raised once the submission exists carries its id as
+        `err.submission_id`; nothing is deleted for you. An error raised
+        before the deploy (a refused upload or runtime pin, files the server
+        rejected, a refused deploy: 409 — quota, active-submission limit,
+        state, with the server's limits on `.body`) also names it in the
+        message, with the `deploy_submission(...)` / `delete_submission(...)`
+        calls that deploy it later or delete it. The submission is also
+        remembered for `status()` as soon as it is created.
 
         Returns `{"submission_id": <id>, "deploy": <deploy response>}`, plus
         `"status"` when `wait=True` (a wait that runs out of `timeout_sec`
@@ -3870,11 +3874,48 @@ class MLArenaClient:
         """
         if (agent is None) == (files is None):
             raise SubmissionError("Provide exactly one of agent= or files=")
+        if files is not None and isinstance(files, (str, bytes, os.PathLike)):
+            raise SubmissionError(
+                f"files= takes a list of paths: files=[{files!r}]")
         if runtime_id is not None and runtime is not None:
             raise SubmissionError("Provide at most one of runtime_id= or runtime=")
         if wait and not deploy:
             raise SubmissionError("wait=True needs deploy=True")
+        if agent is not None:
+            _check_agent_argument(agent)
 
+        # ---- Everything that needs no submission, before the create -------
+        challenge = self.challenge(challenge_id)
+        offered = challenge["runtime_options"]
+        if isinstance(runtime, dict):
+            warnings.warn(
+                "submit(runtime={...}) is deprecated, pass the runtime's name: "
+                "runtime=\"sklearn\" (runtime_options(challenge_id) lists them)",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            runtime_id = _match_runtime(challenge_id, offered, None, **runtime)["id"]
+        elif runtime is not None:
+            runtime_id = _match_runtime(challenge_id, offered, runtime)["id"]
+        elif runtime_id is not None and runtime_id not in {r["id"] for r in offered}:
+            listed = ", ".join(f"{r['id']} ({r['name']})" for r in offered)
+            raise SubmissionError(
+                f"Challenge {challenge_id} offers no runtime with id {runtime_id}; "
+                f"its runtimes: {listed or 'none'}"
+            )
+
+        if agent is not None:
+            agent_source = _agent_source(agent, challenge["entry_filename"], challenge_id)
+            uploads = [("agent.py", len(agent_source.encode("utf-8")))]
+        else:
+            agent_source = None
+            for path in files:
+                if not os.path.isfile(path):
+                    raise SubmissionError(f"File not found: {path}")
+            uploads = [(os.path.basename(path), os.path.getsize(path)) for path in files]
+        _check_upload_limits(challenge_id, challenge, uploads)
+
+        # ---- Create -------------------------------------------------------
         try:
             created = self.create_submission(
                 challenge_id,
@@ -3900,29 +3941,17 @@ class MLArenaClient:
         self._last_submission_id = submission_id
         self._last_challenge = challenge_id
 
-        # Pin runner before deploy so the JobPod uses the right image.
-        if isinstance(runtime, dict):
-            warnings.warn(
-                "submit(runtime={...}) is deprecated, pass the runtime's name: "
-                "runtime=\"sklearn\" (runtime_options(challenge_id) lists them)",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-            with warnings.catch_warnings():  # warned once, just above
-                warnings.simplefilter("ignore", DeprecationWarning)
-                runtime_id = self.resolve_runtime(challenge_id, **runtime)["id"]
-        elif runtime is not None:
-            runtime_id = self.resolve_runtime(challenge_id, runtime)["id"]
-        if runtime_id is not None:
-            self.set_agent_runtime(submission_id, runtime_id)
-
+        # ---- From here the submission exists: every error names it --------
         tmp_dir = None
         try:
-            if agent is not None:
+            # Pin runner before deploy so the JobPod uses the right image.
+            if runtime_id is not None:
+                self.set_agent_runtime(submission_id, runtime_id)
+            if agent_source is not None:
                 tmp_dir = tempfile.mkdtemp()
                 agent_py = os.path.join(tmp_dir, "agent.py")
-                with open(agent_py, "w") as f:
-                    f.write(inspect.getsource(agent))
+                with open(agent_py, "w", encoding="utf-8") as f:
+                    f.write(agent_source)
                 self.upload_submission_file(
                     challenge_id, submission_id, agent_py)
             else:
@@ -3945,44 +3974,54 @@ class MLArenaClient:
                     f"(fix the files and re-upload, or delete the submission with "
                     f"delete_submission({challenge_id}, {submission_id})).",
                     body=status,
+                    submission_id=submission_id,
                 )
 
             if not deploy:
                 return {"submission_id": submission_id, "deploy": None}
-            result = {
-                "submission_id": submission_id,
-                "deploy": self.deploy_submission(challenge_id, submission_id),
-            }
-            if wait:
-                # Drain the generator: tail_logs() stops on `is_settled` and
-                # raises on timeout, so this is the whole wait.
-                for _ in self.tail_logs(challenge_id, submission_id,
-                                        poll_sec=poll_sec,
-                                        timeout_sec=timeout_sec):
-                    pass
-                final = self.submission(submission_id)
-                if final["status"] == "deploy_failed":
-                    # Same contract as the rejected upload above: the server's
-                    # reason is the message, the payload rides on `.body`.
-                    # A deploy_failed submission has deployed: the attempt is
-                    # there.
-                    latest = final["latest_deploy"]
-                    reason = (latest.get("failure_message")
-                              or final.get("last_status_message")
-                              or f"Submission {submission_id} ended in "
-                                 f"deploy_failed without a message")
-                    # Who the verdict blames (participant | challenge |
-                    # platform), when the server's verdict said.
-                    owner = latest.get("failure_owner")
-                    if owner is not None:
-                        reason = f"{reason} (failure_owner: {owner})"
-                    raise SubmissionError(reason, body=final)
-                result["status"] = final
-            return result
+            deployed = self.deploy_submission(challenge_id, submission_id)
+        except MLArenaError as err:
+            if err.submission_id is not None:  # already names it
+                raise
+            raise _left_behind(err, challenge_id, submission_id) from err
         finally:
             if tmp_dir:
                 import shutil
                 shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        result = {"submission_id": submission_id, "deploy": deployed}
+        if not wait:
+            return result
+        try:
+            # Drain the generator: tail_logs() stops on `is_settled` and
+            # raises on timeout, so this is the whole wait.
+            for _ in self.tail_logs(challenge_id, submission_id,
+                                    poll_sec=poll_sec,
+                                    timeout_sec=timeout_sec):
+                pass
+            final = self.submission(submission_id)
+        except MLArenaError as err:
+            # Deployed: the message stays the wait's own, the id rides along.
+            err.submission_id = submission_id
+            raise
+        if final["status"] == "deploy_failed":
+            # Same contract as the rejected upload above: the server's
+            # reason is the message, the payload rides on `.body`.
+            # A deploy_failed submission has deployed: the attempt is
+            # there.
+            latest = final["latest_deploy"]
+            reason = (latest.get("failure_message")
+                      or final.get("last_status_message")
+                      or f"Submission {submission_id} ended in "
+                         f"deploy_failed without a message")
+            # Who the verdict blames (participant | challenge |
+            # platform), when the server's verdict said.
+            owner = latest.get("failure_owner")
+            if owner is not None:
+                reason = f"{reason} (failure_owner: {owner})"
+            raise SubmissionError(reason, body=final, submission_id=submission_id)
+        result["status"] = final
+        return result
 
     def status(self, submission_id: int | None = None) -> dict:
         """The submission (`submission()`), by default the last one made
@@ -4203,7 +4242,7 @@ class MLArenaClient:
                    error_label: str,
                    not_found: type = ChallengeNotFoundError,
                    timeout: int = 30) -> requests.Response:
-        """Single chokepoint for the `/api/chat/*` routes (`_course_call`'s
+        """Single chokepoint for the `/api/chat/*` routes (`_json_call`'s
         sibling). `not_found` names the class a 404 raises:
         `ChallengeNotFoundError` on a challenge-scoped route,
         `ChatSessionNotFoundError` on a session-scoped one. Any other
@@ -5066,17 +5105,19 @@ class MLArenaClient:
             print(format_attempt(attempt))
         return attempt
 
-    # ---- Course content: shared JSON-call helper ----------------------------
+    # ---- Shared JSON-call helper ---------------------------------------------
 
-    def _course_call(self, method: str, path: str, *,
-                     json_body: dict | None = None,
-                     params: dict | None = None,
-                     ok: tuple[int, ...] = (200,),
-                     error_label: str = "request",
-                     timeout: int = 30) -> dict | list:
-        """Single chokepoint for the course-content (`/teacher`, `/academic_courses`)
-        JSON routes — mirrors the per-method boilerplate used above but keeps the
-        ~30 course methods DRY.
+    def _json_call(self, method: str, path: str, *,
+                   json_body: dict | None = None,
+                   params: dict | None = None,
+                   ok: tuple[int, ...] = (200,),
+                   error_label: str = "request",
+                   timeout: int = 30) -> dict | list:
+        """One authenticated JSON request: the course-content routes
+        (`/teacher`, `/academic_courses`), `workspace()` and the challenge
+        lifecycle routes of `/creator_challenge` that need nothing more than
+        send, map errors, return `.json()`. (Named `_course_call` before 4.19.0, when
+        the course methods were its only callers.)
 
         The bearer token is always sent, even on public reads: the consumption
         landing/lesson routes personalize their response when authenticated
@@ -5172,7 +5213,7 @@ class MLArenaClient:
             body["visibility"] = visibility
         if teacher_user_id is not None:
             body["teacher_user_id"] = teacher_user_id
-        return self._course_call(
+        return self._json_call(
             "POST", "/academic_courses/", json_body=body,
             ok=(200, 201), error_label="create_course",
         )
@@ -5192,7 +5233,7 @@ class MLArenaClient:
         caller. An archived or ended course answers 410, except to a caller
         who is already enrolled in it (`already_enrolled: true`).
         """
-        return self._course_call(
+        return self._json_call(
             "GET", f"/academic_courses/enroll/{join_code}",
             error_label="enrollment_info",
         )
@@ -5222,7 +5263,7 @@ class MLArenaClient:
             body["student_email"] = student_email
         if student_number is not None:
             body["student_number"] = student_number
-        return self._course_call(
+        return self._json_call(
             "POST", f"/academic_courses/enroll/{join_code}", json_body=body,
             ok=(200, 201), error_label="enroll_in_course",
         )
@@ -5249,7 +5290,7 @@ class MLArenaClient:
             params["show_all"] = "true"
         if challenge_id is not None:
             params["challenge_id"] = challenge_id
-        return _to_dataframe(self._course_call(
+        return _to_dataframe(self._json_call(
             "GET", "/academic_courses/", params=params or None,
             error_label="list_courses",
         ))
@@ -5272,7 +5313,7 @@ class MLArenaClient:
             params["limit"] = limit
         if offset is not None:
             params["offset"] = offset
-        return self._course_call(
+        return self._json_call(
             "GET", "/academic_courses/catalog", params=params or None,
             error_label="course_catalog",
         )
@@ -5303,7 +5344,7 @@ class MLArenaClient:
         changes nothing for anyone who does not manage the course. The
         same flag is on `module_overview` and `lesson`.
         """
-        return self._course_call(
+        return self._json_call(
             "GET", f"/academic_courses/{slug}", params=_as_student(as_student),
             error_label="course",
         )
@@ -5316,7 +5357,7 @@ class MLArenaClient:
         `as_student=True`: as on `course` (a module hidden from students is
         then a 404).
         """
-        return self._course_call(
+        return self._json_call(
             "GET", f"/academic_courses/{slug}/modules/{module_slug}",
             params=_as_student(as_student), error_label="module_overview",
         )
@@ -5338,7 +5379,7 @@ class MLArenaClient:
         hidden from students is then a 404, and a block whose challenge the
         course's students do not see is left out, with its warning).
         """
-        return self._course_call(
+        return self._json_call(
             "GET",
             f"/academic_courses/{slug}/modules/{module_slug}/lessons/{lesson_slug}",
             params=_as_student(as_student), error_label="lesson",
@@ -5353,7 +5394,7 @@ class MLArenaClient:
         enrolled in (the backend fails loud on ambiguity otherwise).
         """
         body = {"course_id": course_id} if course_id is not None else {}
-        return self._course_call(
+        return self._json_call(
             "POST", f"/academic_courses/lessons/{lesson_id}/view",
             json_body=body, error_label="mark_lesson_viewed",
         )
@@ -5366,7 +5407,7 @@ class MLArenaClient:
         `mark_lesson_viewed` for the `course_id` disambiguation rule.
         """
         body = {"course_id": course_id} if course_id is not None else {}
-        return self._course_call(
+        return self._json_call(
             "POST", f"/academic_courses/lessons/{lesson_id}/complete",
             json_body=body, error_label="mark_lesson_complete",
         )
@@ -5380,7 +5421,7 @@ class MLArenaClient:
         for the `course_id` disambiguation rule.
         """
         body = {"course_id": course_id} if course_id is not None else {}
-        return self._course_call(
+        return self._json_call(
             "POST", f"/academic_courses/lessons/{lesson_id}/uncomplete",
             json_body=body, error_label="mark_lesson_incomplete",
         )
@@ -5403,7 +5444,7 @@ class MLArenaClient:
         stand on the challenge (`not_submitted` | `failed` | `scoring` |
         `scored`) and `team_name` names your team on it (else None).
         """
-        return self._course_call(
+        return self._json_call(
             "GET", f"/academic_courses/{course_id}/progress/me",
             error_label="my_progress",
         )
@@ -5439,7 +5480,7 @@ class MLArenaClient:
             body["summary"] = summary
         if icon is not None:
             body["icon"] = icon
-        return self._course_call(
+        return self._json_call(
             "POST", "/teacher/modules", json_body=body,
             ok=(200, 201), error_label="create_module",
         )
@@ -5451,7 +5492,7 @@ class MLArenaClient:
         Mirrors `GET /api/teacher/modules` (`?library=public`).
         """
         params = {"library": library} if library is not None else None
-        return self._course_call(
+        return self._json_call(
             "GET", "/teacher/modules", params=params, error_label="list_modules",
         )
 
@@ -5464,7 +5505,7 @@ class MLArenaClient:
         (see `update_module`), `is_owned` whether you hold its owner's rights
         (delete, `visibility`, `detach_module`).
         """
-        return self._course_call(
+        return self._json_call(
             "GET", f"/teacher/modules/{module_id}", error_label="get_module",
         )
 
@@ -5496,7 +5537,7 @@ class MLArenaClient:
         allowed = {"title", "slug", "summary", "icon", "visibility",
                    "is_published"}
         body = _filtered_fields(fields, allowed, "update_module")
-        return self._course_call(
+        return self._json_call(
             "PUT", f"/teacher/modules/{module_id}", json_body=body,
             error_label="update_module",
         )
@@ -5510,7 +5551,7 @@ class MLArenaClient:
         first and delete anyway.
         """
         params = {"force": "1"} if force else None
-        return self._course_call(
+        return self._json_call(
             "DELETE", f"/teacher/modules/{module_id}", params=params,
             error_label="delete_module",
         )
@@ -5529,7 +5570,7 @@ class MLArenaClient:
         the answer names them in `dropped_challenges`
         (`[{challenge_id, name}]`, `name` None when you may not see it).
         """
-        return self._course_call(
+        return self._json_call(
             "POST", f"/teacher/modules/{module_id}/fork",
             ok=(200, 201), error_label="fork_module",
         )
@@ -5544,7 +5585,7 @@ class MLArenaClient:
         sets it to `editor`. The next push of a bundle that names the module
         takes it over again. Returns the module detail.
         """
-        return self._course_call(
+        return self._json_call(
             "POST", f"/teacher/modules/{module_id}/detach",
             error_label="detach_module",
         )
@@ -5578,7 +5619,7 @@ class MLArenaClient:
             body["position"] = position
         if pass_threshold is not None:
             body["pass_threshold"] = pass_threshold
-        return self._course_call(
+        return self._json_call(
             "POST", f"/teacher/modules/{module_id}/challenges", json_body=body,
             ok=(200, 201), error_label="attach_challenge",
         )
@@ -5593,7 +5634,7 @@ class MLArenaClient:
         pass_threshold=None)`` removes the bar, while omitting the key leaves
         it alone.
         """
-        return self._course_call(
+        return self._json_call(
             "PUT",
             f"/teacher/modules/{module_id}/challenges/{challenge_id}",
             json_body=fields, error_label="update_challenge_link",
@@ -5604,7 +5645,7 @@ class MLArenaClient:
 
         Mirrors `DELETE /api/teacher/modules/{id}/challenges/{challenge_id}`.
         """
-        return self._course_call(
+        return self._json_call(
             "DELETE",
             f"/teacher/modules/{module_id}/challenges/{challenge_id}",
             error_label="detach_challenge",
@@ -5618,7 +5659,7 @@ class MLArenaClient:
         `ordered_challenge_ids` must be exactly the module's attached
         challenge ids in the desired order.
         """
-        return self._course_call(
+        return self._json_call(
             "PUT", f"/teacher/modules/{module_id}/challenges/reorder",
             json_body={"ordered_ids": ordered_challenge_ids},
             error_label="reorder_module_challenges",
@@ -5643,7 +5684,7 @@ class MLArenaClient:
             body["slug"] = slug
         if parent_lesson_id is not None:
             body["parent_lesson_id"] = parent_lesson_id
-        return self._course_call(
+        return self._json_call(
             "POST", f"/teacher/modules/{module_id}/lessons", json_body=body,
             ok=(200, 201), error_label="create_lesson",
         )
@@ -5655,7 +5696,7 @@ class MLArenaClient:
         `lesson(slug, module_slug, lesson_slug)` for the learner view with
         resolved directives).
         """
-        return self._course_call(
+        return self._json_call(
             "GET", f"/teacher/lessons/{lesson_id}", error_label="get_lesson",
         )
 
@@ -5670,7 +5711,7 @@ class MLArenaClient:
         allowed = {"title", "slug", "body_md", "is_published", "gated",
                    "estimated_minutes"}
         body = _filtered_fields(fields, allowed, "update_lesson")
-        return self._course_call(
+        return self._json_call(
             "PUT", f"/teacher/lessons/{lesson_id}", json_body=body,
             error_label="update_lesson",
         )
@@ -5680,7 +5721,7 @@ class MLArenaClient:
 
         Mirrors `DELETE /api/teacher/lessons/{id}`.
         """
-        return self._course_call(
+        return self._json_call(
             "DELETE", f"/teacher/lessons/{lesson_id}", error_label="delete_lesson",
         )
 
@@ -5692,7 +5733,7 @@ class MLArenaClient:
         `ordered_lesson_ids` must be exactly this module's lesson ids in the
         desired display order (`position` becomes the index).
         """
-        return self._course_call(
+        return self._json_call(
             "PUT", f"/teacher/modules/{module_id}/lessons/reorder",
             json_body={"ordered_ids": ordered_lesson_ids},
             error_label="reorder_lessons",
@@ -5739,7 +5780,7 @@ class MLArenaClient:
         Mirrors `GET /api/teacher/modules/{id}/assets` (owner). Use it to
         find a file whose link is no longer in any body.
         """
-        return self._course_call(
+        return self._json_call(
             "GET", f"/teacher/modules/{module_id}/assets",
             error_label="list_module_assets",
         )
@@ -5749,7 +5790,7 @@ class MLArenaClient:
 
         Mirrors `DELETE /api/teacher/modules/{id}/assets/{path}`.
         """
-        return self._course_call(
+        return self._json_call(
             "DELETE", f"/teacher/modules/{module_id}/assets/{quote(path)}",
             error_label="delete_module_asset",
         )
@@ -5789,14 +5830,16 @@ class MLArenaClient:
         block's challenge (it is private and that course does not assign it).
         """
         body = {"body_md": body_md} if body_md is not None else {}
-        return self._course_call(
+        return self._json_call(
             "POST", f"/teacher/lessons/{lesson_id}/preview", json_body=body,
             error_label="preview_lesson",
         )
 
     # ---- Course authoring: course composition (teacher scope) ---------------
 
-    def update_course(self, course_id: int, **fields) -> dict:
+    def update_course(self, course_id: int, *,
+                      end_date: str | None | _Unset = _UNSET,
+                      **fields) -> dict:
         """Update course meta and settings — owner, assistant or admin.
 
         Mirrors `PUT /api/teacher/course/{id}`. Accepts `name`, `code`,
@@ -5812,15 +5855,18 @@ class MLArenaClient:
         `ask_student_identity` off, the identity a student already has on
         their profile is still shown and exported; turning it on later does
         not ask the students who are already enrolled. Only the fields you
-        pass are changed. Returns the course as `teacher_course(course_id)`
-        does.
+        pass are changed; a keyword passed as None is not sent, except
+        `end_date`: `end_date=None` sends `null`, which clears the course's
+        end date, and leaving `end_date` out leaves it unchanged. Returns the
+        course as `teacher_course(course_id)` does.
         """
         allowed = {"name", "code", "description", "visibility",
-                   "instructor_name", "start_date", "end_date",
+                   "instructor_name", "start_date",
                    "ask_student_identity", "report_recipients",
                    "report_to_assistants"}
-        body = _filtered_fields(fields, allowed, "update_course")
-        return self._course_call(
+        body = _filtered_fields(fields, allowed, "update_course",
+                                nullable={"end_date": end_date})
+        return self._json_call(
             "PUT", f"/teacher/course/{course_id}", json_body=body,
             error_label="update_course",
         )
@@ -5845,7 +5891,7 @@ class MLArenaClient:
 
         Mirrors `GET /api/teacher/course/{id}/modules`.
         """
-        return self._course_call(
+        return self._json_call(
             "GET", f"/teacher/course/{course_id}/modules",
             error_label="list_course_modules",
         )
@@ -5860,7 +5906,7 @@ class MLArenaClient:
         body: dict = {"module_id": module_id}
         if position is not None:
             body["position"] = position
-        return self._course_call(
+        return self._json_call(
             "POST", f"/teacher/course/{course_id}/modules", json_body=body,
             ok=(200, 201), error_label="link_module",
         )
@@ -5891,7 +5937,7 @@ class MLArenaClient:
                            ("visibility", visibility), ("is_published", is_published)):
             if value is not None:
                 body[key] = value
-        return self._course_call(
+        return self._json_call(
             "POST", f"/teacher/course/{course_id}/modules/create", json_body=body,
             ok=(201,), error_label="create_course_module",
         )
@@ -5916,7 +5962,7 @@ class MLArenaClient:
         the course's new module row (the `list_course_modules` shape) plus
         `dropped_challenges`. Owner, assistant or admin of the target course.
         """
-        return self._course_call(
+        return self._json_call(
             "POST", f"/teacher/course/{course_id}/modules/copy",
             json_body={"module_id": module_id},
             ok=(201,), error_label="copy_module_into_course",
@@ -5935,7 +5981,7 @@ class MLArenaClient:
         under each. A module outside the list (a public one) is still copied
         by id.
         """
-        return self._course_call(
+        return self._json_call(
             "GET", f"/teacher/course/{course_id}/copyable-modules",
             error_label="list_copyable_modules",
         )
@@ -5963,7 +6009,7 @@ class MLArenaClient:
             body["summary"] = summary
         if pass_threshold is not None:
             body["pass_threshold"] = pass_threshold
-        return self._course_call(
+        return self._json_call(
             "POST", f"/teacher/course/{course_id}/challenges", json_body=body,
             ok=(200, 201), error_label="add_course_challenge",
         )
@@ -6047,7 +6093,7 @@ class MLArenaClient:
             body["label"] = label
         if pass_threshold is not _UNSET:
             body["pass_threshold"] = pass_threshold
-        return self._course_call(
+        return self._json_call(
             "POST", f"/teacher/course/{course_id}/modules/{module_id}/exercise-sets",
             json_body=body, ok=(201,), error_label="add_course_exercise_set",
         )
@@ -6064,7 +6110,7 @@ class MLArenaClient:
         `{"message", "module_deleted"}`. Requires teacher/TA/admin on the
         course; a module not linked to it raises `NotFoundError` (404).
         """
-        return self._course_call(
+        return self._json_call(
             "DELETE", f"/teacher/course/{course_id}/challenges/{module_id}",
             error_label="remove_course_challenge",
         )
@@ -6074,7 +6120,7 @@ class MLArenaClient:
 
         Mirrors `DELETE /api/teacher/course/{id}/modules/{module_id}`.
         """
-        return self._course_call(
+        return self._json_call(
             "DELETE", f"/teacher/course/{course_id}/modules/{module_id}",
             error_label="unlink_module",
         )
@@ -6086,7 +6132,7 @@ class MLArenaClient:
         Mirrors `PUT /api/teacher/course/{id}/modules/reorder`.
         `ordered_module_ids` must be exactly this course's linked module ids.
         """
-        return self._course_call(
+        return self._json_call(
             "PUT", f"/teacher/course/{course_id}/modules/reorder",
             json_body={"ordered_ids": ordered_module_ids},
             error_label="reorder_modules",
@@ -6122,7 +6168,7 @@ class MLArenaClient:
         first Check), and its challenge meta `exercise_count`. Both are None
         for every other kind of challenge.
         """
-        return self._course_call(
+        return self._json_call(
             "GET", f"/teacher/course/{course_id}/progress",
             error_label="course_progress",
         )
@@ -6200,7 +6246,7 @@ class MLArenaClient:
         archived, ends within 7 days and assigns a challenge, else None).
         Owner, assistant or admin; 403 otherwise.
         """
-        return self._course_call(
+        return self._json_call(
             "GET", f"/teacher/course/{course_id}", error_label="teacher_course",
         )
 
@@ -6214,7 +6260,7 @@ class MLArenaClient:
         its students keep reading it and you keep following it. Returns the
         course (`archived_at_ts` set); 409 when it is already archived.
         """
-        return self._course_call(
+        return self._json_call(
             "POST", f"/teacher/course/{course_id}/archive",
             error_label="archive_course",
         )
@@ -6226,7 +6272,7 @@ class MLArenaClient:
         in its owner's limit again: 403 when the owner has no place left, 409
         when the course is not archived. Returns the course.
         """
-        return self._course_call(
+        return self._json_call(
             "POST", f"/teacher/course/{course_id}/unarchive",
             error_label="unarchive_course",
         )
@@ -6255,7 +6301,7 @@ class MLArenaClient:
         body: dict = {}
         if name is not None:
             body["name"] = name
-        return self._course_call(
+        return self._json_call(
             "POST", f"/teacher/course/{course_id}/duplicate", json_body=body,
             ok=(201,), error_label="duplicate_course",
         )
@@ -6274,7 +6320,7 @@ class MLArenaClient:
         `course_deletion` announced: `{can_delete, enrollment_count,
         deleted_modules, kept_modules}`.
         """
-        return self._course_call(
+        return self._json_call(
             "DELETE", f"/teacher/course/{course_id}", error_label="delete_course",
         )
 
@@ -6287,7 +6333,7 @@ class MLArenaClient:
         (each `[{id, title}]`): the modules that would go with the course and
         the ones that would stay in their owner's library.
         """
-        return self._course_call(
+        return self._json_call(
             "GET", f"/teacher/course/{course_id}/deletion",
             error_label="course_deletion",
         )
@@ -6308,7 +6354,7 @@ class MLArenaClient:
         error body). The mail the platform sends by itself on the course's
         `end_date` needs that date; this call does not.
         """
-        return self._course_call(
+        return self._json_call(
             "POST", f"/teacher/course/{course_id}/report/send",
             error_label="send_course_report",
         )
@@ -6329,7 +6375,7 @@ class MLArenaClient:
         A challenge with no evaluation is not listed, because `attach_challenge`
         refuses it.
         """
-        return _to_dataframe(self._course_call(
+        return _to_dataframe(self._json_call(
             "GET", "/teacher/challenges-for-course",
             error_label="challenges_for_course",
         ))
@@ -6396,7 +6442,7 @@ class MLArenaClient:
         progress are kept, and they can enroll again with the join code (their
         completed lessons then count again).
         """
-        return self._course_call(
+        return self._json_call(
             "DELETE", f"/teacher/student/{course_id}/{user_id}",
             error_label="remove_student",
         )
@@ -6411,7 +6457,7 @@ class MLArenaClient:
         row: `teacher_course(id)["owner_username"]` names them. Returns a DataFrame if
         pandas is installed, else a list of dicts.
         """
-        return _to_dataframe(self._course_call(
+        return _to_dataframe(self._json_call(
             "GET", f"/teacher/course/{course_id}/assistants",
             error_label="course_assistants",
         ))
@@ -6422,7 +6468,7 @@ class MLArenaClient:
         Mirrors `POST /api/teacher/course/{id}/assistants`. A TA gets the same
         teacher view of the course, but cannot manage the assistant list.
         """
-        return self._course_call(
+        return self._json_call(
             "POST", f"/teacher/course/{course_id}/assistants",
             json_body={"username": username}, ok=(200, 201),
             error_label="add_course_assistant",
@@ -6433,7 +6479,7 @@ class MLArenaClient:
 
         Mirrors `DELETE /api/teacher/course/{id}/assistants/{user_id}`.
         """
-        return self._course_call(
+        return self._json_call(
             "DELETE", f"/teacher/course/{course_id}/assistants/{user_id}",
             error_label="remove_course_assistant",
         )
@@ -6650,7 +6696,7 @@ class MLArenaClient:
         repository is pushed from its own GitHub Actions workflow instead
         (`mlarena course push`).
         """
-        return self._course_call(
+        return self._json_call(
             "POST", f"/teacher/courses/{quote(slug, safe='')}/import-github",
             json_body={"repository": repository, "ref": ref, "path": path,
                        "dry_run": dry_run, "prune": prune},
@@ -6844,20 +6890,26 @@ def _as_student(as_student: bool) -> dict | None:
     return {"as_student": "true"} if as_student else None
 
 
-def _filtered_fields(fields: dict, allowed: set, method_name: str) -> dict:
+def _filtered_fields(fields: dict, allowed: set, method_name: str, *,
+                     nullable: dict | None = None) -> dict:
     """Validate a ``**fields`` partial-update kwargs dict against the route's
     editable set, failing loud (Fail-Fast) on an unknown field rather than
-    silently dropping it, and requiring at least one field."""
+    silently dropping it, and requiring at least one field. A ``None`` in
+    ``fields`` is not sent; ``nullable`` holds the keywords where ``None`` is
+    a value (sent as null) and ``_UNSET`` means not passed."""
+    nullable = nullable or {}
     unknown = set(fields) - allowed
     if unknown:
         raise MLArenaError(
             f"{method_name}: unknown field(s) {sorted(unknown)}. "
-            f"Allowed: {sorted(allowed)}"
+            f"Allowed: {sorted(allowed | set(nullable))}"
         )
     body = {k: v for k, v in fields.items() if v is not None}
+    body.update({k: v for k, v in nullable.items() if v is not _UNSET})
     if not body:
         raise MLArenaError(
-            f"{method_name} requires at least one field from {sorted(allowed)}"
+            f"{method_name} requires at least one field from "
+            f"{sorted(allowed | set(nullable))}"
         )
     return body
 
@@ -7004,6 +7056,121 @@ def _default_submission_name(agent, files) -> str:
     if files:
         return os.path.splitext(os.path.basename(files[0]))[0]
     return "submission"
+
+
+def _match_runtime(challenge_id: int, rows: list, name: str | None, *,
+                   language: str | None = None,
+                   framework: str | None = None,
+                   framework_version: str | None = None) -> dict:
+    """The row of `rows` (a challenge's `runtime_options`) named `name`, or
+    the first matching the deprecated keywords; `MLArenaError` when none."""
+    if name is not None:
+        if (language, framework, framework_version) != (None, None, None):
+            raise MLArenaError("Pass a runtime name or the deprecated keywords, not both")
+        for r in rows:
+            if r["name"] == name:
+                return r
+        raise MLArenaError(
+            f"Challenge {challenge_id} offers no runtime named {name!r}; "
+            f"its runtimes: {', '.join(sorted(r['name'] for r in rows))}"
+        )
+    for r in rows:
+        if language is not None and r.get("language") != language:
+            continue
+        if framework is not None and r.get("framework") != framework:
+            continue
+        if framework_version is not None and r.get("framework_version") != framework_version:
+            continue
+        return r
+    raise MLArenaError(
+        f"No runtime found for language={language!r} framework={framework!r} "
+        f"framework_version={framework_version!r}. Available: {rows}"
+    )
+
+
+def _check_agent_argument(agent) -> None:
+    """`submit(agent=…)` takes a class or a module: refuse a path (that is
+    `files=`) and an instance before any request."""
+    if isinstance(agent, (str, bytes, os.PathLike)):
+        raise SubmissionError(
+            f"agent= takes a class (or a module), not a path ({agent!r}): "
+            f"to upload a file, pass files=[{agent!r}]"
+        )
+    if not (inspect.isclass(agent) or inspect.ismodule(agent)):
+        raise SubmissionError(
+            f"agent= takes a class (or a module), got an instance of "
+            f"{type(agent).__name__}: pass the class itself "
+            f"(agent={type(agent).__name__}), or the file with files=[...]"
+        )
+
+
+def _agent_source(agent, entry_filename: str | None, challenge_id: int) -> str:
+    """The text `submit(agent=…)` uploads as `agent.py`: the source of a
+    class (that class only: imports and helpers outside it are not in it)
+    or of a module (the whole file). Refused before anything is created on
+    a challenge whose entry file is not `agent.py`, or when the source
+    cannot be read."""
+    if entry_filename != "agent.py":
+        raise SubmissionError(
+            f"Challenge {challenge_id} does not take an agent.py "
+            + (f"(its submission is {entry_filename!r}): pass files=[...]"
+               if entry_filename is not None else "(it takes no upload)")
+        )
+    try:
+        return inspect.getsource(agent)
+    except (OSError, TypeError) as err:
+        # A class defined in an interactive session has no source file.
+        raise SubmissionError(
+            f"agent=: cannot read the source of {agent!r} ({err}); write it "
+            f"to agent.py and pass files=['agent.py']"
+        ) from err
+
+
+def _check_upload_limits(challenge_id: int, challenge: dict,
+                         uploads: list[tuple[str, int]]) -> None:
+    """Refuse, before the create, uploads the challenge's served limits
+    (`max_upload_files`, `max_upload_size_bytes`) already refuse. `uploads`
+    is `(file name, size in bytes)` per file. The server stays the judge;
+    a None limit is one the challenge does not serve."""
+    names = [name for name, _size in uploads]
+    duplicates = sorted({name for name in names if names.count(name) > 1})
+    if duplicates:
+        raise SubmissionError(
+            f"Two files share the name {', '.join(duplicates)}: a submission "
+            f"stores each file under its base name, so one would replace the other"
+        )
+    max_files = challenge["max_upload_files"]
+    # A code challenge's new submission already holds `agent.py` (the
+    # template), so it counts whether or not it is uploaded.
+    stored = set(names) | ({"agent.py"} if challenge["entry_filename"] == "agent.py" else set())
+    if max_files is not None and len(stored) > max_files:
+        raise SubmissionError(
+            f"Challenge {challenge_id} takes at most {max_files} file(s) per "
+            f"submission; this one would hold {len(stored)} "
+            f"({', '.join(sorted(stored))})"
+        )
+    max_bytes = challenge["max_upload_size_bytes"]
+    total = sum(size for _name, size in uploads)
+    if max_bytes is not None and total > max_bytes:
+        raise SubmissionError(
+            f"Challenge {challenge_id} takes at most {max_bytes} bytes per "
+            f"submission ({max_bytes / (1024 * 1024):.0f} MB); these files "
+            f"total {total} bytes"
+        )
+
+
+def _left_behind(err: MLArenaError, challenge_id: int,
+                 submission_id: int) -> MLArenaError:
+    """`err` (raised after `submit()` created a submission and before it
+    deployed it) as the same class, naming the submission: the message says
+    how to deploy or delete it, `submission_id` carries its id."""
+    return type(err)(
+        f"{err} (submission {submission_id} was created and is not deployed: "
+        f"deploy it with deploy_submission({challenge_id}, {submission_id}) or "
+        f"delete it with delete_submission({challenge_id}, {submission_id}))",
+        status_code=err.status_code, body=err.body,
+        submission_id=submission_id,
+    )
 
 
 def _safe_error(resp: requests.Response, fallback: str = "request failed") -> str:

@@ -10,14 +10,20 @@ class MLArenaError(Exception):
     `submit(wait=True)` that ended `deploy_failed` — there `body` is the final
     status payload and `status_code` is None) or when the reply had no JSON
     object body. The message is unchanged from earlier releases.
+
+    `submission_id` is the submission a `submit()` call created before it
+    failed (a refused upload or deploy, a failed wait), so the caller can
+    deploy it later or delete it; None on every other error.
     """
 
     def __init__(self, message: str = "", *,
                  status_code: int | None = None,
-                 body: dict | None = None):
+                 body: dict | None = None,
+                 submission_id: int | None = None):
         super().__init__(message)
         self.status_code = status_code
         self.body = body
+        self.submission_id = submission_id
 
 
 class AuthenticationError(MLArenaError):

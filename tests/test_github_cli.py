@@ -549,8 +549,15 @@ def test_create_submission_sends_allow_same_commit_only_when_asked():
     assert rec.last["json"] == {"submission_name": "s", "allow_same_commit": True}
 
 
+# What `submit()` reads off `challenge()` before it creates anything.
+_CHALLENGE_4 = {"entry_filename": "agent.py", "max_upload_files": 10,
+                "max_upload_size_bytes": 1 << 20, "runtime_options": []}
+
+
 def _same_commit_router(method, url, kwargs):
     path = url.split("/api", 1)[1]
+    if path == "/challenges/4":
+        return (200, _CHALLENGE_4)
     if method == "POST" and path == "/submissions/challenge/4":
         return (409, {"error": "This commit was already submitted", "submission_id": 77})
     if path == "/submissions/submission/77":
@@ -574,6 +581,7 @@ def test_submit_returns_the_existing_submission_of_the_same_commit(tmp_path):
                    "status": {"id": 77, "status": "active"}}
     # Nothing uploaded, nothing deployed; status() reads the existing one.
     assert [(call["method"], call["path"]) for call in rec.calls] == [
+        ("GET", "/challenges/4"),
         ("POST", "/submissions/challenge/4"), ("GET", "/submissions/submission/77")]
     assert c._last_submission_id == 77
 
@@ -581,13 +589,20 @@ def test_submit_returns_the_existing_submission_of_the_same_commit(tmp_path):
 def test_submit_reraises_a_409_without_a_submission_id(tmp_path):
     # e.g. a chat challenge: its submission is not created by this route.
     agent = _write(str(tmp_path), "agent.py")
-    c, _ = make_client(lambda *_: (409, {"error": "Chat challenges have no upload"}))
+    def router(method, url, kwargs):
+        if url.endswith("/challenges/4"):
+            return (200, _CHALLENGE_4)
+        return (409, {"error": "Chat challenges have no upload"})
+
+    c, _ = make_client(router)
     with pytest.raises(SubmissionError, match="no upload"):
         c.submit(4, files=[agent])
 
 
 def _upload_only_router(method, url, kwargs):
     path = url.split("/api", 1)[1]
+    if path == "/challenges/4":
+        return (200, _CHALLENGE_4)
     if method == "POST" and path == "/submissions/challenge/4":
         return (201, {"submission_id": 11})
     if path == "/submissions/submission/11":
@@ -603,7 +618,7 @@ def test_submit_without_deploy_stops_after_the_upload_check(tmp_path):
     c, rec = make_client(_upload_only_router)
     out = c.submit(4, files=[agent], deploy=False, allow_same_commit=True)
     assert out == {"submission_id": 11, "deploy": None}
-    assert rec.calls[0]["json"]["allow_same_commit"] is True
+    assert rec.calls[1]["json"]["allow_same_commit"] is True
     assert not any(call["path"].endswith("/deploy") for call in rec.calls)
     with pytest.raises(SubmissionError, match="wait=True needs deploy=True"):
         c.submit(4, files=[agent], deploy=False, wait=True)

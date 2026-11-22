@@ -307,6 +307,36 @@ def test_update_course_fields():
             rec.last["json"])
 
 
+def test_update_course_end_date_none_clears_it():
+    # end_date=None is an explicit null (clear); leaving it out sends no key.
+    c, rec = make_client(lambda *_: (200, {"id": 1}))
+    c.update_course(1, end_date=None)
+    _expect(rec.last["json"] == {"end_date": None}, rec.last["json"])
+
+    c.update_course(1, name="New")
+    _expect(rec.last["json"] == {"name": "New"}, rec.last["json"])
+
+    c.update_course(1, end_date="2026-12-31", start_date=None)
+    _expect(rec.last["json"] == {"end_date": "2026-12-31"}, rec.last["json"])
+
+
+def test_update_course_with_nothing_to_send_raises():
+    c, rec = make_client(lambda *_: (200, {"id": 1}))
+    try:
+        c.update_course(1)
+    except MLArenaError as err:
+        _expect("end_date" in str(err), str(err))
+    else:
+        raise AssertionError("update_course(1) did not raise")
+    try:
+        c.update_course(1, start_date=None)
+    except MLArenaError:
+        pass
+    else:
+        raise AssertionError("update_course(1, start_date=None) did not raise")
+    _expect(rec.calls == [], rec.calls)
+
+
 def test_link_and_reorder_modules():
     # link returns 201 (created), reorder returns 200 — route by verb.
     def router(method, path, kwargs):
