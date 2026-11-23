@@ -18,7 +18,7 @@ from mlarena.exceptions import (
 )
 from mlarena.metrics import format_metric
 
-__version__ = "4.19.1"
+__version__ = "4.20.0"
 
 
 def connect(

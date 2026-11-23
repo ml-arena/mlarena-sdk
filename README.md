@@ -60,6 +60,24 @@ client.leaderboard(ch["id"])                      # a DataFrame with pandas
   An error once the submission exists (a refused upload, a deploy over your
   daily quota) carries `err.submission_id` and says how to deploy or delete it.
 
+## 4.20.0 — add an assistant by username search or by email
+
+- `search_challenge_assistant_candidates(challenge_id, q)` and
+  `search_course_assistant_candidates(course_id, q)`: the accounts you may
+  add, by username (two characters at least; at most six rows of `user_id`,
+  `username`, `avatar_key`). Add one with `add_challenge_assistant` /
+  `add_course_assistant` as before.
+- `invite_challenge_assistant(challenge_id, email)` and
+  `invite_course_assistant(course_id, email)` mail a link that makes whoever
+  opens it an assistant, whether or not the address has an account yet. It
+  works once, for 14 days; inviting the same address again renews it.
+  `challenge_assistant_invitations` / `course_assistant_invitations` list the
+  ones still waiting, `cancel_challenge_assistant_invitation` /
+  `cancel_course_assistant_invitation` cancel one. Owner only.
+- `assistant_invitation(token)` reads what a mailed link invites to and
+  `accept_assistant_invitation(token)` accepts it (a key of any scope).
+- `challenge_assistants` and `course_assistants` rows carry `avatar_key`.
+
 ## 4.19.1 — three refusals said earlier and clearer
 
 - **`submit()` refuses a challenge that takes no deploy before it creates.**

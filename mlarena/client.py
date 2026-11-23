@@ -3019,6 +3019,86 @@ class MLArenaClient:
             challenge_id, f"/assistants/{user_id}", "remove_challenge_assistant"
         )
 
+    def search_challenge_assistant_candidates(self, challenge_id: int, q: str) -> list:
+        """Accounts you may add as assistants of this challenge, by username.
+
+        Mirrors `GET /api/creator_challenge/challenge/{id}/assistants/candidates`. `q` (two characters at least) is
+        looked for anywhere in the username; at most six rows, those starting
+        with `q` first, each `user_id`, `username`, `avatar_key`. The owner
+        and the assistants already there are left out. Owner only.
+        """
+        return self._json_call(
+            "GET", f"/creator_challenge/challenge/{challenge_id}/assistants/candidates", params={"q": q},
+            error_label="search_challenge_assistant_candidates",
+        )
+
+    def challenge_assistant_invitations(self, challenge_id: int) -> list:
+        """The assistant invitations mailed and not answered yet, newest first.
+
+        Mirrors `GET /api/creator_challenge/challenge/{id}/assistants/invitations`. Each row carries `id`, `email`,
+        `sender_username`, `created_at_ts`, `expires_at_ts` and `is_expired`.
+        Owner only.
+        """
+        return self._json_call(
+            "GET", f"/creator_challenge/challenge/{challenge_id}/assistants/invitations",
+            error_label="challenge_assistant_invitations",
+        )
+
+    def invite_challenge_assistant(self, challenge_id: int, email: str) -> dict:
+        """Mail `email` a link that makes whoever opens it an assistant of
+        this challenge, whether or not the address has an account yet.
+
+        Mirrors `POST /api/creator_challenge/challenge/{id}/assistants/invitations`. The link works once, for 14 days.
+        Inviting an address that is already waiting renews its invitation
+        (same `id`): a new link is mailed and the earlier one stops working.
+        Returns the invitation row. Owner only.
+        """
+        return self._json_call(
+            "POST", f"/creator_challenge/challenge/{challenge_id}/assistants/invitations",
+            json_body={"email": email}, ok=(201,),
+            error_label="invite_challenge_assistant",
+        )
+
+    def cancel_challenge_assistant_invitation(self, challenge_id: int,
+                                           invitation_id: int) -> dict:
+        """Cancel a pending assistant invitation: its link stops working.
+
+        Mirrors `DELETE /api/creator_challenge/challenge/{id}/assistants/invitations/{invitation_id}`. Owner only.
+        """
+        return self._json_call(
+            "DELETE", f"/creator_challenge/challenge/{challenge_id}/assistants/invitations/{invitation_id}",
+            error_label="cancel_challenge_assistant_invitation",
+        )
+
+    def assistant_invitation(self, token: str) -> dict:
+        """What an assistant invitation link invites to.
+
+        Mirrors `GET /api/author/assistant_invitations/{token}` (`token` is
+        the last part of the mailed link). Returns `challenge_id` / `course_id`
+        (one of the two), `name`, `sender_username`, `expires_at_ts` and
+        `already_editor` (you already edit it). A link that was used,
+        cancelled or replaced raises `ChallengeNotFoundError` (404); an
+        expired one `MLArenaError` (410).
+        """
+        return self._json_call(
+            "GET", f"/author/assistant_invitations/{token}",
+            error_label="assistant_invitation",
+        )
+
+    def accept_assistant_invitation(self, token: str) -> dict:
+        """Accept an assistant invitation: you become an assistant of its
+        challenge or course, and the link is used up.
+
+        Mirrors `POST /api/author/assistant_invitations/{token}/accept`; a key
+        of any scope. Returns `challenge_id` / `course_id` (one of the two)
+        and `name`. Note that a `user` key does not reach the creator or
+        teacher routes afterwards: create a key of that scope.
+        """
+        return self._json_call(
+            "POST", f"/author/assistant_invitations/{token}/accept",
+            error_label="accept_assistant_invitation",
+        )
+
     # ---- Submissions (user scope) ----
 
     def create_submission(self, challenge_id: int, submission_name: str,
@@ -6696,6 +6776,57 @@ class MLArenaClient:
         return self._json_call(
             "DELETE", f"/teacher/course/{course_id}/assistants/{user_id}",
             error_label="remove_course_assistant",
+        )
+
+    def search_course_assistant_candidates(self, course_id: int, q: str) -> list:
+        """Accounts you may add as assistants of this course, by username.
+
+        Mirrors `GET /api/teacher/course/{id}/assistants/candidates`. `q` (two characters at least) is
+        looked for anywhere in the username; at most six rows, those starting
+        with `q` first, each `user_id`, `username`, `avatar_key`. The owner
+        and the assistants already there are left out. Course owner or admin.
+        """
+        return self._json_call(
+            "GET", f"/teacher/course/{course_id}/assistants/candidates", params={"q": q},
+            error_label="search_course_assistant_candidates",
+        )
+
+    def course_assistant_invitations(self, course_id: int) -> list:
+        """The assistant invitations mailed and not answered yet, newest first.
+
+        Mirrors `GET /api/teacher/course/{id}/assistants/invitations`. Each row carries `id`, `email`,
+        `sender_username`, `created_at_ts`, `expires_at_ts` and `is_expired`.
+        Course owner or admin.
+        """
+        return self._json_call(
+            "GET", f"/teacher/course/{course_id}/assistants/invitations",
+            error_label="course_assistant_invitations",
+        )
+
+    def invite_course_assistant(self, course_id: int, email: str) -> dict:
+        """Mail `email` a link that makes whoever opens it an assistant of
+        this course, whether or not the address has an account yet.
+
+        Mirrors `POST /api/teacher/course/{id}/assistants/invitations`. The link works once, for 14 days.
+        Inviting an address that is already waiting renews its invitation
+        (same `id`): a new link is mailed and the earlier one stops working.
+        Returns the invitation row. Course owner or admin.
+        """
+        return self._json_call(
+            "POST", f"/teacher/course/{course_id}/assistants/invitations",
+            json_body={"email": email}, ok=(201,),
+            error_label="invite_course_assistant",
+        )
+
+    def cancel_course_assistant_invitation(self, course_id: int,
+                                           invitation_id: int) -> dict:
+        """Cancel a pending assistant invitation: its link stops working.
+
+        Mirrors `DELETE /api/teacher/course/{id}/assistants/invitations/{invitation_id}`. Course owner or admin.
+        """
+        return self._json_call(
+            "DELETE", f"/teacher/course/{course_id}/assistants/invitations/{invitation_id}",
+            error_label="cancel_course_assistant_invitation",
         )
 
     def export_course_csv(self, course_id: int, challenge_id: int, *,

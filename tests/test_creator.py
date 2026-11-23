@@ -346,6 +346,30 @@ def test_add_challenge_assistant_sends_the_username():
     _expect(rec.last["json"] == {"username": "ta"}, rec.last["json"])
 
 
+def test_challenge_assistant_candidates_and_invitations():
+    c, rec = make_client(lambda *_: (200, [{"user_id": 9, "username": "ta", "avatar_key": None}]))
+    out = c.search_challenge_assistant_candidates(7, "ta")
+    _expect(rec.last["path"] == CREATOR + "/assistants/candidates", rec.last["path"])
+    _expect(rec.last["params"] == {"q": "ta"}, rec.last["params"])
+    _expect(out[0]["user_id"] == 9, out)
+
+    c, rec = make_client(lambda *_: (201, {"id": 4, "email": "lea@example.org"}))
+    out = c.invite_challenge_assistant(7, "lea@example.org")
+    _expect(rec.last["method"] == "POST", rec.last["method"])
+    _expect(rec.last["path"] == CREATOR + "/assistants/invitations", rec.last["path"])
+    _expect(rec.last["json"] == {"email": "lea@example.org"}, rec.last["json"])
+    _expect(out["id"] == 4, out)
+
+    c, rec = make_client(lambda *_: (200, []))
+    _expect(c.challenge_assistant_invitations(7) == [], "invitations")
+    _expect(rec.last["path"] == CREATOR + "/assistants/invitations", rec.last["path"])
+
+    c, rec = make_client(lambda *_: (200, {"message": "Invitation cancelled"}))
+    c.cancel_challenge_assistant_invitation(7, 4)
+    _expect(rec.last["method"] == "DELETE", rec.last["method"])
+    _expect(rec.last["path"] == CREATOR + "/assistants/invitations/4", rec.last["path"])
+
+
 def test_challenge_image_writes_the_bytes_it_got():
     png = b"\x89PNG\r\n\x1a\nbody"
     c, rec = make_client(lambda *_: FakeResponse(200, {}, content=png))

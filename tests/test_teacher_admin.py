@@ -453,6 +453,50 @@ def test_remove_course_assistant_takes_the_user_id():
     _expect(rec.last["path"] == "/teacher/course/5/assistants/9", rec.last["path"])
 
 
+def test_course_assistant_candidates_and_invitations():
+    invitation = {"id": 4, "email": "lea@example.org", "sender_username": "ann",
+                  "created_at_ts": "2026-11-20T10:00:00Z",
+                  "expires_at_ts": "2026-12-04T10:00:00Z", "is_expired": False}
+    c, rec = make_client(lambda *_: (200, [{"user_id": 9, "username": "bob", "avatar_key": None}]))
+    out = c.search_course_assistant_candidates(5, "bo")
+    _expect(rec.last["path"] == "/teacher/course/5/assistants/candidates", rec.last["path"])
+    _expect(rec.last["params"] == {"q": "bo"}, rec.last["params"])
+    _expect(out[0]["username"] == "bob", out)
+
+    c, rec = make_client(lambda *_: (201, invitation))
+    out = c.invite_course_assistant(5, "lea@example.org")
+    _expect(rec.last["method"] == "POST", rec.last["method"])
+    _expect(rec.last["path"] == "/teacher/course/5/assistants/invitations", rec.last["path"])
+    _expect(rec.last["json"] == {"email": "lea@example.org"}, rec.last["json"])
+    _expect(out["id"] == 4, out)
+
+    c, rec = make_client(lambda *_: (200, [invitation]))
+    out = c.course_assistant_invitations(5)
+    _expect(rec.last["path"] == "/teacher/course/5/assistants/invitations", rec.last["path"])
+    _expect(out[0]["email"] == "lea@example.org", out)
+
+    c, rec = make_client(lambda *_: (200, {"message": "Invitation cancelled"}))
+    c.cancel_course_assistant_invitation(5, 4)
+    _expect(rec.last["method"] == "DELETE", rec.last["method"])
+    _expect(rec.last["path"] == "/teacher/course/5/assistants/invitations/4", rec.last["path"])
+
+
+def test_assistant_invitation_link_reads_and_accepts():
+    c, rec = make_client(lambda *_: (200, {"challenge_id": None, "course_id": 5, "name": "DL",
+                                           "sender_username": "ann",
+                                           "expires_at_ts": "2026-12-04T10:00:00Z",
+                                           "already_editor": False}))
+    out = c.assistant_invitation("tok")
+    _expect(rec.last["path"] == "/author/assistant_invitations/tok", rec.last["path"])
+    _expect(out["course_id"] == 5, out)
+
+    c, rec = make_client(lambda *_: (200, {"challenge_id": None, "course_id": 5, "name": "DL"}))
+    out = c.accept_assistant_invitation("tok")
+    _expect(rec.last["method"] == "POST", rec.last["method"])
+    _expect(rec.last["path"] == "/author/assistant_invitations/tok/accept", rec.last["path"])
+    _expect(out["name"] == "DL", out)
+
+
 def test_assistant_errors_surface():
     c, _rec = make_client(lambda *_: (409, {"error": "already a TA"}))
     try:
