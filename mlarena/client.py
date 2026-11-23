@@ -1097,6 +1097,13 @@ class MLArenaClient:
         `challenge.toml`, every config key (data feed and participation
         limits included) and tags; not its datasets.
 
+        What a new challenge is born with: its kind's sample `env.py` and no
+        benchmark file (`run_benchmark`). An exercise set (`exercise_v1`) is born data-only, like one made
+        with `add_course_exercise_set`: the generated two-line `env.py` and
+        an empty `exercises.json`, so `update_exercise_definition` writes it
+        at once. To write the set in Python instead, upload your own
+        `env.py` (`upload_env_file`).
+
         If `tag_names` is given, each name is resolved against the public
         tag catalog (`GET /api/challenge_tags/tags`) before the create
         call; on a copy they replace the source's tags. Unknown names raise
@@ -1357,7 +1364,16 @@ class MLArenaClient:
         owned by the file: sending it here raises `MLArenaError` (400)
         `"<key> is set in challenge.toml (line N); edit the file"` — change
         the file (`upload_env_file`) instead. `creator_challenge(id)
-        ["config"]["origin"]` says who owns each key. Once
+        ["config"]["origin"]` says who owns each key. On
+        a file challenge whose `env.py` the scoring form generated,
+        `submission_filename` and what `metrics` ranks (the ranking
+        descriptor's `key`, `source`, `order`) are the form's: a value that
+        would change them away from what the file states is a 409 naming
+        the form, since the generated file would keep the old ones; change
+        them with `set_scoring_form` (label, precision and visibility stay
+        settable here). The same rule holds for a `challenge.toml` and for a
+        bundle that keeps the generated `env.py`; one that brings its own
+        `env.py` takes the scoring over. Once
         the challenge has started only the fields that cannot rescore an
         existing run still apply — the presentation fields of `metrics`
         (`label`, `unit`, `precision`, `format`, `visible`) and
@@ -1939,9 +1955,13 @@ class MLArenaClient:
         """The challenge's benchmark folder (creator scope).
 
         Mirrors `GET /api/creator_challenge/challenge/{id}/benchmark/files`
-        (`benchmark.py`). Same shape as `list_env_files()`: the benchmark
-        `agent.py` on a code challenge, the benchmark submission file on a
-        file challenge.
+        (`benchmark.py`). Same shape as `list_env_files()`: what is stored.
+        The benchmark `agent.py` on a code challenge once you uploaded one or
+        a first `run_benchmark` stored the agent template; the benchmark
+        submission file on a file challenge once you uploaded it
+        (`upload_benchmark_file`) or generated the baseline
+        (`generate_scoring_baseline`). A read: it writes nothing, and
+        `{"files": {}}` is an empty folder.
         """
         return self._creator_get(
             challenge_id, "/benchmark/files", "list_benchmark_files"
@@ -1962,10 +1982,15 @@ class MLArenaClient:
         """Kick off the benchmark simulation. Returns the new run, in the
         shape `benchmark_status()["run"]` serves it (`job_status` `pending`).
 
-        Requires that env.py has been uploaded and a benchmark `agent.py`
-        (or the challenge's submission file for file_v1, e.g. submission.csv /
-        pitch.txt) is already present. The call itself is fire-and-forget; poll
-        `benchmark_status` for completion.
+        Requires that env.py has been uploaded. On a code challenge with no
+        benchmark `agent.py` stored, the challenge's current agent template
+        is stored as `agent.py` and runs (no upload and no earlier read
+        needed). A file challenge needs its submission file (e.g.
+        submission.csv / pitch.txt); while the challenge is not started, one
+        with nothing to score is refused (400) before a run is queued: an
+        empty file, or a CSV holding only the ground truth's header line.
+        The call itself is fire-and-forget; poll `benchmark_status` for
+        completion.
         """
         resp = self._request("POST",
             self._url(
@@ -5533,7 +5558,10 @@ class MLArenaClient:
         the profile — set those via the Profile page / profile update). The
         backend requires both to be present before enrolling, unless the course
         does not ask for them (`enrollment_info()["ask_student_identity"]`,
-        a course setting). An archived or ended course answers 410. Returns
+        a course setting). `student_email` must be an email address: any
+        other value is a 400 naming the field, nothing is stored and the call
+        can be made again (the same rule as `update_profile` and a course's
+        `report_recipients`). An archived or ended course answers 410. Returns
         `{message, challenge_ids, course_slug}`.
         """
         if join_code is None:
@@ -5612,6 +5640,16 @@ class MLArenaClient:
         the course is then its content, with no module heading. Each lesson
         of the TOC carries `visible_to_students` (it is published and so is
         its module), next to its own `is_published`.
+
+        A module's `challenges` are its entries. An entry whose challenge is
+        a draft you do not edit is not open yet: its `challenge` and `metric`
+        are None, and it carries only the course's `label` and
+        `pass_threshold`. No field of the draft is served before its first
+        Start (`my_progress` has no cell for it, `enrollment_info` does not
+        name it). What the course's author wrote is served as theirs: the
+        module's `title` and `summary` and the entry's `label`. The title of
+        an entry made with `add_course_challenge` was filled from the
+        challenge's name when it was added, and is the author's text since.
 
         `as_student=True` ("View as student", `?as_student=true`) serves a
         manager of the course what an enrolled student gets: no module or
@@ -5738,7 +5776,12 @@ class MLArenaClient:
         """Create an owned, reusable content module. Requires a `teacher` token.
 
         Mirrors `POST /api/teacher/modules`. `slug` (kebab, `^[a-z0-9-]+$`) is
-        auto-derived from the title when omitted and is unique per owner.
+        unique per owner: derived from the title when omitted (and suffixed
+        `-2`, `-3`… until free); a `slug` you pass is kept as written, or
+        refused: 409 when you already have a module with it, 400 when it is
+        not a slug as the platform writes one (a leading, trailing or
+        doubled hyphen, over 100 characters). The same holds for
+        `create_course`, `create_course_module` and `create_lesson`.
 
         Two independent flags, easy to confuse:
 
@@ -5956,7 +5999,9 @@ class MLArenaClient:
         Mirrors `POST /api/teacher/modules/{id}/lessons`. `kind` is `lesson`
         (default) | `exercise`. `parent_lesson_id` nests it one level under
         another lesson in the same module. Publish it later via
-        `update_lesson(id, is_published=True)`.
+        `update_lesson(id, is_published=True)`. `slug` is derived from the
+        title when omitted (suffixed until free in the module); one you pass
+        is kept as written, or refused with a 409 when the module has it.
         """
         body: dict = {"title": title, "kind": kind, "body_md": body_md,
                       "gated": gated}
@@ -6183,7 +6228,12 @@ class MLArenaClient:
         lesson summaries of `get_module`, in order, each with
         `visible_to_students`) and its `challenges`.
 
-        Mirrors `GET /api/teacher/course/{id}/modules`.
+        Mirrors `GET /api/teacher/course/{id}/modules`. A row's one id is
+        `module_id`: the id `unlink_module`, `remove_course_challenge`,
+        `reorder_modules`, `add_course_exercise_set` and every module method
+        (`get_module`, `create_lesson`, …) take. A row has no `id` key: it
+        used to hold the link row's id, which no method takes and which
+        named some other module.
         """
         return self._json_call(
             "GET", f"/teacher/course/{course_id}/modules",
@@ -6222,7 +6272,9 @@ class MLArenaClient:
         other value is a 403). (`create_module` followed by
         `link_module` makes a module of your own library: in a course you
         only assist, its owner could not edit it.) Linked at the end of the
-        course, with a slug no module of the course uses. Returns the
+        course, with a slug no module of the course uses (a `slug` you pass
+        that is taken is a 409; without one it is derived from the title and
+        suffixed until free). Returns the
         course's new module row (the `list_course_modules` shape). Owner,
         assistant or admin of the course.
         """
@@ -6293,6 +6345,10 @@ class MLArenaClient:
         students see), links it at the end of the course and attaches the
         challenge with `pass_threshold` (see `attach_challenge`); either all
         three happen or none does. `is_published=False` stages it as a draft.
+        A course holds a challenge once: when one of its modules already has
+        it (a hidden one included) the call is a 409 naming that entry
+        (`err.body["module_id"]`), and nothing is added; change the entry
+        there (`update_challenge_link`).
         Returns the course's new module row (the shape `list_course_modules`
         returns). Requires teacher/TA/admin on the course.
         """
@@ -6336,7 +6392,10 @@ class MLArenaClient:
         console offers only a started or draft challenge; the server accepts
         any challenge you may reuse (public, yours, or one you assist on).
         If the course is created but the challenge is refused, the course
-        stays and the refusal is raised.
+        stays and the refusal is raised. With `course=`, the call is
+        idempotent: when the course already holds the challenge
+        (`add_course_challenge` answers 409 with the entry's `module_id`),
+        nothing is added and the course is returned as on the first call.
 
         Returns the course as `create_course` / `teacher_course` serve it:
         its `join_code` is what students enroll with (`enroll_in_course`, or
@@ -6354,7 +6413,13 @@ class MLArenaClient:
             detail = None
             challenge_id = challenge
         if course is not None:
-            self.add_course_challenge(course, challenge_id)
+            try:
+                self.add_course_challenge(course, challenge_id)
+            except MLArenaError as err:
+                # The course already holds it (the 409 names the entry's
+                # `module_id`): nothing to add, the answer is the same.
+                if err.status_code != 409 or "module_id" not in (err.body or {}):
+                    raise
             return self.teacher_course(course)
         if name is None:
             name = (detail if detail is not None else self.challenge(challenge_id))["name"]
@@ -7083,7 +7148,11 @@ class MLArenaClient:
         relative to. A linked file the module does not hold is reported with
         a warning and skipped; two modules that hold different files under
         one path cannot share a directory, and raise. An attached challenge
-        is written by its slug. A module's `visibility` is written for a
+        is written by its slug: for a course you manage it is read from the
+        module itself (`get_module`), which names a draft the course holds
+        even when you do not edit it; for a course you only study, an entry
+        that is not open yet (its challenge is a draft) cannot be written and
+        raises. A module's `visibility` is written for a
         course you manage (it is a teacher-side field). Returns the manifest
         dict.
         """
@@ -7132,12 +7201,18 @@ class MLArenaClient:
                 "summary": module["summary"],
                 "icon": module["icon"],
             }
+            attached = module["challenges"]
             if landing["can_manage"]:
-                module_out["visibility"] = self.get_module(module["id"])["visibility"]
+                # The teacher's read of the module: its `visibility`, and its
+                # attachments as the course's staff are told about them (a
+                # draft they do not edit is named there; the learner's
+                # landing serves such an entry without its challenge).
+                authored = self.get_module(module["id"])
+                module_out["visibility"] = authored["visibility"]
+                attached = authored["challenges"]
             module_out.update({
                 "is_published": module["is_published"],
-                "challenges": [_manifest_challenge_entry(c)
-                               for c in module["challenges"]],
+                "challenges": [_manifest_challenge_entry(c) for c in attached],
                 "lessons": lessons_out,
             })
             modules_out.append(module_out)
@@ -7300,16 +7375,23 @@ def _manifest_challenge_entry(link: dict) -> dict:
     """A module's attached challenge as the manifest names it: by slug, which
     is the same on every deployment.
 
-    A link without its challenge (an authoring link serves `challenge: None`
-    for a challenge you may not see) cannot be written: the manifest would
-    name a challenge by a slug you were not given.
+    A link without its challenge cannot be written, since the manifest would
+    name a challenge by a slug you were not given: an authoring link serves
+    `challenge: None` for a challenge you may not see, a learner's entry for
+    a draft that is not open yet.
     """
     challenge = link.get("challenge")
     if challenge is None:
+        if "challenge_id" in link:
+            raise MLArenaError(
+                f"Cannot export the link to challenge {link['challenge_id']}: you may "
+                "not see that challenge, so the manifest cannot name it by its slug. "
+                "Ask its owner for access."
+            )
         raise MLArenaError(
-            f"Cannot export the link to challenge {link.get('challenge_id')}: you may "
-            "not see that challenge, so the manifest cannot name it by its slug. Ask "
-            "its owner for access, or remove the link from the module."
+            f"Cannot export the entry {link.get('label') or 'of a module'!r}: its "
+            "challenge is not open yet (a draft), so the manifest cannot name it by "
+            "its slug. The course's owner or an assistant can export it."
         )
     return {"slug": challenge["slug"], "label": link["label"],
             "pass_threshold": link["pass_threshold"]}

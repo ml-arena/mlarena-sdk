@@ -556,7 +556,7 @@ def test_export_course_csv_requires_the_challenge():
 
 
 def test_add_course_challenge_is_one_call():
-    row = {"id": 9, "module_id": 4, "title": "Week 2", "challenges": []}
+    row = {"module_id": 4, "title": "Week 2", "challenges": []}
     c, rec = make_client(lambda *_: (201, row))
     out = c.add_course_challenge(7, 42, title="Week 2", summary="Read me.",
                                  pass_threshold=0.5)

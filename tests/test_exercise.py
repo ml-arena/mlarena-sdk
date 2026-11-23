@@ -365,7 +365,7 @@ def test_format_attempt_lines():
 def test_exercise_names_are_exported_at_package_level():
     assert mlarena.ExerciseAttemptNotFoundError is ExerciseAttemptNotFoundError
     assert issubclass(mlarena.ExerciseAttemptNotFoundError, mlarena.NotFoundError)
-    assert mlarena.__version__ == "4.20.0"
+    assert mlarena.__version__ == "4.21.0"
 
 
 def test_update_settings_sends_the_exercise_limits_passed(monkeypatch):
@@ -480,7 +480,7 @@ def test_exercise_self_test_reads_the_state(monkeypatch):
 
 
 def test_add_course_exercise_set_sends_only_what_was_named(monkeypatch):
-    link = {"id": 4, "challenge_id": 91, "pass_threshold": 70.0}
+    link = {"challenge_id": 91, "pass_threshold": 70.0}
     c, rec = make_client(monkeypatch, lambda m, p, k: (201, link))
     assert c.add_course_exercise_set(3, 12, "Week 1 exercises")["challenge_id"] == 91
     assert (rec.last["method"], rec.last["path"]) == ("POST", "/teacher/course/3/modules/12/exercise-sets")

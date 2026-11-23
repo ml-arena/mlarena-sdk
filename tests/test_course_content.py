@@ -676,8 +676,10 @@ def _export_router(method, path, kwargs):
                     {"challenge": {"id": 42, "name": "CartPole-v1",
                                    "slug": "cartpole-v1"},
                      "label": "CartPole", "pass_threshold": 195.0, "metric": None},
-                    {"challenge": {"id": 43, "name": "Old", "slug": "old"},
-                     "label": None, "pass_threshold": None, "metric": None},
+                    # A draft the caller does not edit: the learner's landing
+                    # serves the entry without its challenge (not open yet).
+                    {"challenge": None, "label": None, "pass_threshold": None,
+                     "metric": None},
                 ],
                 "lessons": [
                     {"id": 10, "parent_lesson_id": None, "title": "What is RL?",
@@ -703,7 +705,15 @@ def _export_router(method, path, kwargs):
             "asset_base_url": "/api/academic_courses/assets/modules/1/",
         })
     if path == "/teacher/modules/1":
-        return (200, {"id": 1, "visibility": "unlisted"})
+        # The teacher's read names the draft to the course's staff.
+        return (200, {"id": 1, "visibility": "unlisted", "challenges": [
+            {"challenge_id": 42, "challenge": {"id": 42, "name": "CartPole-v1",
+                                               "slug": "cartpole-v1"},
+             "label": "CartPole", "pass_threshold": 195.0, "metric": None, "position": 0},
+            {"challenge_id": 43, "challenge": {"id": 43, "name": "Old", "slug": "old",
+                                               "status": "draft", "can_edit": False},
+             "label": None, "pass_threshold": None, "metric": None, "position": 1},
+        ]})
     if path == "/academic_courses/assets/modules/1/media/loop.png":
         return FakeResponse(200, content=_PNG)
     if path == "/academic_courses/assets/modules/1/data/week1.csv":
@@ -858,12 +868,42 @@ def test_a_link_without_its_challenge_is_a_clear_export_error():
 
     try:
         _manifest_challenge_entry(
-            {"id": 3, "challenge_id": 43, "challenge": None, "label": None,
+            {"challenge_id": 43, "challenge": None, "label": None,
              "pass_threshold": None})
     except MLArenaError as exc:
         _expect("challenge 43" in str(exc), str(exc))
     else:
         raise AssertionError("a link without its challenge must raise MLArenaError")
+
+
+def test_export_of_a_course_you_only_study_refuses_an_entry_that_is_not_open():
+    """A learner's landing serves a draft's entry without its challenge: the
+    manifest cannot name it, and the error does not tell a student to edit
+    the module."""
+    def router(method, path, kwargs):
+        if path == "/academic_courses/intro":
+            return (200, {
+                "id": 9, "name": "Intro", "code": None, "slug": "intro", "description": None,
+                "visibility": "private", "instructor_name": None, "start_date": None,
+                "end_date": None, "has_cover": False, "can_manage": False,
+                "modules": [{
+                    "id": 1, "title": "Foundations", "slug": "foundations", "summary": None,
+                    "icon": None, "is_published": True, "lessons": [],
+                    "challenges": [{"challenge": None, "label": "Final project",
+                                    "pass_threshold": None, "metric": None}],
+                }],
+            })
+        raise AssertionError(f"unexpected request {method} {path}")
+
+    c, _rec = make_client(router)
+    with tempfile.TemporaryDirectory() as d:
+        try:
+            c.export_course_to_dir("intro", d)
+        except MLArenaError as exc:
+            _expect("'Final project'" in str(exc) and "not open yet" in str(exc), str(exc))
+            _expect("remove the link" not in str(exc), str(exc))
+        else:
+            raise AssertionError("an entry that is not open yet must raise MLArenaError")
 
 
 # --------------------------------------------------------------------------- #
@@ -872,7 +912,7 @@ def test_a_link_without_its_challenge_is_a_clear_export_error():
 
 
 def test_copy_module_into_course_body_and_status():
-    row = {"id": 9, "module_id": 12, "title": "Week 1", "can_edit": True, "is_owned": True,
+    row = {"module_id": 12, "title": "Week 1", "can_edit": True, "is_owned": True,
            "dropped_challenges": [{"challenge_id": 4, "name": None}]}
     c, rec = make_client(lambda *_: (201, row))
     out = c.copy_module_into_course(7, 3)
@@ -883,7 +923,7 @@ def test_copy_module_into_course_body_and_status():
 
 
 def test_create_course_module_sends_only_what_is_given():
-    c, rec = make_client(lambda *_: (201, {"id": 9, "module_id": 12}))
+    c, rec = make_client(lambda *_: (201, {"module_id": 12}))
     out = c.create_course_module(7, "Week 3")
     _expect(out["module_id"] == 12, out)
     _expect((rec.last["method"], rec.last["path"]) ==

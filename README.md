@@ -60,6 +60,64 @@ client.leaderboard(ch["id"])                      # a DataFrame with pandas
   An error once the submission exists (a refused upload, a deploy over your
   daily quota) carries `err.submission_id` and says how to deploy or delete it.
 
+## 4.21.0 — one id per course module row, and refusals where a wrong value used to be stored
+
+Requires a platform at or after the backend change of the same date (no
+migration). Breaking for code that read `row["id"]` on a course module row.
+
+- **A course module row has one id, `module_id`.** The rows of
+  `list_course_modules`, `create_course_module`, `link_module`,
+  `add_course_challenge`, `copy_module_into_course` and `reorder_modules` no
+  longer carry `id`. It held the link row's id, which no method takes; passed
+  to `remove_course_challenge`, `unlink_module` or `create_lesson` it named
+  another module (the two id sequences overlap). Use `row["module_id"]`.
+  The challenge attachments of a module (`row["challenges"]`,
+  `get_module()["challenges"]`, `attach_challenge`, `update_challenge_link`,
+  `add_course_exercise_set`, `reorder_module_challenges`) likewise carry
+  `challenge_id` and no `id`.
+- **`add_course_challenge` refuses a challenge the course already has** (409;
+  `err.body["module_id"]` is the existing entry).
+  `use_challenge_with_class(challenge, course)` is idempotent: called again
+  it adds nothing and returns the course; it used to add a second entry
+  without the first one's pass bar.
+- **A `slug` you choose is kept or refused.** `create_course`,
+  `create_module`, `create_course_module` and `create_lesson` answer 409 when
+  the slug you passed is taken, and 400 when it is not a slug as the
+  platform writes one (a leading, trailing or doubled hyphen); they used to
+  store another one. A slug derived from the name is still suffixed until
+  free.
+- **`enroll_in_course` and `update_profile` take an email address as
+  `student_email`**: any other value is a 400 naming the field and nothing is
+  stored, so the enroll can be sent again (it used to be stored, and the
+  retry answered 409).
+- **A form-generated `env.py` keeps its declaration.** On a file challenge
+  whose `env.py` the scoring form generated, a `submission_filename` or a
+  `metrics` ranking (key, source, order) that would differ from what the
+  file states is a 409 naming the form, through `update_settings`, a
+  `challenge.toml` (`upload_env_file`) or a bundle (`push_challenge`) that
+  keeps the generated file: use `set_scoring_form`, which writes `env.py`
+  again. A bundle with its own `env.py` takes the scoring over.
+- **`create_challenge(kernel_version="exercise_v1")` makes a data-only set**
+  (the generated `env.py` and an empty `exercises.json`), like
+  `add_course_exercise_set`: `update_exercise_definition` works at once. The
+  Python sample is no longer seeded; upload your own `env.py` to write the
+  set in Python.
+- **The benchmark files.** `list_benchmark_files` writes nothing (it used to
+  create a starting file). `run_benchmark` on a code challenge with no
+  `agent.py` stored runs the current agent template and stores it as
+  `agent.py`, so it needs no earlier read; a file challenge has no benchmark
+  file until you upload one or call `generate_scoring_baseline`, and on a
+  challenge that is not started `run_benchmark` refuses (400) an empty file
+  or a CSV holding only the ground truth's header.
+- **A draft challenge in a course you study.** In `course()` and
+  `module_overview()`, an entry whose challenge is a draft you do not edit
+  has `challenge` and `metric` None (not open yet: only the course's `label`
+  and `pass_threshold`; the module's own title is the author's text and is
+  served); `export_course_to_dir` of a course you manage reads the entries
+  from the module itself, so it still names such a draft; `my_progress()` has no cell for it,
+  `enrollment_info()` does not name it and `enroll_in_course()` leaves its id
+  out of `challenge_ids`.
+
 ## 4.20.0 — add an assistant by username search or by email
 
 - `search_challenge_assistant_candidates(challenge_id, q)` and

@@ -63,7 +63,7 @@ COURSE = {
     "join_code": "JOIN1234", "start_date": None, "end_date": None,
     "archived_at_ts": None, "enrollment_state": "open", "is_enrolled": False,
 }
-ENTRY = {"id": 90, "module_id": 90, "title": "Titanic", "challenges": []}
+ENTRY = {"module_id": 90, "title": "Titanic", "challenges": []}
 CHALLENGE = {"id": 5, "name": "Titanic", "slug": "titanic", "status": "started"}
 
 
@@ -172,3 +172,31 @@ def _run_all():
 
 if __name__ == "__main__":
     sys.exit(1 if _run_all() else 0)
+
+
+def test_a_course_that_already_holds_the_challenge_is_returned_unchanged():
+    """`use_challenge_with_class(challenge, course)` twice: the second add is
+    the server's 409 naming the existing entry, and the call answers the
+    course as the first one did."""
+    client, rec = make_client({
+        ("POST", "/teacher/course/42/challenges"): (
+            409, {"error": "This course already has the challenge 'Titanic'", "module_id": 90}),
+        ("GET", "/teacher/course/42"): (200, COURSE),
+    })
+    out = client.use_challenge_with_class(5, 42)
+    _expect(out == COURSE, out)
+    _expect(rec.signature() == [
+        ("POST", "/teacher/course/42/challenges"), ("GET", "/teacher/course/42"),
+    ], rec.signature())
+
+
+def test_another_refusal_of_the_add_is_raised():
+    client, _rec = make_client({
+        ("POST", "/teacher/course/42/challenges"): (409, {"error": "Something else"}),
+    })
+    try:
+        client.use_challenge_with_class(5, 42)
+    except MLArenaError as err:
+        _expect(err.status_code == 409, err)
+    else:
+        raise AssertionError("a 409 that names no entry must be raised")
