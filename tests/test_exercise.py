@@ -365,7 +365,7 @@ def test_format_attempt_lines():
 def test_exercise_names_are_exported_at_package_level():
     assert mlarena.ExerciseAttemptNotFoundError is ExerciseAttemptNotFoundError
     assert issubclass(mlarena.ExerciseAttemptNotFoundError, mlarena.NotFoundError)
-    assert mlarena.__version__ == "4.19.0"
+    assert mlarena.__version__ == "4.19.1"
 
 
 def test_update_settings_sends_the_exercise_limits_passed(monkeypatch):
