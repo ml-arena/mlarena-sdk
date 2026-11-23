@@ -62,6 +62,16 @@ client.leaderboard(ch["id"])                      # a DataFrame with pandas
 
 ## 4.19.0 (unreleased)
 
+- **Who reads what, as the platform now answers.** `leaderboard(course_id=…)`
+  on a private or unlisted course raises for a non-member (400, as for an
+  unknown course); on a public course the withheld rows also come without
+  their dates, run counts and resource figures. An exercise set's board is
+  for its editors and course managers. `challenge()`, `leaderboard()`,
+  `create_submission()` and `create_team()` raise `NotFoundError` on a draft
+  the caller does not edit. `exercise_admin()` takes a teacher key on a set
+  the caller edits. `lesson()` returns `dropped_directives`: each block left
+  out for the reader as `{type, args, reason}`, `reason` one of
+  `not_started`, `checker_error`, `no_such_exercise`, `not_found`.
 - **`submit()` checks before it creates.** One `challenge()` read comes
   first, and these are refused with no submission left behind: a runtime
   name or id the challenge does not offer, `agent=` given a path (use
@@ -2058,7 +2068,7 @@ was started once (its exercises are registered then).
   - `df.attrs["challenge"]` — what every row shares: `challenge_id`, `metrics` (the declaration, see [Metrics](#metrics)), `window_days`, `has_gpu`. `df.attrs["metrics"]` is the same declaration.
   - Columns — the backend's names: `rank`, `username`, `avatar_key`, `submission_id`, `submission_name`, `score` (the ranking spec's value, `None` = unranked), `score_ci95`, `n_episodes_total`, `elo_variance`, `number_of_runs`, `created_at_ts`, `last_end_run_ts`, `is_my_submission`, `team_id`, `team_name`, `team_members`, `action_time_max_sec`, `agent_metric_total_ram_max_bytes`, `agent_metric_vram_max_bytes`, `is_public` (`None` when the row is not yours to know) and, through a course with a bar, `passed`; then **one column per declared key** (the row's `metrics[key]`) and, when `window_days` is set, one `metrics_window_<key>` column per key (the same fold over the last `window_days` days). On a chat challenge `score` (and the `loot` column) is the team's euro total. Without pandas the rows keep `metrics` / `metrics_window` as `{key: value}` dicts.
   - `aggregate="user"` — one row per participant (their best submission, a team's best for a team); the backend's default when `aggregate` is omitted, as on the console. `aggregate="submission"` — every ranked submission is a row.
-  - `course_id=…` — the board as a course sees it: only its students, per-row `passed` (tri-state: `None` while the row has no ranked value), and `df.attrs["course_context"]` = `{course_id, pass_threshold, names_withheld}`. Unless you are a member of the course (enrolled, its owner, an assistant, an admin), `names_withheld` is `True`: the rows keep every column, with `username`, `avatar_key`, `submission_id`, `submission_name`, `team_id`, `team_name`, `team_members`, `datagouv_reuse` set to `None` and `can_open` `False`, and `q` / `around` are refused (400).
+  - `course_id=…` — the board as a course sees it: only its students, per-row `passed` (tri-state: `None` while the row has no ranked value), and `df.attrs["course_context"]` = `{course_id, pass_threshold, names_withheld}`. Unless you are a member of the course (enrolled, its owner, an assistant, an admin), `names_withheld` is `True`: the rows keep every column, with `username`, `avatar_key`, `submission_id`, `submission_name`, `team_id`, `team_name`, `team_members`, `datagouv_reuse`, `created_at_ts`, `last_end_run_ts`, `number_of_runs`, `action_time_max_sec`, `agent_metric_total_ram_max_bytes`, `agent_metric_vram_max_bytes` set to `None` and `can_open` `False`, and `q` / `around` are refused (400). That is a public course: a private or unlisted course has no board for a non-member (`MLArenaError`, 400 "Invalid course_id for this challenge", as for a course that does not exist). An exercise set's board goes to its editors and its course managers only (`NotFoundError` otherwise).
   - `top=N` — the first N rows (all of them without it). `me=True` puts your own row and its `window` neighbours (default 3) on `df.attrs["me"]`; `q="jo"` puts the matching usernames on `df.attrs["matches"]`; `df.attrs["total"]` counts every ranked row.
   - A refused query (an `aggregate` other than `"user"` / `"submission"`, a `course_id` that does not hold the challenge) is an `MLArenaError` with the server's reason, `status_code` and `body`.
 - A challenge's direction is its ranking spec's `order`, set through `metrics` before it starts. Course pass bars follow it: `passed` means `value >= pass_threshold` under `"desc"` and `value <= pass_threshold` under `"asc"` (see `metric` — the ranking spec — in `my_progress` / `course_progress`).

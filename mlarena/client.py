@@ -4061,11 +4061,21 @@ class MLArenaClient:
           assist it or are an admin, ``course_context["names_withheld"]`` is
           True and every row comes with its rank, score and metrics but
           with `username`, `avatar_key`, `submission_id`,
-          `submission_name`, `team_id`, `team_name`, `team_members` and
-          `datagouv_reuse` set to None and `can_open` False (the keys
-          stay). On such a read ``q`` and ``around`` are refused
+          `submission_name`, `team_id`, `team_name`, `team_members`,
+          `datagouv_reuse`, `created_at_ts`, `last_end_run_ts`,
+          `number_of_runs`, `action_time_max_sec`,
+          `agent_metric_total_ram_max_bytes` and
+          `agent_metric_vram_max_bytes` set to None and `can_open` False
+          (the keys stay). On such a read ``q`` and ``around`` are refused
           (`MLArenaError`, 400): each would say whether a given person is
-          in the course. The board without ``course_id`` is unchanged.
+          in the course. That is a public course: a private or unlisted
+          course has no board for a non-member, and the call raises
+          `MLArenaError` (400, "Invalid course_id for this challenge"),
+          the answer of a course that does not exist. The board without
+          ``course_id`` is unchanged. An exercise set's board is served to
+          its editors and to the managers of a course that holds it only
+          (`NotFoundError` otherwise), and so is the board of a draft
+          challenge the caller does not edit.
         - ``top=N``: the first N rows (every ranked row without it);
           ``offset=K`` starts the page at the K-th row (0-based), so
           ``top=50, offset=100`` is rows 101-150 — the console's page 3.
