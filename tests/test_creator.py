@@ -941,6 +941,38 @@ def test_the_scoring_update_archive_and_delete_methods_hit_their_routes():
         _expect(rec.last.get("json") is None, (method, rec.last.get("json")))
 
 
+def test_the_env_update_methods_hit_their_routes():
+    c, rec = make_client(lambda *_: (200, {"ok": True}))
+    for method, verb, suffix in (
+        ("env_update", "GET", "/env/update"),
+        ("cancel_env_update", "DELETE", "/env/update"),
+        ("revert_env", "POST", "/env/revert"),
+    ):
+        getattr(c, method)(7)
+        _expect(rec.last["method"] == verb, (method, rec.last["method"]))
+        _expect(rec.last["path"] == CREATOR + suffix, (method, rec.last["path"]))
+        _expect(rec.last.get("json") is None, (method, rec.last.get("json")))
+    c.env_revisions(7, offset=30, limit=10)
+    _expect(rec.last["method"] == "GET" and rec.last["path"] == CREATOR + "/env/revisions", rec.last)
+    _expect(rec.last["params"] == {"offset": 30, "limit": 10}, rec.last["params"])
+
+
+def test_clean_redeploy_all_takes_the_revision_filter():
+    c, rec = make_client(lambda *_: (200, {"dry_run": True, "total": 1, "redeployed": [], "failed": []}))
+    c.clean_redeploy_all(7, dry_run=True, scored_by_another_revision=True)
+    _expect(rec.last["params"] == {"dry_run": "true", "scored_by_another_revision": "true"},
+            rec.last["params"])
+    c.clean_redeploy_all(7, scored_by_another_revision=True)
+    _expect(rec.last["params"] == {"scored_by_another_revision": "true"}, rec.last["params"])
+
+
+def test_wait_for_env_update_polls_until_in_place_settled_and_judged():
+    states = [{"step": step, "message": step} for step in ("waiting_runs", "settling", "checking", "live")]
+    c, rec = make_client(lambda *_: (200, states.pop(0)))
+    out = c.wait_for_env_update(7, timeout=5, poll_interval=0)
+    _expect(out["step"] == "live" and states == [], (out, states))
+
+
 def test_a_refused_delete_carries_the_counts():
     body = {"error": "The challenge cannot be deleted while it has 2 submission(s).",
             "status": "draft", "submission_count": 2, "team_count": 0,

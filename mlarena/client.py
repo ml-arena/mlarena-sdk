@@ -1640,8 +1640,10 @@ class MLArenaClient:
         """Delete one file from the challenge's env folder (creator scope).
 
         Mirrors `DELETE /api/creator_challenge/challenge/{id}/env/files/{name}`
-        (`env_files.py`). Refused once the challenge has started, and `env.py`
-        itself cannot be deleted — the challenge would have nothing to run.
+        (`env_files.py`). Accepted on a started challenge too: the delete is
+        an update of the env folder (`env_update`), put in place once the
+        running runs have ended, and the reply carries its state under
+        `env_update`.
         """
         return self._creator_delete(
             challenge_id, f"/env/files/{filename}", "delete_env_file"
@@ -1674,6 +1676,13 @@ class MLArenaClient:
         Multipart PUT to `/api/creator_challenge/challenge/{id}/env/files`.
         Use this for binary files; for text content driven by a template,
         prefer `update_env_file_content`.
+
+        Accepted on a started challenge too (4.19.0): the write is an update
+        of the env folder, recorded as a revision. The reply's `env_update`
+        (the shape of `env_update(id)`) says whether it is in place or
+        waiting for the challenge's running runs; on a started file or code
+        challenge the benchmark then runs before any participant's run, and
+        a failure puts the previous files back (`wait_for_env_update`).
 
         `challenge.toml` is the challenge config's file editor: it is applied
         when it is saved — validated like `update_settings`, with the same
@@ -2157,6 +2166,154 @@ class MLArenaClient:
             error_label="scoring_update",
         )
 
+    def env_update(self, challenge_id: int) -> dict:
+        """The state of a challenge's environment files and of an update on its way.
+
+        Mirrors `GET /api/creator_challenge/challenge/{id}/env/update`. Every
+        change of the env folder (`upload_env_file`, `delete_env_file`,
+        `set_scoring_form`, `update_exercise_definition`, `push_challenge`,
+        `import_challenge_from_github`, `revert_env`) builds the new folder
+        beside the current one and swaps it in, started or not. While runs of
+        the challenge are on their way the swap waits for them, and until it
+        is done no queued run starts: the challenge stays started and
+        accepts submissions, which queue. Returns
+
+        - `step`: `live` (nothing on its way), `waiting_runs`, `settling`,
+          `checking` or `check_failed`: the one step the update is at.
+          `check_failed`: the files failed their check and there are no
+          checked files to return to; on a file or code challenge no run
+          starts until you upload a fix or call `run_benchmark` again;
+        - `live`: the revision of the files runs are scored by (None before
+          the first recorded change);
+        - `pending`: the update waiting, with `waiting_runs` (the running
+          runs it waits for) and `waiting_until_ts` (the latest instant the
+          platform lets one of them last);
+        - `settling_until_ts`: after the swap, the instant from which workers
+          read the new files (about a minute: the storage's cache). Until it
+          no run starts; a chat agent or an exercise checker keeps serving
+          the previous files and is replaced then;
+        - `verifying_simulation_result_id`: on a started file or code
+          challenge the swap starts the benchmark; until its verdict it is
+          the only run that starts, and a failure puts the previous files
+          back by itself (`last_reverted["reverted_by"]` is then
+          `benchmark_failed` or `benchmark_deadline` (a chat agent or an
+          exercise checker that does not load the new files is reverted the
+          same way), `"author"` after
+          `revert_env`, and `last_reverted["benchmark_failure"]` says why);
+        - `auto_reverted`: the files live now are the previous ones, put
+          back by the platform after the update that replaced them failed
+          its check or gave no verdict in time (`last_reverted` is that
+          update). False after your own `revert_env` and once another update
+          went live;
+        - `swap_error`: why `pending` is not in place yet when something
+          stops it (the storage refused a rename or a copy: retried; or the
+          record of the swap cannot be read: `cancel_env_update`);
+        - `claims_held`, `held_runs`, `message` (the state in one sentence,
+          with what participants' runs are scored by);
+        - `can_revert`, `can_cancel`.
+
+        A revision is `{"id", "provider", "transport", "content_sha256",
+        "user", "created_at_ts", "applied_at_ts", "reverted_at_ts",
+        "benchmark_simulation_result_id", "benchmark_passed",
+        "benchmark_failure", "is_live", "is_previous", "is_pending", …}`;
+        `transport` says what changed the folder (`file_write`,
+        `file_delete`, `form`, `bundle`, `revert`, or the GitHub ones).
+        Reading the state also moves a pending update forward.
+        """
+        return self._json_call(
+            "GET", f"/creator_challenge/challenge/{challenge_id}/env/update",
+            error_label="env_update",
+        )
+
+    def wait_for_env_update(
+        self, challenge_id: int, *, timeout: float = 600.0, poll_interval: float = 2.0,
+    ) -> dict:
+        """Poll `env_update` until the update is in place, settled and judged.
+
+        That is: nothing pending, the settling time after the swap over
+        (`settling_until_ts`: workers read the new files about a minute after
+        a change), and no benchmark verdict awaited.
+
+        A client-side composition of `env_update`. Returns the last state;
+        raises `TimeoutError` after `timeout` seconds. After it,
+        `state["live"]` is the revision in place: when the update's benchmark
+        failed, that is a `revert` revision and `state["last_reverted"]` is
+        the update that was taken out.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            state = self.env_update(challenge_id)
+            if state["step"] in ("live", "check_failed"):
+                return state
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"env update of challenge {challenge_id} still on its way after "
+                    f"{timeout:.0f} s: {state['message']}"
+                )
+            time.sleep(poll_interval)
+
+    def cancel_env_update(self, challenge_id: int) -> dict:
+        """Cancel the pending update of a challenge's environment files.
+
+        Mirrors `DELETE /api/creator_challenge/challenge/{id}/env/update`:
+        the staged files are dropped, and a swap of them that kept failing
+        is undone. Cancelling releases nothing by itself: the queued runs
+        start again only when the files in place were released to
+        participants (after a failed check with nothing to return to, or
+        when you cancel the platform's own revert, the queue stays held
+        until you upload a fix or run the benchmark again:
+        `state["claims_held"]`). 409 when none is pending, and when the
+        update's swap stopped half way and the platform cannot tell how to
+        put the folders back (nothing is changed then). Settings the request
+        had already applied (a bundle's `challenge.toml`, an overview) stay.
+        Returns the state (`env_update`).
+        """
+        return self._json_call(
+            "DELETE", f"/creator_challenge/challenge/{challenge_id}/env/update",
+            error_label="cancel_env_update",
+        )
+
+    def revert_env(self, challenge_id: int) -> dict:
+        """Put the previous version of a challenge's environment files back.
+
+        Mirrors `POST /api/creator_challenge/challenge/{id}/env/revert`. The
+        files come back byte for byte (`challenge.toml` excepted: it stays
+        the applied settings' file). A revert is an update like any other: it
+        waits for the running runs and is recorded as a `revert` revision.
+        On a started challenge the previous version is the last one that was
+        released to participants, and going back to it is not checked again
+        (those files served); files that were never released are checked
+        like any update (the benchmark, or the new pod's load) before a
+        participant's run starts. The files a revert replaces become the
+        previous version when they are worth returning to (released, on a
+        started challenge), so a second call then undoes the first. 409 when
+        no previous version is kept, when it never served a started
+        challenge, failed its check or is the current one, when its folder
+        is no longer what was recorded, or while an update is pending; 403
+        on an exercise set when the folder to restore holds Python checks
+        and you have no creator access. Returns the state (`env_update`).
+        """
+        return self._json_call(
+            "POST", f"/creator_challenge/challenge/{challenge_id}/env/revert",
+            error_label="revert_env",
+        )
+
+    def env_revisions(self, challenge_id: int, *, offset: int = 0, limit: int = 30) -> dict:
+        """The history of a challenge's environment files, newest first.
+
+        Mirrors `GET /api/creator_challenge/challenge/{id}/env/revisions`.
+        Returns `{"revisions": [...], "total", "offset", "limit"}`; each
+        revision is the shape `env_update` documents: what changed the files
+        (`transport`), who (`user`), when (`created_at_ts`, `applied_at_ts`),
+        the benchmark's verdict, and whether it is the live, the previous or
+        the pending version (`is_live`, `is_previous`, `is_pending`) or was
+        reverted (`reverted_at_ts`).
+        """
+        return self._json_call(
+            "GET", f"/creator_challenge/challenge/{challenge_id}/env/revisions",
+            params={"offset": offset, "limit": limit}, error_label="env_revisions",
+        )
+
     def cancel_runs_in_flight(self, challenge_id: int) -> dict:
         """Cancel the runs a stopped challenge still has on their way and nobody will play.
 
@@ -2388,9 +2545,15 @@ class MLArenaClient:
         The generated file is yours. Calling this again (another metric,
         another column) rewrites it only while it is byte-identical to what
         was generated: after a hand edit the call is a 409 (`MLArenaError`)
-        and nothing changes; delete `env.py` to use the form again. A 400
-        while the challenge is started (stop it first), when `challenge.toml`
-        holds `metrics`, or for a bad name.
+        and nothing changes; delete `env.py` to use the form again. While
+        the challenge is started the columns can still be changed (an update
+        of the environment files, checked before it serves: see
+        `env_update`); another metric or submission file name is a 409 then
+        (stop the challenge to change them). A 400 when `challenge.toml`
+        holds `metrics`, or for a bad name. A 409 too when other writes of
+        the environment files kept landing while this one was being
+        prepared (it is prepared again up to three times first): call it
+        again.
         """
         body = {
             "scoring_metric": scoring_metric,
@@ -2748,7 +2911,10 @@ class MLArenaClient:
             raise _failed(MLArenaError, "clean_redeploy_submission", resp)
         return resp.json()
 
-    def clean_redeploy_all(self, challenge_id: int, *, dry_run: bool = False) -> dict:
+    def clean_redeploy_all(
+        self, challenge_id: int, *, dry_run: bool = False,
+        scored_by_another_revision: bool = False,
+    ) -> dict:
         """Re-score every eligible submission of a challenge (wipe its runs, deploy it again).
 
         Mirrors `POST
@@ -2765,13 +2931,26 @@ class MLArenaClient:
         in any status. The real call needs a started challenge (409
         otherwise): to restart a stopped one and re-score it in one step use
         `start_challenge(id, clean_redeploy_all=True)`.
+
+        `scored_by_another_revision=True` takes only the active submissions
+        whose last scored run was scored by other environment files than the
+        current ones: what an update of the env folder left on the old
+        scoring (a submission scored before a change that was reverted is on
+        the current files again and is left out). With `dry_run=True` this is
+        the count behind "re-score N" after an update. The reply echoes the
+        flag as `scored_by_another_revision`.
         """
         resp = self._request("POST",
             self._url(
                 f"/creator_challenge/challenge/{challenge_id}"
                 "/submissions/clean_redeploy_all"
             ),
-            params={"dry_run": "true"} if dry_run else None,
+            params={
+                key: "true" for key, on in (
+                    ("dry_run", dry_run),
+                    ("scored_by_another_revision", scored_by_another_revision),
+                ) if on
+            } or None,
             headers=self._headers(),
             timeout=300,
         )
@@ -4994,9 +5173,11 @@ class MLArenaClient:
         exercise and you have no creator access ("Exercises checked by
         Python code need creator access for now; short-answer and
         multiple-choice exercises do not");
-        `MLArenaError` (409, `.body["write_blocked_by"]`) while the set
-        is started (`started`: stop it first) or when its hand-written env.py
-        does not load `exercises.json` (`env_py`); `MLArenaError` (400) for a
+        `MLArenaError` (409, `.body["write_blocked_by"]`: `env_py`) when its
+        hand-written env.py does not load `exercises.json`. A started set
+        takes the write too, as an update of its environment files: a new
+        pod loads them about a minute later and its load is their check
+        (`env_update`); `MLArenaError` (400) for a
         document that does not fit the format, or whose file would be larger
         than 1 000 000 bytes (`.body["size"]`).
         """

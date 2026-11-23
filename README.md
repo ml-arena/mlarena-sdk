@@ -62,6 +62,49 @@ client.leaderboard(ch["id"])                      # a DataFrame with pandas
 
 ## 4.19.0 (unreleased)
 
+Requires a platform at Alembic `c9f3a7b1d5e8` or later for the env-update methods.
+
+- **Update a started challenge without stopping it.** `upload_env_file`,
+  `update_env_file_content`, `delete_env_file`, `set_scoring_form` (the
+  columns; the metric stays locked while started),
+  `update_exercise_definition`, `push_challenge` and
+  `import_challenge_from_github` are accepted on a started challenge. Each
+  is an update of the env folder: built beside the current files, recorded
+  as a revision, and swapped in once the challenge has no running run.
+  Until then no queued run starts; the challenge stays started and
+  submissions queue. Workers read the new files about a minute after the
+  swap (`settling_until_ts`); then, on a started file or code challenge, the
+  benchmark of the new files runs first, and a failure puts the previous files back by
+  itself. Replies carry the state under `env_update`.
+- **`env_update(id)`, `wait_for_env_update(id)`, `cancel_env_update(id)`,
+  `revert_env(id)`, `env_revisions(id)`.** The state of the update, a
+  polling helper, cancel the pending one, put the previous files back (byte
+  for byte), and the history of the env folder (what changed it, who, when,
+  the benchmark's verdict, live / previous / reverted).
+- **`clean_redeploy_all(id, scored_by_another_revision=True)`.** Re-scores
+  only the active submissions whose last scored run was scored by other
+  files than the current ones; with `dry_run=True`, their count.
+- **`source_revision` has more values.** On a challenge's `environment`, a
+  bundle reply and the history: `provider` may be `"platform"` (then
+  `repository`, `commit_sha` and `commit_url` are `None`), `transport` may be
+  `file_write`, `file_delete`, `form`, `bundle` or `revert`, and every
+  revision carries `id` and `content_sha256`.
+- **Dataset files** can be added and removed on a started challenge.
+- **`challenge(id)["updating"]`** (with `updating_message`) and a
+  submission's `queue_info["challenge_updating"]`: true while a started
+  challenge's runs are held by an update of its environment. Deploys are
+  accepted and wait.
+- The update a chat challenge or an exercise set takes is checked by the
+  new pod's load: files that do not load are reverted like a failed
+  benchmark. The version Revert restores is the last one released to
+  participants.
+- A run (`RunResult`) carries `source_revision_id`: the env revision it was
+  scored by; `creator_runs()` rows also carry `scored_by_live_files`.
+- `env_update(id)["step"]` is `live`, `waiting_runs`, `settling` or
+  `checking` (what `wait_for_env_update` polls on), and a reverted revision
+  says who took it out: `reverted_by` = `author`, `benchmark_failed` or
+  `benchmark_deadline`.
+
 - **Who reads what, as the platform now answers.** `leaderboard(course_id=…)`
   on a private or unlisted course raises for a non-member (400, as for an
   unknown course); on a public course the withheld rows also come without

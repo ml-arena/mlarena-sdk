@@ -127,7 +127,11 @@ def _resolve_challenge(client, value: str) -> dict:
 
 
 def _revision_label(revision: dict) -> str:
-    return f"{revision['repository']}@{revision['commit_sha'][:7]}"
+    """A commit of a repository, or a change made on the platform (a push
+    from outside a GitHub job: no repository, no commit)."""
+    if revision["provider"] == "github":
+        return f"{revision['repository']}@{revision['commit_sha'][:7]}"
+    return f"platform ({revision['transport']})"
 
 
 def _is_excluded(name: str) -> bool:

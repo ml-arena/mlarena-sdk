@@ -1194,3 +1194,14 @@ def test_console_script_is_declared():
     with open(os.path.join(root, "pyproject.toml"), encoding="utf-8") as fh:
         assert 'mlarena = "mlarena.cli:main"' in fh.read()
     assert callable(cli.main)
+
+
+def test_a_platform_revision_is_labelled_without_a_commit():
+    """A push from outside a GitHub job is a change made on the platform:
+    the report's revision has no repository and no commit."""
+    from mlarena import cli
+    platform = {**REVISION, "provider": "platform", "transport": "bundle",
+                "repository": None, "commit_sha": None, "ref": None,
+                "event_name": None, "run_url": None, "commit_url": None}
+    assert cli._revision_label(platform) == "platform (bundle)"
+    assert cli._revision_label(REVISION) == "alice/agent@0123456"
