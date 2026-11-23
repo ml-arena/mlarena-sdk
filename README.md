@@ -116,7 +116,9 @@ Requires a platform at Alembic `c9f3a7b1d5e8` or later for the env-update method
   out for the reader as `{type, args, reason}`, `reason` one of
   `not_started`, `checker_error`, `no_such_exercise`, `not_found`.
 - **`submit()` checks before it creates.** One `challenge()` read comes
-  first, and these are refused with no submission left behind: a runtime
+  first, and these are refused with no submission left behind: a challenge
+  that is not `started` (`draft`, `stopped`, `ended`: it takes no deploy;
+  `deploy=False` still creates and uploads), a runtime
   name or id the challenge does not offer, `agent=` given a path (use
   `files=[path]`), an instance or a class without readable source, `agent=`
   on a challenge whose entry file is not `agent.py`, `files=` given a single
@@ -131,9 +133,13 @@ Requires a platform at Alembic `c9f3a7b1d5e8` or later for the env-update method
   deploy 409) the message also says
   `(submission 11 was created and is not deployed: deploy it with deploy_submission(4, 11) or delete it with delete_submission(4, 11))`.
   Nothing is deleted for you.
-- **`update_course(course_id, end_date=None)` clears the end date** (sends
-  `null`); leaving `end_date` out leaves it as it is. It used to drop the
-  `None`. Needs a platform whose course update clears on `null`.
+- **`update_course(course_id, end_date=None)` clears the end date, and
+  `start_date=None` the start date** (each sends `null`); leaving one out
+  leaves it as it is. It used to drop the `None`. Needs a platform whose
+  course update clears on `null`.
+- **`preview_lesson` says which directive failed.** The `MLArenaError` of a
+  400 ends with the server's `directive_error` (it used to read only
+  `Invalid directive`; the reason was on `err.body`).
 
 ## 4.18.0 — a file challenge without Python
 

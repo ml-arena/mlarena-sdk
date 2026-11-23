@@ -217,6 +217,21 @@ def test_preview_lesson_strict():
     _expect(rec.last["json"] == {}, rec.last["json"])
 
 
+def test_preview_lesson_error_says_which_directive_and_why():
+    # The 400's `error` is only "Invalid directive"; the reason is beside it.
+    reason = "mlarena:leaderboard: challenge 999 does not exist"
+    c, _rec = make_client(lambda *_: (
+        400, {"error": "Invalid directive", "directive_error": reason}))
+    try:
+        c.preview_lesson(7, body_md="```mlarena:leaderboard id=999```")
+    except MLArenaError as err:
+        _expect(str(err) == f"preview_lesson failed: Invalid directive: {reason}", str(err))
+        _expect(err.status_code == 400, err.status_code)
+        _expect(err.body["directive_error"] == reason, err.body)
+    else:
+        raise AssertionError("preview_lesson did not raise")
+
+
 def test_update_module_and_lesson_accept_a_slug():
     c, rec = make_client(lambda *_: (200, {"id": 2}))
     c.update_module(2, slug="week-1")
@@ -316,8 +331,12 @@ def test_update_course_end_date_none_clears_it():
     c.update_course(1, name="New")
     _expect(rec.last["json"] == {"name": "New"}, rec.last["json"])
 
+    # start_date is a date the route clears the same way.
     c.update_course(1, end_date="2026-12-31", start_date=None)
-    _expect(rec.last["json"] == {"end_date": "2026-12-31"}, rec.last["json"])
+    _expect(rec.last["json"] == {"start_date": None, "end_date": "2026-12-31"},
+            rec.last["json"])
+    c.update_course(1, start_date="2026-01-05")
+    _expect(rec.last["json"] == {"start_date": "2026-01-05"}, rec.last["json"])
 
 
 def test_update_course_with_nothing_to_send_raises():
@@ -328,12 +347,13 @@ def test_update_course_with_nothing_to_send_raises():
         _expect("end_date" in str(err), str(err))
     else:
         raise AssertionError("update_course(1) did not raise")
+    # A None for a field that is not a date is not sent: nothing is left.
     try:
-        c.update_course(1, start_date=None)
+        c.update_course(1, name=None)
     except MLArenaError:
         pass
     else:
-        raise AssertionError("update_course(1, start_date=None) did not raise")
+        raise AssertionError("update_course(1, name=None) did not raise")
     _expect(rec.calls == [], rec.calls)
 
 

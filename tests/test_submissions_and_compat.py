@@ -521,6 +521,7 @@ def test_tail_logs_raises_on_timeout_instead_of_returning_silently():
 
 # The keys `submit()` reads off `challenge()` before it creates anything.
 _CODE_CHALLENGE = {
+    "status": "started",
     "entry_filename": "agent.py",
     "max_upload_files": 3,
     "max_upload_size_bytes": 1024,
@@ -716,6 +717,18 @@ def test_submit_refuses_an_unknown_runtime_before_creating_anything():
     with pytest.raises(SubmissionError, match=r"no runtime with id 99; its runtimes: 6 \(python\), 7 \(torch\)"):
         c.submit(4, agent=MyAgent, runtime_id=99)
     assert _created(rec) == []
+
+
+def test_submit_refuses_a_challenge_that_takes_no_deploy_before_creating_anything():
+    for status in ("draft", "stopped", "ended"):
+        c, rec = make_client(_challenge_router(status=status))
+        with pytest.raises(SubmissionError, match=f"is {status}: deploys are closed"):
+            c.submit(4, agent=MyAgent)
+        assert _created(rec) == []
+    # Without a deploy the status is the server's to judge: the create goes out.
+    c, rec = make_client(_challenge_router(status="stopped"))
+    out = c.submit(4, agent=MyAgent, deploy=False)
+    assert out["deploy"] is None and len(_created(rec)) == 1
 
 
 def test_submit_refuses_a_path_or_an_instance_as_agent_before_any_request():

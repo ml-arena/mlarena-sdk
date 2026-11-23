@@ -550,7 +550,7 @@ def test_create_submission_sends_allow_same_commit_only_when_asked():
 
 
 # What `submit()` reads off `challenge()` before it creates anything.
-_CHALLENGE_4 = {"entry_filename": "agent.py", "max_upload_files": 10,
+_CHALLENGE_4 = {"status": "started", "entry_filename": "agent.py", "max_upload_files": 10,
                 "max_upload_size_bytes": 1 << 20, "runtime_options": []}
 
 

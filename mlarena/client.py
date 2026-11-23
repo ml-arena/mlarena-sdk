@@ -4002,7 +4002,9 @@ class MLArenaClient:
 
         Before anything is created, one `challenge()` read checks what needs
         no submission, and raises `SubmissionError` (`MLArenaError` for an
-        unknown runtime name) with no submission left behind: the runtime
+        unknown runtime name) with no submission left behind: the challenge's
+        `status` (with `deploy=True`, a challenge that is not `started` takes
+        no deploy: `draft`, `stopped` or `ended`), the runtime
         (a name or an id the challenge does not offer), the `agent=`
         argument (a path, an instance, a class without readable source, a
         challenge whose entry file is not `agent.py`), the files (a missing
@@ -4065,6 +4067,13 @@ class MLArenaClient:
 
         # ---- Everything that needs no submission, before the create -------
         challenge = self.challenge(challenge_id)
+        if deploy and challenge["status"] != "started":
+            # The deploy route's own 409, said before a submission exists.
+            raise SubmissionError(
+                f"Challenge {challenge_id} is {challenge['status']}: deploys are closed. "
+                "Nothing was created; submit(..., deploy=False) creates the "
+                "submission and uploads its files without deploying."
+            )
         offered = challenge["runtime_options"]
         if isinstance(runtime, dict):
             warnings.warn(
@@ -6014,21 +6023,34 @@ class MLArenaClient:
         Mirrors `POST /api/teacher/lessons/{id}/preview`. Pass `body_md` to
         validate an unsaved buffer; omit it to validate the saved body. An
         unknown/unresolvable directive fails loud (400 → `MLArenaError`) so it's
-        caught before publishing; a challenge you may not see is refused as
+        caught before publishing: the message ends with the server's
+        `directive_error` (which block, and why), also on `err.body`; a
+        challenge you may not see is refused as
         one that does not exist. Returns `{directives, warnings}`: the
         payloads as you would read them, and one warning per block and per
         course linking the lesson's module whose students would not see the
         block's challenge (it is private and that course does not assign it).
         """
         body = {"body_md": body_md} if body_md is not None else {}
-        return self._json_call(
-            "POST", f"/teacher/lessons/{lesson_id}/preview", json_body=body,
-            error_label="preview_lesson",
-        )
+        try:
+            return self._json_call(
+                "POST", f"/teacher/lessons/{lesson_id}/preview", json_body=body,
+                error_label="preview_lesson",
+            )
+        except MLArenaError as err:
+            detail = (err.body or {}).get("directive_error")
+            if detail is None:
+                raise
+            # The reply's `error` is only "Invalid directive": the reason is
+            # the `directive_error` key beside it.
+            raise type(err)(
+                f"{err}: {detail}", status_code=err.status_code, body=err.body,
+            ) from None
 
     # ---- Course authoring: course composition (teacher scope) ---------------
 
     def update_course(self, course_id: int, *,
+                      start_date: str | None | _Unset = _UNSET,
                       end_date: str | None | _Unset = _UNSET,
                       **fields) -> dict:
         """Update course meta and settings — owner, assistant or admin.
@@ -6046,17 +6068,18 @@ class MLArenaClient:
         `ask_student_identity` off, the identity a student already has on
         their profile is still shown and exported; turning it on later does
         not ask the students who are already enrolled. Only the fields you
-        pass are changed; a keyword passed as None is not sent, except
-        `end_date`: `end_date=None` sends `null`, which clears the course's
-        end date, and leaving `end_date` out leaves it unchanged. Returns the
+        pass are changed; a keyword passed as None is not sent, except the
+        two dates: `start_date=None` / `end_date=None` send `null`, which
+        clears that date, and leaving one out leaves it unchanged. Returns the
         course as `teacher_course(course_id)` does.
         """
         allowed = {"name", "code", "description", "visibility",
-                   "instructor_name", "start_date",
+                   "instructor_name",
                    "ask_student_identity", "report_recipients",
                    "report_to_assistants"}
         body = _filtered_fields(fields, allowed, "update_course",
-                                nullable={"end_date": end_date})
+                                nullable={"start_date": start_date,
+                                          "end_date": end_date})
         return self._json_call(
             "PUT", f"/teacher/course/{course_id}", json_body=body,
             error_label="update_course",
