@@ -630,15 +630,23 @@ def test_submit_without_deploy_stops_after_the_upload_check(tmp_path):
 
 COURSE_PLAN = {
     "dry_run": False,
-    "course": {"id": 100, "slug": "intro-to-rl", "action": "updated"},
+    "course": {"id": 100, "slug": "intro-to-rl", "action": "updated",
+               "changes": ["description"]},
     "modules": [{
         "slug": "foundations", "id": 200, "action": "adopted", "renamed_from": "basics",
+        "changes": ["slug", "title"],
         "lessons": [
-            {"slug": "what-is-rl", "id": 300, "action": "unchanged", "renamed_from": None},
-            {"slug": "bandits", "id": None, "action": "created", "renamed_from": None},
+            {"slug": "what-is-rl", "id": 300, "action": "unchanged", "renamed_from": None,
+             "changes": []},
+            {"slug": "bandits", "id": None, "action": "created", "renamed_from": None,
+             "changes": []},
+            {"slug": "rag", "id": 301, "action": "updated", "renamed_from": None,
+             "changes": ["body_md", "title"]},
         ],
         "orphaned_lessons": ["old-intro"], "pruned_lessons": [],
-        "assets": {"written": 2, "removed": 1},
+        "assets": {"written_paths": ["foundations/a.png", "foundations/b.png"],
+                   "removed_paths": ["old/1.png", "old/2.png", "old/3.png",
+                                     "old/4.png", "old/5.png"]},
     }],
     "unmanaged_modules": ["extra"],
     "source_revision": REVISION,
@@ -647,6 +655,20 @@ COURSE_PLAN = {
         "module 'foundations', lesson 'bandits': mlarena:challenge: challenge 9 is not "
         "visible to the students of course 'Intro to RL' (it is private and the course "
         "does not assign it), so they will not see this block",
+    ],
+}
+
+
+EXPORTED_MANIFEST = {
+    "course": {"name": "Intro to RL", "slug": "intro-to-rl", "cover": "cover.png"},
+    "modules": [
+        {"title": "Foundations", "slug": "foundations", "lessons": [
+            {"title": "What is RL?", "slug": "what-is-rl", "file": "foundations/what-is-rl.md",
+             "children": [{"title": "Lab", "slug": "lab", "file": "foundations/lab.md"}]},
+        ]},
+        {"title": "Bandits", "slug": "bandits", "lessons": [
+            {"title": "UCB", "slug": "ucb", "file": "bandits/ucb.md"},
+        ]},
     ],
 }
 
@@ -706,6 +728,16 @@ class FakeClient:
         if self.error is not None:
             raise self.error
         return self.course_plan
+
+    def export_course_to_dir(self, slug, path, **kwargs):
+        self.calls.append(("export_course_to_dir", slug, path, kwargs))
+        if self.error is not None:
+            raise self.error
+        os.makedirs(os.path.join(path, ".github", "workflows"), exist_ok=True)
+        for name in ("course.yaml", "README.md", ".github/workflows/push.yml"):
+            with open(os.path.join(path, name), "w") as fh:
+                fh.write("x")
+        return EXPORTED_MANIFEST
 
 
 @pytest.fixture
@@ -1015,12 +1047,16 @@ def test_cli_course_push_prints_the_plan(fake, tmp_path, capsys, actions):
                              {"slug": "intro-to-rl", "subpath": None,
                               "dry_run": True, "prune": True})]
     out = capsys.readouterr().out
-    assert "course intro-to-rl: updated" in out
-    assert "  module foundations: adopted (renamed from basics)" in out
+    assert "  module foundations: adopted (slug, title) (renamed from basics)" in out
     assert "    lesson what-is-rl: unchanged" in out
     assert "    lesson bandits: created" in out
+    # An update names the fields that changed.
+    assert "course intro-to-rl: updated (description)" in out
+    assert "    lesson rag: updated (body_md, title)" in out
     assert "    lesson old-intro: orphaned" in out
-    assert "    assets: 2 written, 1 removed" in out
+    assert ("    assets: 2 written (foundations/a.png, foundations/b.png), "
+            "5 removed (old/1.png, old/2.png, old/3.png and 2 more) — files no lesson links"
+            in out)
     assert "  module extra: not in the manifest, untouched" in out
     assert "source: alice/agent@0123456" in out
     assert "https://ml-arena.com/courses/intro-to-rl" in out
@@ -1047,6 +1083,68 @@ def test_cli_course_push_dry_run_and_pruned_lines(fake, tmp_path, capsys):
     out = capsys.readouterr().out
     assert "Dry run: nothing was changed" in out
     assert "    lesson old-intro: pruned (deleted)" in out
+
+
+def test_cli_course_push_assets_line_only_for_what_moved(fake, capsys):
+    module = {**COURSE_PLAN["modules"][0], "assets": {
+        "written_paths": [], "removed_paths": []}}
+    fake(FakeClient(course_plan={**COURSE_PLAN, "modules": [module]}))
+    assert cli.main(["course", "push"]) == 0
+    assert "assets:" not in capsys.readouterr().out
+
+    module["assets"] = {"written_paths": ["foundations/a.png"], "removed_paths": []}
+    assert cli.main(["course", "push"]) == 0
+    assert "    assets: 1 written (foundations/a.png)\n" in capsys.readouterr().out
+
+
+def test_cli_course_export_writes_the_folder_and_names_the_next_step(fake, tmp_path, capsys):
+    client = fake(FakeClient())
+    target = str(tmp_path / "rl")
+    assert cli.main(["course", "export", "intro-to-rl", target]) == 0
+    assert client.asked[0]["scope"] == "teacher"
+    assert client.calls == [("export_course_to_dir", "intro-to-rl", target,
+                             {"overwrite": False})]
+    out = capsys.readouterr().out
+    assert f"Exported course intro-to-rl to {target}" in out
+    assert "  foundations/: 2 lessons" in out
+    assert "  bandits/: 1 lesson\n" in out
+    assert "  cover.png (cover)" in out
+    assert "  .github/workflows/push.yml" in out
+    assert "  README.md" in out
+    assert f"Next: mlarena course push --dry-run {target}" in out
+
+
+def test_cli_course_export_defaults_to_a_folder_named_after_the_slug(
+        fake, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    client = fake(FakeClient())
+    assert cli.main(["course", "export", "intro-to-rl", "--overwrite"]) == 0
+    assert client.calls == [("export_course_to_dir", "intro-to-rl",
+                             os.path.join(".", "intro-to-rl"), {"overwrite": True})]
+
+
+def test_cli_course_export_refused_exits_1(fake, tmp_path, capsys):
+    fake(FakeClient(error=MLArenaError("rl is not empty. Export into a new or empty folder")))
+    assert cli.main(["course", "export", "intro-to-rl", str(tmp_path)]) == 1
+    assert "is not empty" in capsys.readouterr().err
+
+
+def test_cli_every_argument_has_a_help_text():
+    """`mlarena … --help` explains every positional and option."""
+    def parsers(parser):
+        yield parser
+        for action in parser._actions:
+            if isinstance(action, cli.argparse._SubParsersAction):
+                for sub in action.choices.values():
+                    yield from parsers(sub)
+
+    missing = [
+        (parser.prog, action.dest)
+        for parser in parsers(cli.build_parser())
+        for action in parser._actions
+        if not isinstance(action, cli.argparse._SubParsersAction) and not action.help
+    ]
+    assert missing == []
 
 
 def test_cli_course_push_refused_exits_1(fake, tmp_path, capsys):

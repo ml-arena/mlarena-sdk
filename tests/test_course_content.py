@@ -501,12 +501,11 @@ def _write_manifest(d, manifest):
 
 def _write_course_dir(d, slug="intro-to-rl"):
     """A course directory in the bundle layout: manifest, a lesson body and the
-    image it links (paths relative to the root)."""
-    os.makedirs(os.path.join(d, "foundations"))
-    os.makedirs(os.path.join(d, "media"))
+    image it links (a link is relative to the lesson file's folder)."""
+    os.makedirs(os.path.join(d, "foundations", "images"))
     with open(os.path.join(d, "foundations", "what-is-rl.md"), "w") as fh:
-        fh.write("# What is RL\n![loop](media/loop.png)\n")
-    with open(os.path.join(d, "media", "loop.png"), "wb") as fh:
+        fh.write("# What is RL\n![loop](images/loop.png)\n")
+    with open(os.path.join(d, "foundations", "images", "loop.png"), "wb") as fh:
         fh.write(b"\x89PNG")
     course = {"name": "Intro to RL"}
     if slug is not None:
@@ -546,7 +545,7 @@ def test_push_course_uploads_the_directory_as_one_bundle():
     filename, names = _archive_names(call)
     _expect(filename == "bundle.zip", filename)
     # Rooted at the directory, manifest + body + linked file.
-    _expect(names == ["course.json", "foundations/what-is-rl.md", "media/loop.png"],
+    _expect(names == ["course.json", "foundations/images/loop.png", "foundations/what-is-rl.md"],
             names)
 
 
@@ -660,181 +659,266 @@ def test_author_course_from_dir_ships_legacy_manifest_keys_unchanged():
 
 _PNG = b"\x89PNG\r\n"
 
-
-def _export_router(method, path, kwargs):
-    if path == "/academic_courses/intro":
-        return (200, {
-            "id": 9, "name": "Intro to RL", "code": "RL101", "slug": "intro",
-            "description": "d", "visibility": "public",
-            "instructor_name": "Prof", "start_date": "2026-01-01",
-            "end_date": "2026-06-01", "has_cover": True, "can_manage": True,
-            "modules": [{
-                "id": 1, "title": "Foundations", "slug": "foundations",
-                "summary": "s", "icon": "book", "layout": "advanced",
-                "position": 0, "is_published": True,
-                "challenges": [
-                    {"challenge": {"id": 42, "name": "CartPole-v1",
-                                   "slug": "cartpole-v1"},
-                     "label": "CartPole", "pass_threshold": 195.0, "metric": None},
-                    # A draft the caller does not edit: the learner's landing
-                    # serves the entry without its challenge (not open yet).
-                    {"challenge": None, "label": None, "pass_threshold": None,
-                     "metric": None},
-                ],
-                "lessons": [
-                    {"id": 10, "parent_lesson_id": None, "title": "What is RL?",
-                     "slug": "what-is-rl", "kind": "lesson", "gated": False,
-                     "is_published": True, "estimated_minutes": 10},
-                    {"id": 11, "parent_lesson_id": 10, "title": "Lab",
-                     "slug": "lab", "kind": "exercise", "gated": True,
-                     "is_published": False, "estimated_minutes": None},
-                ],
-            }],
-        })
-    if path.endswith("/lessons/what-is-rl"):
-        return (200, {
-            "body_md": ("# What is RL\nexported body\n"
-                        "![loop](media/loop.png) [site](https://example.org/x.png)\n"
-                        "```\n![not a link](media/in-code.png)\n```\n"
-                        "[gone](media/gone.csv) [up](../secret.txt)\n"),
-            "asset_base_url": "/api/academic_courses/assets/modules/1/",
-        })
-    if path.endswith("/lessons/lab"):
-        return (200, {
-            "body_md": "[data](./data/week1.csv?raw=1#top)",
-            "asset_base_url": "/api/academic_courses/assets/modules/1/",
-        })
-    if path == "/teacher/modules/1":
-        # The teacher's read names the draft to the course's staff.
-        return (200, {"id": 1, "visibility": "unlisted", "challenges": [
-            {"challenge_id": 42, "challenge": {"id": 42, "name": "CartPole-v1",
-                                               "slug": "cartpole-v1"},
-             "label": "CartPole", "pass_threshold": 195.0, "metric": None, "position": 0},
-            {"challenge_id": 43, "challenge": {"id": 43, "name": "Old", "slug": "old",
-                                               "status": "draft", "can_edit": False},
-             "label": None, "pass_threshold": None, "metric": None, "position": 1},
-        ]})
-    if path == "/academic_courses/assets/modules/1/media/loop.png":
-        return FakeResponse(200, content=_PNG)
-    if path == "/academic_courses/assets/modules/1/data/week1.csv":
-        return FakeResponse(200, content=b"x,y\n")
-    if path == "/academic_courses/assets/modules/1/media/gone.csv":
-        return (404, {"error": "File not found"})
-    if path == "/academic_courses/assets/courses/9/cover":
-        return FakeResponse(200, content=_PNG,
-                            headers={"Content-Type": "image/png"})
-    raise AssertionError(f"unexpected request {method} {path}")
+_EXPORTED_YAML = """\
+course:
+  name: Intro to RL
+  slug: intro
+  cover: cover.png
+modules:
+- title: Foundations
+  slug: foundations
+  lessons:
+  - title: What is RL?
+    slug: what-is-rl
+    file: foundations/what-is-rl.md
+    is_published: true
+"""
 
 
-def test_export_course_to_dir():
-    c, rec = make_client(_export_router)
-    with tempfile.TemporaryDirectory() as d:
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            manifest = c.export_course_to_dir("intro", d)
+def _zip(entries):
+    """A .zip of `{name: bytes}`; a name ending in `@link` is a symbolic link."""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        for name, content in entries.items():
+            if name.endswith("@link"):
+                info = zipfile.ZipInfo(name[:-len("@link")])
+                info.external_attr = (0o120777 << 16)
+                archive.writestr(info, content)
+            else:
+                archive.writestr(name, content)
+    return buffer.getvalue()
 
-        def read(*parts):
-            with open(os.path.join(d, *parts), "rb") as fh:
-                return fh.read()
 
-        _expect(b"exported body" in read("foundations", "what-is-rl.md"),
-                "wrong body content")
-        # Linked files land where the body's relative link points, from the root.
-        _expect(read("media", "loop.png") == _PNG, "image not exported")
-        _expect(read("data", "week1.csv") == b"x,y\n", "data file not exported")
-        _expect(read("cover.png") == _PNG, "cover not exported")
-        _expect(not os.path.exists(os.path.join(d, "media", "in-code.png")),
-                "a link inside a code fence was followed")
-        manifest_files = [n for n in ("course.yaml", "course.json")
-                          if os.path.isfile(os.path.join(d, n))]
-        _expect(len(manifest_files) == 1, manifest_files)
+_EXPORT = {
+    "course.yaml": _EXPORTED_YAML.encode(),
+    "cover.png": _PNG,
+    "foundations/what-is-rl.md": b"# What is RL\n![loop](images/loop.png)\n",
+    "foundations/images/loop.png": _PNG,
+    ".github/workflows/push.yml": b"name: Push course to ML-Arena\n",
+    "README.md": b"# Intro to RL\n",
+}
 
-    # A linked file the module does not hold is reported, not fatal.
-    _expect(any("media/gone.csv" in str(w.message) for w in caught), caught)
-    paths = [call["path"] for call in rec.calls]
-    _expect(not any("secret" in p or "example.org" in p or "in-code" in p
-                    for p in paths), paths)
 
-    _expect(manifest["course"] == {
-        "name": "Intro to RL", "slug": "intro", "code": "RL101",
-        "description": "d", "visibility": "public", "instructor_name": "Prof",
-        "start_date": "2026-01-01", "end_date": "2026-06-01",
-        "cover": "cover.png",
-    }, manifest["course"])
-    module = manifest["modules"][0]
-    _expect(module["visibility"] == "unlisted", module)
-    # By slug (every challenge has one): the same on every deployment.
-    _expect(module["challenges"] == [
-        {"slug": "cartpole-v1", "label": "CartPole", "pass_threshold": 195.0},
-        {"slug": "old", "label": None, "pass_threshold": None},
-    ], module["challenges"])
-    _expect(module["lessons"] == [{
-        "title": "What is RL?", "slug": "what-is-rl", "kind": "lesson",
-        "file": "foundations/what-is-rl.md", "gated": False,
-        "is_published": True, "estimated_minutes": 10,
-        "children": [{
-            "title": "Lab", "slug": "lab", "kind": "exercise",
-            "file": "foundations/lab.md", "gated": True,
-            "is_published": False, "estimated_minutes": None,
-        }],
-    }], module["lessons"])
+def _export_client(entries=None, status=200):
+    payload = _zip(_EXPORT if entries is None else entries)
+
+    def router(method, path, kwargs):
+        if (method, path) == ("GET", "/academic_courses/intro/bundle"):
+            if status != 200:
+                return (status, {"error": "You may not export this course"})
+            return FakeResponse(200, content=payload)
+        raise AssertionError(f"unexpected request {method} {path}")
+    return make_client(router)
+
+
+def _tree(d):
+    found = []
+    for current, _dirs, files in os.walk(d):
+        for name in files:
+            found.append(os.path.relpath(os.path.join(current, name), d).replace(os.sep, "/"))
+    return sorted(found)
+
+
+def test_export_course_to_dir_unpacks_the_server_zip():
+    c, rec = _export_client()
+    with tempfile.TemporaryDirectory() as parent:
+        d = os.path.join(parent, "intro")          # created when missing
+        manifest = c.export_course_to_dir("intro", d)
+        _expect(_tree(d) == sorted(_EXPORT), _tree(d))
+        with open(os.path.join(d, "foundations", "images", "loop.png"), "rb") as fh:
+            _expect(fh.read() == _PNG, "image not written")
+    _expect([(call["method"], call["path"]) for call in rec.calls]
+            == [("GET", "/academic_courses/intro/bundle")], rec.calls)
+    _expect(manifest["course"]["slug"] == "intro", manifest)
+    _expect(manifest["modules"][0]["lessons"][0]["file"] == "foundations/what-is-rl.md",
+            manifest)
 
 
 def test_export_then_push_round_trips():
-    """What export writes is a bundle `push_course` accepts as it is: the
-    manifest's slug names the route and every file the bodies link is in the
-    archive under the path they link."""
-    c, rec = make_client(_export_router)
+    """The exported folder is a bundle `push_course` sends as it is."""
+    c, _rec = _export_client()
     with tempfile.TemporaryDirectory() as d:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            c.export_course_to_dir("intro", d)
-        # course.yaml with PyYAML installed, course.json without.
-        manifest_name = next(n for n in ("course.yaml", "course.json")
-                             if os.path.isfile(os.path.join(d, n)))
+        c.export_course_to_dir("intro", d)
         c._request = Recorder(lambda *_: (200, _PLAN))
         c.push_course(d)
         call = c._request.last
     _expect(call["path"] == "/teacher/courses/intro/bundle", call["path"])
     _, names = _archive_names(call)
-    _expect(names == sorted([manifest_name, "cover.png", "data/week1.csv",
-                             "foundations/lab.md", "foundations/what-is-rl.md",
-                             "media/loop.png"]), names)
+    _expect(names == sorted(_EXPORT), names)
 
 
-def test_export_refuses_two_modules_with_one_asset_path():
-    def router(method, path, kwargs):
-        if path == "/academic_courses/intro":
-            lesson = {"id": 1, "parent_lesson_id": None, "title": "L", "slug": "l",
-                      "kind": "lesson", "gated": False, "is_published": True,
-                      "estimated_minutes": None}
-            module = {"title": "M", "summary": None, "icon": None,
-                      "is_published": True, "challenges": [], "lessons": [lesson]}
-            return (200, {
-                "id": 9, "name": "Intro", "code": None, "slug": "intro",
-                "description": None, "visibility": "public",
-                "instructor_name": None, "start_date": None, "end_date": None,
-                "has_cover": False, "can_manage": False,
-                "modules": [{**module, "id": 1, "slug": "a"},
-                            {**module, "id": 2, "slug": "b"}],
-            })
-        for module_id, slug in ((1, "a"), (2, "b")):
-            if path == f"/academic_courses/intro/modules/{slug}/lessons/l":
-                return (200, {
-                    "body_md": "![f](media/fig.png)",
-                    "asset_base_url": f"/api/academic_courses/assets/modules/{module_id}/",
-                })
-            if path == f"/academic_courses/assets/modules/{module_id}/media/fig.png":
-                return FakeResponse(200, content=slug.encode())
-        raise AssertionError(f"unexpected request {method} {path}")
-
-    c, rec = make_client(router)
+def test_export_refuses_a_folder_that_holds_files_before_any_request():
+    c, rec = _export_client()
     with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, "notes.txt"), "w") as fh:
+            fh.write("mine")
         try:
             c.export_course_to_dir("intro", d)
-            raise AssertionError("expected MLArenaError on the asset conflict")
+            raise AssertionError("expected MLArenaError on a non-empty folder")
         except MLArenaError as err:
-            _expect("media/fig.png" in str(err), str(err))
+            _expect("not empty" in str(err) and "overwrite=True" in str(err), str(err))
+        _expect(rec.calls == [], rec.calls)
+        _expect(_tree(d) == ["notes.txt"], _tree(d))
+
+
+def test_export_overwrite_replaces_the_course_files_and_keeps_the_others():
+    c, _rec = _export_client()
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, ".git"))
+        with open(os.path.join(d, ".git", "HEAD"), "w") as fh:
+            fh.write("ref: refs/heads/main\n")
+        os.makedirs(os.path.join(d, "foundations"))
+        with open(os.path.join(d, "foundations", "what-is-rl.md"), "w") as fh:
+            fh.write("old body")
+        c.export_course_to_dir("intro", d, overwrite=True)
+        _expect(_tree(d) == sorted([*_EXPORT, ".git/HEAD"]), _tree(d))
+        with open(os.path.join(d, "foundations", "what-is-rl.md"), "rb") as fh:
+            _expect(fh.read() == _EXPORT["foundations/what-is-rl.md"], "body not replaced")
+
+
+def test_export_refuses_an_unsafe_archive_and_writes_nothing():
+    for bad in ({"../escape.md": b"x"}, {"/etc/passwd": b"x"},
+                {"a\\b.md": b"x"}, {"C:/x.md": b"x"},
+                {"foundations/link@link": b"/etc/passwd"},
+                {"foundations": b"x", "foundations/a.md": b"y"}):
+        c, _rec = _export_client({**_EXPORT, **bad})
+        with tempfile.TemporaryDirectory() as parent:
+            d = os.path.join(parent, "out")
+            try:
+                c.export_course_to_dir("intro", d)
+                raise AssertionError(f"expected MLArenaError for {sorted(bad)}")
+            except MLArenaError as err:
+                _expect("nothing was written" in str(err), str(err))
+            _expect(not os.path.exists(d) or _tree(d) == [], (bad, _tree(d)))
+            _expect(not os.path.exists(os.path.join(parent, "escape.md")), bad)
+
+
+def _refused(c, d, overwrite=False, match="nothing was written"):
+    try:
+        c.export_course_to_dir("intro", d, overwrite=overwrite)
+    except MLArenaError as err:
+        _expect(match in str(err), str(err))
+        return str(err)
+    raise AssertionError("expected MLArenaError")
+
+
+def test_export_refuses_a_colon_in_any_part_of_a_path():
+    c, _rec = _export_client({**_EXPORT, "foundations/a:b.md": b"x"})
+    with tempfile.TemporaryDirectory() as parent:
+        d = os.path.join(parent, "out")
+        _refused(c, d)
+        _expect(not os.path.exists(d), "the folder was created")
+
+
+def test_export_refuses_entries_that_differ_only_by_case():
+    for extra in ({"readme.md": b"x"}, {"Foundations/other.md": b"x"}):
+        c, _rec = _export_client({**_EXPORT, **extra})
+        with tempfile.TemporaryDirectory() as parent:
+            d = os.path.join(parent, "out")
+            message = _refused(c, d)
+            _expect("differ only by case" in message, message)
+            _expect(not os.path.exists(d), "the folder was created")
+
+
+def test_export_refuses_more_files_or_bytes_than_a_push_takes(monkeypatch):
+    import mlarena.bundle as bundle
+
+    monkeypatch.setattr(bundle, "MAX_EXTRACT_FILES", len(_EXPORT) - 1)
+    c, _rec = _export_client()
+    with tempfile.TemporaryDirectory() as parent:
+        d = os.path.join(parent, "out")
+        _expect("files, more than" in _refused(c, d), "file cap")
+        _expect(not os.path.exists(d), "the folder was created")
+    monkeypatch.setattr(bundle, "MAX_EXTRACT_FILES", 5000)
+
+    monkeypatch.setattr(bundle, "MAX_EXTRACT_BYTES", sum(map(len, _EXPORT.values())) - 1)
+    with tempfile.TemporaryDirectory() as parent:
+        d = os.path.join(parent, "out")
+        _expect("bytes, more than" in _refused(c, d), "byte cap")
+        _expect(not os.path.exists(d), "the folder was created")
+
+
+def _lying_zip(content=b"x" * 100, declared=10):
+    """A stored entry, `big.bin`, whose headers declare `declared` bytes for
+    `content` (the local header's size field at +22, the central
+    directory's at +24)."""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_STORED) as archive:
+        archive.writestr("course.yaml", _EXPORTED_YAML.encode())
+        archive.writestr("big.bin", content)
+    payload = bytearray(buffer.getvalue())
+    size, small = len(content).to_bytes(4, "little"), declared.to_bytes(4, "little")
+    local = payload.rfind(b"PK\x03\x04")
+    central = payload.rfind(b"PK\x01\x02")
+    for offset in (local + 22, central + 24):
+        _expect(payload[offset:offset + 4] == size, offset)
+        payload[offset:offset + 4] = small
+    return bytes(payload)
+
+
+def test_export_refuses_an_entry_that_holds_more_than_it_declares():
+    payload = _lying_zip()
+
+    def router(method, path, kwargs):
+        return FakeResponse(200, content=payload)
+    c, _rec = make_client(router)
+    with tempfile.TemporaryDirectory() as parent:
+        d = os.path.join(parent, "out")
+        message = _refused(c, d)
+        _expect("big.bin" in message, message)
+        _expect(not os.path.exists(d), "a partial folder was left")
+
+
+def test_export_entries_are_streamed_and_staged(monkeypatch):
+    """No entry is read whole into memory, and the staging folder is gone."""
+    def no_read(self, *args, **kwargs):
+        raise AssertionError("ZipFile.read loads an entry into memory")
+    monkeypatch.setattr(zipfile.ZipFile, "read", no_read)
+    c, _rec = _export_client()
+    with tempfile.TemporaryDirectory() as parent:
+        d = os.path.join(parent, "out")
+        c.export_course_to_dir("intro", d)
+        _expect(_tree(d) == sorted(_EXPORT), _tree(d))
+
+
+def test_export_overwrite_refuses_a_folder_where_a_file_is():
+    # A directory entry over an existing file, and a file under one.
+    for entries, existing in (({**_EXPORT, "notes/": b""}, "notes"),
+                              (_EXPORT, "foundations")):
+        c, _rec = _export_client(entries)
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, existing), "w") as fh:
+                fh.write("mine")
+            message = _refused(c, d, overwrite=True)
+            _expect("is a file, and the course has a folder there" in message, message)
+            _expect(_tree(d) == [existing], _tree(d))
+
+
+def test_export_overwrite_does_not_write_through_a_symbolic_link():
+    c, _rec = _export_client()
+    with tempfile.TemporaryDirectory() as parent:
+        d = os.path.join(parent, "out")
+        outside = os.path.join(parent, "outside")
+        os.makedirs(d)
+        os.makedirs(outside)
+        os.symlink(outside, os.path.join(d, "foundations"))
+        try:
+            c.export_course_to_dir("intro", d, overwrite=True)
+            raise AssertionError("expected MLArenaError on a symbolic link")
+        except MLArenaError as err:
+            _expect("symbolic link" in str(err), str(err))
+        _expect(os.listdir(outside) == [], os.listdir(outside))
+        _expect(not os.path.exists(os.path.join(d, "course.yaml")), "partial write")
+
+
+def test_export_refusal_keeps_the_server_message():
+    c, _rec = _export_client(status=403)
+    with tempfile.TemporaryDirectory() as parent:
+        try:
+            c.export_course_to_dir("intro", os.path.join(parent, "out"))
+            raise AssertionError("expected an error on a 403")
+        except MLArenaError as err:
+            _expect("You may not export this course" in str(err), str(err))
 
 
 # --------------------------------------------------------------------------- #
@@ -859,51 +943,6 @@ def _run_all():
 
 if __name__ == "__main__":
     sys.exit(1 if _run_all() else 0)
-
-
-def test_a_link_without_its_challenge_is_a_clear_export_error():
-    """An authoring link serves `challenge: None` for a challenge the caller
-    may not see: the manifest entry names the id, it does not crash."""
-    from mlarena.client import _manifest_challenge_entry
-
-    try:
-        _manifest_challenge_entry(
-            {"challenge_id": 43, "challenge": None, "label": None,
-             "pass_threshold": None})
-    except MLArenaError as exc:
-        _expect("challenge 43" in str(exc), str(exc))
-    else:
-        raise AssertionError("a link without its challenge must raise MLArenaError")
-
-
-def test_export_of_a_course_you_only_study_refuses_an_entry_that_is_not_open():
-    """A learner's landing serves a draft's entry without its challenge: the
-    manifest cannot name it, and the error does not tell a student to edit
-    the module."""
-    def router(method, path, kwargs):
-        if path == "/academic_courses/intro":
-            return (200, {
-                "id": 9, "name": "Intro", "code": None, "slug": "intro", "description": None,
-                "visibility": "private", "instructor_name": None, "start_date": None,
-                "end_date": None, "has_cover": False, "can_manage": False,
-                "modules": [{
-                    "id": 1, "title": "Foundations", "slug": "foundations", "summary": None,
-                    "icon": None, "is_published": True, "lessons": [],
-                    "challenges": [{"challenge": None, "label": "Final project",
-                                    "pass_threshold": None, "metric": None}],
-                }],
-            })
-        raise AssertionError(f"unexpected request {method} {path}")
-
-    c, _rec = make_client(router)
-    with tempfile.TemporaryDirectory() as d:
-        try:
-            c.export_course_to_dir("intro", d)
-        except MLArenaError as exc:
-            _expect("'Final project'" in str(exc) and "not open yet" in str(exc), str(exc))
-            _expect("remove the link" not in str(exc), str(exc))
-        else:
-            raise AssertionError("an entry that is not open yet must raise MLArenaError")
 
 
 # --------------------------------------------------------------------------- #

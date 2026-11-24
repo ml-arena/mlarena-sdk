@@ -13,18 +13,17 @@ import functools
 import inspect
 import io
 import os
-import re
 import tempfile
 import time
 import warnings
 from pathlib import Path
 from typing import Iterator
-from urllib.parse import quote, unquote
+from urllib.parse import quote
 
 import requests
 import yaml
 
-from mlarena.bundle import bundle_root, read_bundle
+from mlarena.bundle import bundle_root, check_extract_target, extract_bundle, read_bundle
 from mlarena.chat import ChatConversation
 from mlarena.exercise import format_attempt, source_of
 from mlarena.exceptions import (
@@ -6985,10 +6984,13 @@ class MLArenaClient:
               cover.png              # optional, named by the manifest
               foundations/
                 what-is-rl.md        # a lesson body, named by the manifest
-              media/loop.png         # linked from a body as ![](media/loop.png)
+                images/loop.png      # linked from it as ![](images/loop.png)
 
-        Every path of the manifest and every relative link of a lesson body
-        is relative to the directory's root.
+        A relative path is relative to the folder of the file that writes
+        it, as on GitHub: a path of the manifest (`file`, `cover`) from the
+        directory's root, a link of a lesson body from the lesson file's
+        folder (an inline `body_md` from the root). A link with `..` is
+        refused: a lesson's files sit in its folder or below it.
 
         Manifest (`course.yaml`)::
 
@@ -7001,7 +7003,7 @@ class MLArenaClient:
               instructor_name: "Prof X"
               start_date: 2026-01-01
               end_date: 2026-06-01
-              cover: cover.png       # optional, relative to the dir
+              cover: cover.png       # optional, from the directory's root
             modules:
               - title: "Foundations"
                 slug: foundations
@@ -7043,12 +7045,17 @@ class MLArenaClient:
         A module written by a bundle is managed by it: the console's editor
         and the module / lesson write methods answer 409 until
         `detach_module`. Relative links in a lesson are kept as written; the
-        files they name become the module's assets.
+        files they name become the module's assets, keyed by the link (the
+        lessons of a module share one store: two lessons that link one key
+        to different files are refused).
 
         Returns the server's plan: `dry_run`, `course` (`id`, `slug`,
-        `action`), `modules` (each `slug`, `id`, `action` — `created` |
-        `updated` | `unchanged` | `adopted` —, `renamed_from`, `lessons`,
-        `orphaned_lessons`, `pruned_lessons`, `assets`), `unmanaged_modules`,
+        `action`, `changes`), `modules` (each `slug`, `id`, `action` —
+        `created` | `updated` | `unchanged` | `adopted` —, `changes`,
+        `renamed_from`, `lessons` (each with `action` and `changes`, the
+        fields an `updated` lesson changed), `orphaned_lessons`,
+        `pruned_lessons`, `assets`: `written` / `removed` and their store
+        keys `written_paths` / `removed_paths`), `unmanaged_modules`,
         `source_revision`, the course's `url`, and `warnings`: one sentence
         per `mlarena:` block whose challenge the students of this course will
         not see (it is private and the course, as the push leaves it, does
@@ -7129,173 +7136,47 @@ class MLArenaClient:
         )
         return self.push_course(path)
 
-    def export_course_to_dir(self, slug: str, path: str) -> dict:
-        """Export a course to a local directory: a `course.yaml`, the lessons'
-        markdown, the files they link and the cover.
+    def export_course_to_dir(self, slug: str, path: str, *,
+                             overwrite: bool = False) -> dict:
+        """Write a course as a folder that `push_course` (or a GitHub
+        repository's workflow) pushes back unchanged; returns its manifest.
 
-        The inverse of `push_course`: pushing the exported directory changes
-        nothing. Reads the public consumption surface (landing + lesson
-        bodies + module assets), so it works for a course you can view
-        (public, or one you own / are enrolled in; owners also get draft
-        lessons *and draft modules* — for anyone else an unpublished module
-        is simply absent, so exporting someone else's course gives you the
-        published cut of it).
+        Mirrors `GET /api/academic_courses/{slug}/bundle`, the console's
+        *Download as a folder (.zip)*: the server builds the zip and this
+        method unpacks it into `path` (`mlarena.bundle.extract_bundle`). The
+        folder holds `course.yaml`, each lesson body at
+        `<module-slug>/<lesson-slug>.md` with the files it links beside it
+        (a link is relative to the lesson file's folder, as on GitHub), and
+        the cover. For a course you manage it also holds
+        `.github/workflows/push.yml` (the course template's workflow: commit
+        the folder to a GitHub repository and each push to `main` updates
+        the course) and a `README.md`, which lists under "Fix before your
+        first push" any link of a lesson to a file the course does not hold.
 
-        Layout: `<module-slug>/<lesson-slug>.md` for each lesson body, and
-        every relative link of a body (`![](media/loop.png)`,
-        `[data](data.csv)`) downloaded from its module's assets to that same
-        path from the directory's root, which is what a bundle's links are
-        relative to. A linked file the module does not hold is reported with
-        a warning and skipped; two modules that hold different files under
-        one path cannot share a directory, and raise. An attached challenge
-        is written by its slug: for a course you manage it is read from the
-        module itself (`get_module`), which names a draft the course holds
-        even when you do not edit it; for a course you only study, an entry
-        that is not open yet (its challenge is a draft) cannot be written and
-        raises. A module's `visibility` is written for a
-        course you manage (it is a teacher-side field). Returns the manifest
-        dict.
+        `path` is created when missing. An existing folder must be empty, so
+        an export never mixes with other files by accident; `overwrite=True`
+        writes the course's files over the ones there and keeps every other
+        file (to refresh a repository's checkout: its `.git` stays). The
+        archive is checked before anything is written: an entry outside the
+        folder (absolute, `..`), a symbolic link or a duplicate raises
+        `MLArenaError` and writes nothing.
+
+        Returns the parsed `course.yaml`, the dict `push_course` reads.
+        Next step: `push_course(path, dry_run=True)` reports every lesson
+        *unchanged*, and a module written in the Studio *adopted* (it moves
+        to the repository; only the module's owner's push does that).
         """
-        landing = self.course(slug)
-        base = os.path.abspath(path)
-        os.makedirs(base, exist_ok=True)
-
-        modules_out = []
-        asset_owner: dict[str, str] = {}
-        for module in landing["modules"]:
-            module_slug = module["slug"]
-            os.makedirs(os.path.join(base, module_slug), exist_ok=True)
-
-            entries: dict[int, dict] = {}
-            lessons_out = []
-            for toc in module["lessons"]:
-                full = self.lesson(slug, module_slug, toc["slug"])
-                body_md = full["body_md"]
-                rel = f"{module_slug}/{toc['slug']}.md"
-                with open(os.path.join(base, module_slug, f"{toc['slug']}.md"),
-                          "w", encoding="utf-8") as fh:
-                    fh.write(body_md)
-                for asset_path in _relative_asset_links(body_md):
-                    self._export_asset(full["asset_base_url"], asset_path, base,
-                                       module_slug, asset_owner)
-                entry = {
-                    "title": toc["title"],
-                    "slug": toc["slug"],
-                    "kind": toc["kind"],
-                    "file": rel,
-                    "gated": toc["gated"],
-                    "is_published": toc["is_published"],
-                    "estimated_minutes": toc["estimated_minutes"],
-                }
-                entries[toc["id"]] = entry
-                if toc["parent_lesson_id"] is None:
-                    lessons_out.append(entry)
-                else:
-                    # A lesson's children follow it in the landing's order.
-                    entries[toc["parent_lesson_id"]].setdefault(
-                        "children", []).append(entry)
-
-            module_out = {
-                "title": module["title"],
-                "slug": module_slug,
-                "summary": module["summary"],
-                "icon": module["icon"],
-            }
-            attached = module["challenges"]
-            if landing["can_manage"]:
-                # The teacher's read of the module: its `visibility`, and its
-                # attachments as the course's staff are told about them (a
-                # draft they do not edit is named there; the learner's
-                # landing serves such an entry without its challenge).
-                authored = self.get_module(module["id"])
-                module_out["visibility"] = authored["visibility"]
-                attached = authored["challenges"]
-            module_out.update({
-                "is_published": module["is_published"],
-                "challenges": [_manifest_challenge_entry(c) for c in attached],
-                "lessons": lessons_out,
-            })
-            modules_out.append(module_out)
-
-        course_out = {
-            "name": landing["name"],
-            "slug": landing["slug"],
-            "code": landing["code"],
-            "description": landing["description"],
-            "visibility": landing["visibility"],
-            "instructor_name": landing["instructor_name"],
-            "start_date": landing["start_date"],
-            "end_date": landing["end_date"],
-        }
-        if landing["has_cover"]:
-            course_out["cover"] = self._export_course_cover(landing["id"], base)
-        manifest = {"course": course_out, "modules": modules_out}
-        _dump_course_manifest(base, manifest)
-        return manifest
-
-    def _export_asset(self, asset_base_url: str, asset_path: str, base: str,
-                      module_slug: str, asset_owner: dict) -> None:
-        """Download one linked module asset to `base/<asset_path>`.
-
-        `asset_base_url` is the lesson's (a path of this server, `/api/…/`).
-        `asset_owner` remembers which module wrote each path, across the
-        export.
-        """
+        # Refused before the download: a folder that already holds files.
+        check_extract_target(path, overwrite)
         resp = self._request(
-            "GET",
-            f"{self._base_url}{asset_base_url}{quote(asset_path)}",
+            "GET", self._url(f"/academic_courses/{quote(slug, safe='')}/bundle"),
             headers=self._headers(), timeout=300,
         )
-        if resp.status_code == 404:
-            warnings.warn(
-                f"module {module_slug!r}: a lesson links {asset_path!r}, which "
-                f"is not among the module's assets; skipped",
-                stacklevel=3,
-            )
-            return
         self._handle_response(resp)
         if resp.status_code != 200:
-            raise _failed(MLArenaError, "export_course_to_dir (asset)", resp)
-        content = resp.content
-        out_path = os.path.join(base, *asset_path.split("/"))
-        owner = asset_owner.get(asset_path)
-        if owner is not None and owner != module_slug:
-            with open(out_path, "rb") as fh:
-                if fh.read() != content:
-                    raise MLArenaError(
-                        f"modules {owner!r} and {module_slug!r} both hold an "
-                        f"asset {asset_path!r}, with different content: one "
-                        f"course directory cannot hold both. Rename one of "
-                        f"them, then export again."
-                    )
-            return
-        os.makedirs(os.path.dirname(out_path), exist_ok=True)
-        with open(out_path, "wb") as fh:
-            fh.write(content)
-        asset_owner[asset_path] = module_slug
-
-    def _export_course_cover(self, course_id: int, base: str) -> str:
-        """Write the course's cover as `cover.<ext>` in `base`; returns the
-        file name. The extension is the served image type's."""
-        resp = self._request(
-            "GET", self._url(f"/academic_courses/assets/courses/{course_id}/cover"),
-            headers=self._headers(), timeout=300, stream=True,
-        )
-        self._handle_response(resp)
-        if resp.status_code != 200:
-            raise _failed(MLArenaError, "course_cover", resp)
-        content_type = resp.headers["Content-Type"].split(";")[0].strip().lower()
-        if content_type not in _COVER_EXTENSIONS:
-            raise MLArenaError(
-                f"course cover is served as {content_type!r}, not an image type "
-                f"this export knows ({', '.join(sorted(_COVER_EXTENSIONS))})"
-            )
-        name = f"cover{_COVER_EXTENSIONS[content_type]}"
-        with open(os.path.join(base, name), "wb") as fh:
-            for chunk in resp.iter_content(chunk_size=1 << 20):
-                if chunk:
-                    fh.write(chunk)
-        return name
+            raise _failed(MLArenaError, "export_course_to_dir", resp)
+        extract_bundle(resp.content, path, overwrite=overwrite)
+        return _load_course_manifest(os.path.abspath(path))
 
     def __repr__(self) -> str:
         # mlk_<scope>_<lookup>_<secret> / mlo_<lookup>_<secret>: never the secret.
@@ -7369,112 +7250,6 @@ def _manifest_course_slug(base: str) -> str:
             f"is matched by its slug), or pass slug="
         )
     return str(slug)
-
-
-def _manifest_challenge_entry(link: dict) -> dict:
-    """A module's attached challenge as the manifest names it: by slug, which
-    is the same on every deployment.
-
-    A link without its challenge cannot be written, since the manifest would
-    name a challenge by a slug you were not given: an authoring link serves
-    `challenge: None` for a challenge you may not see, a learner's entry for
-    a draft that is not open yet.
-    """
-    challenge = link.get("challenge")
-    if challenge is None:
-        if "challenge_id" in link:
-            raise MLArenaError(
-                f"Cannot export the link to challenge {link['challenge_id']}: you may "
-                "not see that challenge, so the manifest cannot name it by its slug. "
-                "Ask its owner for access."
-            )
-        raise MLArenaError(
-            f"Cannot export the entry {link.get('label') or 'of a module'!r}: its "
-            "challenge is not open yet (a draft), so the manifest cannot name it by "
-            "its slug. The course's owner or an assistant can export it."
-        )
-    return {"slug": challenge["slug"], "label": link["label"],
-            "pass_threshold": link["pass_threshold"]}
-
-
-_COVER_EXTENSIONS = {
-    "image/png": ".png",
-    "image/jpeg": ".jpg",
-    "image/gif": ".gif",
-    "image/webp": ".webp",
-}
-
-# What a lesson body links to: the server's rule, `relative_link_targets` and
-# `asset_relpath` in `backend/app/services/course_manifest.py`. A course
-# bundle holds exactly these files, so the export downloads exactly these.
-
-# Text that renders as written, where a `[a](b)` is not a link.
-_LINK_FREE_RES = (
-    re.compile(r"(?ms)^[ \t]*(?P<fence>`{3,}|~{3,}).*?^[ \t]*(?P=fence)[ \t]*$"),
-    re.compile(r"(?s)<!--.*?-->"),
-    re.compile(r"(`+)[^`\n](?:[^\n]*?[^`\n])??\1(?!`)"),
-    re.compile(r"(?s)\$\$.+?\$\$"),
-    re.compile(r"(?<![\\$])\$(?!\s)[^$\n]+?(?<![\s\\])\$(?!\d)"),
-)
-# `[text](target "title")`, `![alt](target)` and `[label]: target`.
-_MD_LINK_RES = (
-    re.compile(
-        r"\[(?:[^\[\]]|\[[^\[\]]*\])*\]\(\s*(?P<target><[^<>\n]*>|[^()\s]+)"
-        r"(?:\s+(?:\"[^\"]*\"|'[^']*'|\([^()]*\)))?\s*\)"
-    ),
-    re.compile(r"(?m)^ {0,3}\[(?!\^)[^\]\n]+\]:[ \t]*(?P<target><[^<>\n]*>|\S+)"),
-)
-_HTML_LINK_RES = (
-    re.compile(r"(?is)<(?:img|video|audio|source)\b[^>]*?\ssrc\s*=\s*"
-               r"(?:\"(?P<dq>[^\"]*)\"|'(?P<sq>[^']*)')"),
-    re.compile(r"(?is)<a\b[^>]*?\shref\s*=\s*(?:\"(?P<dq>[^\"]*)\"|'(?P<sq>[^']*)')"),
-)
-_URL_SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
-
-
-def _relative_asset_links(body_md: str) -> list[str]:
-    """The module asset paths a lesson body links to, sorted.
-
-    A relative link (`![](media/fig.png)`, `[data](data.csv)`, an HTML `src`
-    / `href`) resolves against the module's asset base, so it names a module
-    asset. Not assets: anything with a scheme, `/`-absolute targets, `#`
-    anchors, whatever sits in code, a comment or math, and a target that
-    climbs out of the store (`../x`).
-    """
-    text = body_md
-    for pattern in _LINK_FREE_RES:
-        text = pattern.sub(" ", text)
-    targets = []
-    for pattern in _MD_LINK_RES:
-        for match in pattern.finditer(text):
-            target = match.group("target")
-            if target.startswith("<") and target.endswith(">"):
-                target = target[1:-1]
-            targets.append(target)
-    for pattern in _HTML_LINK_RES:
-        for match in pattern.finditer(text):
-            target = match.group("dq") if match.group("dq") is not None else match.group("sq")
-            targets.append(target.strip())
-
-    found: set[str] = set()
-    for target in targets:
-        if not target or target.startswith(("#", "/")) or _URL_SCHEME_RE.match(target):
-            continue
-        asset_path = unquote(re.split(r"[?#]", target, maxsplit=1)[0])
-        while asset_path.startswith("./"):
-            asset_path = asset_path[2:]
-        parts = asset_path.split("/")
-        if not asset_path or "\\" in asset_path or any(
-                part in ("", ".", "..") for part in parts):
-            continue
-        found.add(asset_path)
-    return sorted(found)
-
-
-def _dump_course_manifest(base: str, manifest: dict) -> None:
-    """Write a manifest as ``course.yaml``."""
-    with open(os.path.join(base, "course.yaml"), "w", encoding="utf-8") as fh:
-        yaml.safe_dump(manifest, fh, sort_keys=False, allow_unicode=True)
 
 
 def _default_submission_name(agent, files) -> str:

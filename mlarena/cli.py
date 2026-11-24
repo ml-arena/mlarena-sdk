@@ -1,9 +1,10 @@
-"""The `mlarena` command: submit, push a challenge, push a course.
+"""The `mlarena` command: submit, push a challenge, push or export a course.
 
     mlarena whoami
     mlarena submit --challenge <slug-or-id> [--files a b … | --dir DIR] …
     mlarena challenge push [DIR] --challenge <slug-or-id> [--path SUBPATH] [--dry-run]
-    mlarena course push [DIR] [--slug SLUG] [--dry-run] [--prune]
+    mlarena course push [DIR] [--slug SLUG] [--path SUBPATH] [--dry-run] [--prune]
+    mlarena course export SLUG [DIR] [--overwrite]
 
 Each command is a composition of `MLArenaClient` methods: the CLI has no
 route of its own. The credential is resolved by `mlarena.connect()`
@@ -423,6 +424,38 @@ def _renamed(entry: dict) -> str:
     return f" (renamed from {entry['renamed_from']})" if entry["renamed_from"] else ""
 
 
+# A plan names at most this many asset paths per list; the rest is a count.
+PLAN_PATHS_SHOWN = 3
+
+
+def _action(entry: dict) -> str:
+    """`updated (body_md, title)`: the action, and the fields that changed
+    when there are any (an `updated` or `adopted` item)."""
+    if entry["changes"]:
+        return f"{entry['action']} ({', '.join(entry['changes'])})"
+    return entry["action"]
+
+
+def _some_paths(paths: list[str]) -> str:
+    shown = ", ".join(paths[:PLAN_PATHS_SHOWN])
+    if len(paths) > PLAN_PATHS_SHOWN:
+        shown += f" and {len(paths) - PLAN_PATHS_SHOWN} more"
+    return shown
+
+
+def _assets_line(assets: dict) -> str | None:
+    """`assets: 2 written (a.png, b.png), 37 removed (…) — files no lesson
+    links`. Read from the path lists only (the counts beside them are an
+    expand step of the server)."""
+    written, removed = assets["written_paths"], assets["removed_paths"]
+    parts = []
+    if written:
+        parts.append(f"{len(written)} written ({_some_paths(written)})")
+    if removed:
+        parts.append(f"{len(removed)} removed ({_some_paths(removed)}) — files no lesson links")
+    return f"assets: {', '.join(parts)}" if parts else None
+
+
 def _course_plan_lines(report: dict) -> list[str]:
     """`CourseBundleResponse` (`backend/app/views/teacher/_schemas.py`) as
     text. The one place its keys are read."""
@@ -430,19 +463,18 @@ def _course_plan_lines(report: dict) -> list[str]:
     lines = []
     if report["dry_run"]:
         lines.append("Dry run: nothing was changed")
-    lines.append(f"course {course['slug']}: {course['action']}")
+    lines.append(f"course {course['slug']}: {_action(course)}")
     for module in report["modules"]:
-        lines.append(f"  module {module['slug']}: {module['action']}{_renamed(module)}")
-        lines += [f"    lesson {lesson['slug']}: {lesson['action']}{_renamed(lesson)}"
+        lines.append(f"  module {module['slug']}: {_action(module)}{_renamed(module)}")
+        lines += [f"    lesson {lesson['slug']}: {_action(lesson)}{_renamed(lesson)}"
                   for lesson in module["lessons"]]
         lines += [f"    lesson {slug}: orphaned (not in the manifest; unpublished, kept)"
                   for slug in module["orphaned_lessons"]]
         lines += [f"    lesson {slug}: pruned (deleted)"
                   for slug in module["pruned_lessons"]]
-        assets = module["assets"]
-        if assets["written"] or assets["removed"]:
-            lines.append(f"    assets: {assets['written']} written, "
-                         f"{assets['removed']} removed")
+        assets = _assets_line(module["assets"])
+        if assets is not None:
+            lines.append(f"    {assets}")
     for slug in report["unmanaged_modules"]:
         lines.append(f"  module {slug}: not in the manifest, untouched")
     if report["source_revision"] is not None:
@@ -482,6 +514,44 @@ def cmd_course_push(args) -> int:
 
 
 # --------------------------------------------------------------------------- #
+# course export
+# --------------------------------------------------------------------------- #
+
+
+def _lesson_count(lessons: list) -> int:
+    return sum(1 + len(lesson.get("children", [])) for lesson in lessons)
+
+
+def cmd_course_export(args) -> int:
+    directory = args.directory if args.directory is not None else os.path.join(".", args.slug)
+    client = _connect(args.base_url, "teacher", args.audience)
+    try:
+        manifest = client.export_course_to_dir(args.slug, directory,
+                                               overwrite=args.overwrite)
+    except MLArenaError as err:
+        return _fail(str(err), heading="ML Arena course export")
+    _out(f"Exported course {manifest['course']['slug']} to {directory}")
+    _out("  course.yaml")
+    for module in manifest["modules"]:
+        count = _lesson_count(module["lessons"])
+        _out(f"  {module['slug']}/: {count} lesson{'s' if count != 1 else ''}")
+    cover = manifest["course"].get("cover")
+    if cover:
+        _out(f"  {cover} (cover)")
+    for extra in (os.path.join(".github", "workflows", "push.yml"), "README.md"):
+        if os.path.isfile(os.path.join(directory, extra)):
+            _out(f"  {extra.replace(os.sep, '/')}")
+    _out("")
+    _out(f"Next: mlarena course push --dry-run {directory}")
+    _out("  every lesson should read 'unchanged', and a module written in the Studio "
+         "'adopted'. Then commit the folder to a GitHub repository: each push to main "
+         "updates the course. The course's owner makes the first push.")
+    if os.path.isfile(os.path.join(directory, "README.md")):
+        _out("  README.md lists what to fix before the first push, if anything.")
+    return EXIT_OK
+
+
+# --------------------------------------------------------------------------- #
 # Parser + entry point
 # --------------------------------------------------------------------------- #
 
@@ -509,7 +579,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     submit = commands.add_parser(
         "submit", help="create a submission, upload its files and deploy it")
-    submit.add_argument("--challenge", required=True, metavar="SLUG_OR_ID")
+    submit.add_argument(
+        "--challenge", required=True, metavar="SLUG_OR_ID",
+        help="the challenge: its id, or the slug of /challenges/<slug>")
     submit.add_argument("--files", nargs="+", metavar="FILE",
                         help="the files to upload, each stored under its base name")
     submit.add_argument("--dir", metavar="DIR",
@@ -534,8 +606,13 @@ def build_parser() -> argparse.ArgumentParser:
         dest="challenge_command", required=True, metavar="COMMAND")
     challenge_push = challenge_commands.add_parser(
         "push", help="replace the challenge's files with a directory")
-    challenge_push.add_argument("directory", nargs="?", default=".", metavar="DIR")
-    challenge_push.add_argument("--challenge", required=True, metavar="SLUG_OR_ID")
+    challenge_push.add_argument(
+        "directory", nargs="?", default=".", metavar="DIR",
+        help="the challenge folder (env.py, challenge.toml, …) or a .zip / "
+             ".tar.gz of it (default: the current directory)")
+    challenge_push.add_argument(
+        "--challenge", required=True, metavar="SLUG_OR_ID",
+        help="the challenge to update: its id, or the slug of /challenges/<slug>")
     challenge_push.add_argument("--path", metavar="SUBPATH",
                                 help="the folder inside DIR that holds the challenge")
     challenge_push.add_argument("--dry-run", action="store_true",
@@ -547,16 +624,36 @@ def build_parser() -> argparse.ArgumentParser:
         dest="course_command", required=True, metavar="COMMAND")
     course_push = course_commands.add_parser(
         "push", help="create or update a course from a directory (course.yaml)")
-    course_push.add_argument("directory", nargs="?", default=".", metavar="DIR")
-    course_push.add_argument("--slug", help="the course's slug (default: the manifest's)")
+    course_push.add_argument(
+        "directory", nargs="?", default=".", metavar="DIR",
+        help="the course folder (course.yaml at its root) or a .zip / .tar.gz "
+             "of it (default: the current directory)")
+    course_push.add_argument(
+        "--slug", help="the course's slug (default: course.slug of the "
+                       "manifest; required for an archive)")
     course_push.add_argument("--path", metavar="SUBPATH",
                              help="the folder inside DIR that holds the course")
     course_push.add_argument("--dry-run", action="store_true",
                              help="print the plan; change nothing")
     course_push.add_argument("--prune", action="store_true",
-                             help="delete the lessons that left the manifest "
-                                  "(default: unpublish them)")
+                             help="delete the lessons that left the manifest, "
+                                  "with their students' progress (default: "
+                                  "unpublish them)")
     course_push.set_defaults(run=cmd_course_push)
+
+    course_export = course_commands.add_parser(
+        "export", help="write a course as a folder that `course push` and a "
+                       "GitHub repository take as they are")
+    course_export.add_argument(
+        "slug", metavar="SLUG", help="the course's slug (ml-arena.com/courses/<slug>)")
+    course_export.add_argument(
+        "directory", nargs="?", default=None, metavar="DIR",
+        help="the folder to write, new or empty (default: ./SLUG)")
+    course_export.add_argument(
+        "--overwrite", action="store_true",
+        help="write into a folder that already holds files: the course's files "
+             "replace theirs, every other file is kept (a git checkout keeps .git)")
+    course_export.set_defaults(run=cmd_course_export)
     return parser
 
 

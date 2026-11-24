@@ -60,6 +60,45 @@ client.leaderboard(ch["id"])                      # a DataFrame with pandas
   An error once the submission exists (a refused upload, a deploy over your
   daily quota) carries `err.submission_id` and says how to deploy or delete it.
 
+## 4.22.0 — a course as a folder, both ways
+
+Requires a platform at or after the backend change of the same date (the
+export route and the plan's new keys).
+
+- **`export_course_to_dir(slug, path, *, overwrite=False)` downloads the
+  server's export** (`GET /api/academic_courses/{slug}/bundle`, the console's
+  *Download as a folder (.zip)*) and unpacks it. The folder holds
+  `course.yaml`, each lesson at `<module>/<lesson>.md` with the files it links
+  beside it, the cover, and for a course you manage the template's
+  `.github/workflows/push.yml` and a `README.md` (which lists under *Fix
+  before your first push* any link to a file the course does not hold).
+  Commit it to a GitHub repository and each push to `main` updates the course;
+  `push_course(path, dry_run=True)` on it reports every lesson *unchanged*
+  (and a module written in the Studio *adopted*: only its owner's push hands
+  it to the repository). It
+  still returns the manifest dict. The SDK no longer builds the folder from
+  the lesson reads itself, so the export follows the platform's link rule.
+- **The target folder must be missing or empty**, checked before the
+  download: `MLArenaError` otherwise. `overwrite=True` writes the course's
+  files over the folder's and keeps every other file (a checkout keeps its
+  `.git`). An archive entry outside the folder (absolute, `..`), a symbolic
+  link or a duplicate raises and writes nothing.
+- **New command `mlarena course export SLUG [DIR] [--overwrite]`** (teacher
+  scope; `DIR` defaults to `./SLUG`): writes the folder, prints one line per
+  module and the next step, `mlarena course push --dry-run DIR`.
+- **The plan says what changed.** In `push_course`'s answer the course, each
+  module and each lesson carry `changes`, the fields an `updated` item
+  changed (a lesson's position counts only when the order changes), and each
+  module's `assets` carries `written_paths` / `removed_paths` (read those: the
+  `written` / `removed` counts beside them are kept for older CLIs only). `mlarena course push` prints `lesson rag: updated (body_md, title)`
+  and `assets: 2 written (a.png, b.png), 37 removed (…) — files no lesson links`.
+- **A lesson's links are relative to the lesson file's folder**, as on
+  GitHub (the platform's rule, nothing to change in the SDK): in
+  `intro/welcome.md`, `![](images/x.png)` is `intro/images/x.png`. A manifest
+  path (`file`, `cover`) is still read from `course.yaml`; a link with `..`
+  is refused.
+- Every positional and option of the `mlarena` command has a help text.
+
 ## 4.21.0 — one id per course module row, and refusals where a wrong value used to be stored
 
 Requires a platform at or after the backend change of the same date (no
@@ -1699,6 +1738,7 @@ mlarena whoami
 mlarena submit --challenge lunar-lander-v3 --files agent.py model.pt --runtime torch --wait
 mlarena challenge push ./my-challenge --challenge my-challenge --dry-run
 mlarena course push ./my-course --dry-run
+mlarena course export my-course ./my-course
 ```
 
 - `mlarena whoami` prints the account, the kind of credential and the base
@@ -1719,7 +1759,12 @@ mlarena course push ./my-course --dry-run
   prints what changed, the config result and the `env.py` check.
 - `mlarena course push [DIR] [--slug SLUG] [--path SUBPATH] [--dry-run] [--prune]`
   applies a course directory (`push_course`) and prints the plan: each module
-  and lesson created, updated, unchanged or orphaned.
+  and lesson created, updated (with the fields that changed), unchanged or
+  orphaned, and the files written and removed.
+- `mlarena course export SLUG [DIR] [--overwrite]` writes a course you can
+  read as a folder that `course push` takes back unchanged (`DIR` defaults to
+  `./SLUG` and must be new or empty unless `--overwrite`): the way to start a
+  repository from a course built in the Studio.
 - `--path SUBPATH`, on both pushes, is the folder inside `DIR` that holds the
   challenge or the course (one repository, several of them): only that folder
   is uploaded.
@@ -1738,7 +1783,7 @@ mlarena course push ./my-course --dry-run
 Actions job with `permissions: id-token: write`, the job proves who it is with
 GitHub's OIDC token and receives a 15-minute token: there is no secret to
 store in the repository. `submit` asks for the `user` scope, `challenge push`
-for `creator`, `course push` for `teacher`.
+for `creator`, `course push` and `course export` for `teacher`.
 
 **One-time setup.**
 
@@ -2099,15 +2144,17 @@ import mlarena
 teacher = mlarena.connect(api_key="mlk_teacher_…")
 
 # my-course/course.yaml describes the course; lesson bodies are markdown files
-# named by the manifest, next to the images and files they link (see
+# named by the manifest, with the images and files they link beside them (a
+# link is relative to the lesson file's folder, as on GitHub; see
 # push_course's docstring for the full schema). The server applies the
 # directory as one bundle, matched by slug: pushing again changes nothing.
 plan = teacher.push_course("my-course/", dry_run=True)   # what would change
 plan = teacher.push_course("my-course/")
 print(plan["course"], plan["url"])
 
-# Round-trip the other way for backup / versioning:
-teacher.export_course_to_dir("intro-to-rl", "backup/")
+# The other way: a course built in the Studio as a folder to commit to a
+# repository (the folder must be new or empty; overwrite=True refreshes one).
+teacher.export_course_to_dir("intro-to-rl", "intro-to-rl/")
 ```
 
 A module written by a bundle is managed by it: the editor and the module /
@@ -2142,7 +2189,7 @@ print(student.my_progress(landing["id"]))                # content % + next less
 - `client.create_lesson(module_id, title, kind="lesson", slug=None, parent_lesson_id=None, body_md="", gated=False)`, `get_lesson`, `update_lesson(id, **fields)`, `delete_lesson`, `reorder_lessons`.
 - `client.upload_module_asset(module_id, file_path, path=None)` (returns `{path, url}`; link it from a lesson body by its `path`: `![fig](media/fig.png)`), `list_module_assets(module_id)`, `delete_module_asset(module_id, path)`.
 - `client.preview_lesson(lesson_id, body_md=None)` — validates `mlarena:` directives as you (fails loud on unknown, and on a challenge you may not see as on one that does not exist); `warnings` names the courses whose students would not see a block's challenge.
-- `client.push_course(path, slug=None, subpath=None, dry_run=False, prune=False)`, `client.import_course_from_github(slug, repository, ref=None, path=None, dry_run=False, prune=False)`, `client.export_course_to_dir(slug, path)` — a course as a directory (above).
+- `client.push_course(path, slug=None, subpath=None, dry_run=False, prune=False)`, `client.import_course_from_github(slug, repository, ref=None, path=None, dry_run=False, prune=False)`, `client.export_course_to_dir(slug, path, overwrite=False)` — a course as a directory (above).
 - `client.add_course_challenge(course_id, challenge_id, title=None, summary=None, pass_threshold=None, is_published=True)` — the console's "Add challenge": one transactional call creates a private module (title defaults to the challenge's name, `summary` is the student page), links it at the end of the course and attaches the challenge; nothing is written if any part is refused.
 - `client.use_challenge_with_class(challenge, course=None, *, name=None, end_date=None)` — the console's "Use with my class", composed client-side: the challenge (id or slug) added to `course`, or to a new course named `name` or after the challenge (optional `end_date`); returns the course with its `join_code`.
 - `client.remove_course_challenge(course_id, module_id)` — the console's "Remove": one transactional call unlinks the entry and deletes its module when it is a simple module you may edit that no other course links; answers `{"message", "module_deleted"}`.
