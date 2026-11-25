@@ -680,8 +680,8 @@ class MLArenaClient:
         Mirrors `GET /api/machines[?kernel_version=]` (`machines.py`,
         `list_machines`) — the list the console's Runtime section offers.
         Each entry is a `MachineOut`: `id`, `name`, `runtime` (`"k8s"` |
-        `"vm"`), `node_pool` (`"autoscaling"` | `"large-autoscaling"` |
-        `"sandbox"`, the gVisor pool; `None` on a vm machine), `vm_health_ok`,
+        `"vm"`), `node_pool` (`"autoscaling"` | `"large-autoscaling"`;
+        `None` on a vm machine), `vm_health_ok`,
         `vm_health_checked_at_ts`, `gpu_device_ids`, `gpu_count`,
         `image_pull_policy`, `job_cpu_max`, `job_memory_max`,
         `job_timeout_max_sec` (the longest `simulation_timeout_sec` a
