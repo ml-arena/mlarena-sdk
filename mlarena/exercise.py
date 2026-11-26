@@ -2,7 +2,7 @@
 
 An exercise challenge holds the short Python exercises of one course module.
 A participant sends code (or, for a `text` / `choice` exercise, an answer);
-the challenge's resident checker runs it against the creator's hidden asserts
+the challenge's resident checker runs it against the set's hidden asserts
 and answers within about a second. The public routes are
 `/api/exercise/*` (`MLArenaClient.exercise_challenge`, `submit_exercise`,
 `exercise_attempt`, `exercise_attempts`); this module holds what the

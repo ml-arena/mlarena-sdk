@@ -25,6 +25,7 @@ import yaml
 
 from mlarena.bundle import bundle_root, check_extract_target, extract_bundle, read_bundle
 from mlarena.chat import ChatConversation
+from mlarena.ci_auth import KIND_GITHUB_ACTIONS
 from mlarena.exercise import format_attempt, source_of
 from mlarena.exceptions import (
     AuthenticationError,
@@ -54,6 +55,17 @@ _UNSET = _Unset()
 
 # A token that expires is renewed this long before it does.
 _TOKEN_RENEW_MARGIN_SEC = 60
+
+# The 403 of every route that creates a challenge, for an account that has
+# not accepted the terms of use: its `reason` and its sentence, as the
+# backend writes them (`backend/app/services/terms.py`). The compositions
+# that create a course before a challenge raise it themselves, before the
+# course (`MLArenaClient._refuse_without_terms`).
+TERMS_REQUIRED_REASON = "terms_required"
+TERMS_REQUIRED = (
+    "Accept the terms of use before you create a challenge: once per account, in the "
+    "console when you create your first challenge, or with POST /api/auth/terms/accept."
+)
 
 
 # SDK 4.0.0 (score model, D5): the six legacy score keywords of
@@ -143,10 +155,16 @@ class MLArenaClient:
                          _safe_error(resp, "Invalid or missing API credentials."))
         if resp.status_code == 403:
             body = _json_body(resp)
+            reason = body.get("reason") if body is not None else None
+            if reason == TERMS_REQUIRED_REASON:
+                # Creating a challenge before the terms of use were accepted
+                # (`services.terms`): the server's sentence, then where to
+                # read them and how this caller accepts.
+                raise _error(PermissionDeniedError, resp, self._terms_required_message(
+                    _safe_error(resp, "Access denied")))
             # Taking part in a course challenge without being enrolled in its
             # course (`challenge_access.ChallengeParticipant`).
-            cls = (EnrollmentRequiredError
-                   if body is not None and body.get("reason") == "enrollment_required"
+            cls = (EnrollmentRequiredError if reason == "enrollment_required"
                    else PermissionDeniedError)
             raise _error(cls, resp, _safe_error(resp, "Access denied"))
         if resp.status_code == 404:
@@ -159,6 +177,36 @@ class MLArenaClient:
                 raise _error(MaintenanceError, resp,
                              _safe_error(resp, "Platform under maintenance"))
         return resp
+
+    def _terms_required_message(self, sentence: str) -> str:
+        """`sentence` (the server's `terms_required` refusal), then where the
+        terms are read and how they are accepted. The SDK never accepts them
+        for the caller: `accept_terms` is theirs to call, once they have
+        read them. A GitHub Actions run cannot (the route refuses its
+        token): the account's holder does."""
+        terms_url = f"{self._base_url}/terms"
+        if self.credentials is not None and self.credentials.kind == KIND_GITHUB_ACTIONS:
+            return (f"{sentence} Read them at {terms_url} . A GitHub Actions run "
+                    "cannot accept them for the account: its holder accepts once, "
+                    "in the console or with an API key (client.accept_terms()).")
+        return (f"{sentence} Read them at {terms_url} , then call "
+                "client.accept_terms() (once per account, with an author key).")
+
+    def _refuse_without_terms(self) -> None:
+        """Raise what a route that creates a challenge answers to an account
+        that has not accepted the terms of use (`PermissionDeniedError`, 403,
+        `body["reason"] == "terms_required"`), read from `me()`.
+
+        For the compositions that create a course and then a challenge in
+        it: called first, so a refusal leaves no empty course behind. A
+        credential the platform does not know is left to the first route
+        (401)."""
+        me = self.me()
+        if me["is_authenticated"] and me["terms_accepted_at_ts"] is None:
+            raise PermissionDeniedError(
+                self._terms_required_message(TERMS_REQUIRED), status_code=403,
+                body={"error": TERMS_REQUIRED, "reason": TERMS_REQUIRED_REASON},
+            )
 
     def _request(self, method: str, url: str, **kwargs) -> requests.Response:
         """Single chokepoint for HTTP calls. Disables redirect-following by
@@ -237,14 +285,17 @@ class MLArenaClient:
         loads on every page. Keys: ``is_authenticated``, ``id``, ``username``,
         ``email``, ``avatar_key``, ``is_admin``, ``is_human_verified``,
         ``has_teacher_access`` (the teacher flag *or* admin *or* a
-        course-assistant row), ``has_creator_access``
-        (the real creator rule — the flag *or* admin *or* an assistant row
-        on a challenge), ``can_create_course``, ``max_courses_limit`` and
-        ``active_course_count`` (the limit behind it and the active, not
+        course-assistant row), ``can_create_course``, ``max_courses_limit``
+        and ``active_course_count`` (the limit behind it and the active, not
         archived, courses you own; an admin is exempt from the limit),
-        and ``github_login`` (the GitHub account
+        ``github_login`` (the GitHub account
         linked to this one, None when there is none; it is linked from the
-        console's Profile page, a browser flow). Every key is always present.
+        console's Profile page, a browser flow) and ``terms_accepted_at_ts``
+        (when the account accepted the terms of use, an ISO 8601 UTC string;
+        None = not yet, and every method that creates a challenge is refused
+        until `accept_terms`). Every key is always present. What you may do
+        on one challenge is on that challenge's payloads (``role``,
+        ``can_edit``): there is one kind of author.
 
         Note the route answers to any scope, but the *flags* describe the
         account, not the token: a ``mlk_user_…`` token on an admin account
@@ -253,7 +304,7 @@ class MLArenaClient:
         Listing or rotating API keys is deliberately **not** offered here:
         ``/api/auth/api_keys`` and ``/api/auth/api_keys/<scope>/rotate``
         answer 403 to a bearer caller, so that a leaked ``user`` key cannot
-        mint a ``creator`` one. Rotate keys from the console's Profile page.
+        mint an ``author`` one. Rotate keys from the console's Profile page.
         """
         resp = self._request("GET", self._url("/auth/current_user"),
                              headers=self._headers())
@@ -261,6 +312,37 @@ class MLArenaClient:
         if resp.status_code != 200:
             raise _failed(MLArenaError, "me", resp)
         return resp.json()
+
+    def accept_terms(self) -> dict:
+        """Accept the terms of use for your account: once, before your first
+        challenge.
+
+        Mirrors ``POST /api/auth/terms/accept`` (no body). Read the terms
+        first: ``<base_url>/terms`` (https://ml-arena.com/terms). Until an
+        account has accepted them, every method that creates a challenge is
+        refused with a `PermissionDeniedError` (403) whose
+        ``.body["reason"]`` is ``"terms_required"``: `add_course_challenge`
+        (a build and a copy), `create_challenge` (a competition),
+        `copy_module_into_course` and `duplicate_course` when a challenge
+        would be copied, and the compositions over them
+        (`create_challenge_for_class`, `use_example_challenge`,
+        `start_from_example_course`). Nothing is created then. Creating a
+        course, a module or a lesson needs no terms. Nobody is exempt, an
+        admin included, and each person accepts for themselves: a course's
+        assistant who creates a challenge in it has accepted, whether or not
+        its owner has.
+
+        Returns ``{"terms_accepted_at_ts": "2026-11-26T10:15:00Z"}``. Once
+        per account: a second call changes nothing and returns the first
+        date, the one `me()` serves under the same key. The SDK never calls
+        this for you.
+
+        Who may call it: the account's holder, with an ``author`` key. A
+        ``user`` key is refused (403), and so is the token of a GitHub
+        Actions run (403: a workflow acts for the account, accepting is its
+        holder's own act, in the console or with a key).
+        """
+        return self._json_call("POST", "/auth/terms/accept", error_label="accept_terms")
 
     # ---- GitHub: trusted repositories (any token scope) ----
     #
@@ -635,9 +717,13 @@ class MLArenaClient:
         course's bar on its score, None = no bar), all None for a
         competition; `course` is the course a course challenge belongs to
         (`{id, slug, name, visibility, single_challenge_id,
-        enrollment_state, is_enrolled, join_code}`, None for a
-        competition): what a reader who is not enrolled needs to enroll
-        (`enroll_in_course(join_code)`) while `enrollment_state` is `open`.
+        example_listed_at_ts, enrollment_state, is_enrolled, join_code}`,
+        None for a competition): what a reader who is not enrolled needs to
+        enroll (`enroll_in_course(join_code)`) while `enrollment_state` is
+        `open` (`open` | `archived` | `ended`). `single_challenge_id` is
+        this challenge's id when it is the course's only content (the course
+        is then shown as the challenge), else None; `example_listed_at_ts`
+        is when the course was listed as an example (None = not an example).
         `copied_from_challenge_id` is the challenge it was copied from (None
         when it was not); `copied_from_challenge` (`{id, name, slug}`) names
         that source when it is a public competition ("Based on the
@@ -645,10 +731,18 @@ class MLArenaClient:
 
         You on it: `role` (`"owner"`, `"assistant"` or None; an admin who is
         neither reads None), `can_edit` (you may open its workspace: its
-        staff, an admin) and `can_participate` (you may submit, deploy,
+        staff, an admin), `can_participate` (you may submit, deploy,
         chat, check an exercise or team up: on a competition any signed-in
         user who sees it, on a course challenge the course's staff and the
-        users enrolled in it; a refusal raises `EnrollmentRequiredError`).
+        users enrolled in it; a refusal raises `EnrollmentRequiredError`)
+        and `can_copy` (you may copy it into a course of yours,
+        `use_example_challenge` / `add_course_challenge(
+        copy_from_challenge_id=…)`: a started, stopped or ended challenge
+        in a published module of an example course for any signed-in user,
+        any challenge for its staff and for an admin; False without a
+        credential. Read this flag, not the course's `example_listed_at_ts`:
+        a draft of an example course is not copied. Where it is False the
+        copy methods answer 404).
 
         `kind_label` is the kind's one label (`"Python agent"` |
         `"Upload a file"` | `"Chat with an AI agent"` | `"Exercises"`).
@@ -657,14 +751,14 @@ class MLArenaClient:
         only, None for a file or chat challenge. `submission_layout` is the
         CSV a file challenge's submission must follow — `columns`,
         `separator`, `id_column`, `target_column`, `row_count` (None when
-        unknown) — read from the creator's ground truth; None for any other
+        unknown) — read from the challenge's ground truth; None for any other
         kind, a non-CSV submission file, or before a `y_test.csv` is parsed.
         `miniature` is None when the challenge has no miniature.
 
         `runtime_options` is the set of agent runtime images the challenge
         offers (ordered by id; `[]` for a file or chat challenge) and
         `default_agent_runtime_id` the one a new submission gets (None for a
-        file or chat challenge) — both written by the creator
+        file or chat challenge) — both written by the challenge's staff
         (`update_settings(agent_runtime_ids=…, default_agent_runtime_id=…)`).
         """
         # Public route, but a non-public course challenge is only visible to a
@@ -702,13 +796,26 @@ class MLArenaClient:
         `"vm"`), `node_pool` (`"autoscaling"` | `"large-autoscaling"`;
         `None` on a vm machine), `vm_health_ok`,
         `vm_health_checked_at_ts`, `gpu_device_ids`, `gpu_count`,
-        `image_pull_policy`, `job_cpu_max`, `job_memory_max`,
+        `image_pull_policy` (`"IfNotPresent"` | `"Always"` | `"Never"`),
+        `job_cpu_max`, `job_memory_max`,
         `job_timeout_max_sec` (the longest `simulation_timeout_sec` a
-        challenge on it may ask for), `max_concurrent_jobs`, `is_enabled`,
-        `created_at_ts` and `kernels`,
+        challenge on it may ask for), `max_concurrent_jobs`, the replay caps
+        of a run on it (`replay_frames_max`, `replay_video_second_max`,
+        `replay_frames_bytes_max`, `replay_video_bytes_max`,
+        `replay_image_bytes_max`), `is_enabled`,
+        `created_at_ts`, `kernels`,
         its queues (`MachineKernelOut`: `id`, `machine_id`, `kernel_version`,
         `docker_image_worker_envagent_id`, `worker_replicas`, `is_public`,
-        `is_default`, `created_at_ts`).
+        `is_default`, `created_at_ts`), `energy_profile` (the coefficients a
+        run's footprint is computed with: `id`, `valid_from_ts`,
+        `cpu_watts_per_vcpu`, `ram_watts_per_gib`, `pue`,
+        `carbon_intensity_g_per_kwh`, `source_note`; None on a machine whose
+        runs are not metered) and `rate`, what time on the machine costs
+        (`MachineRateOut`: `id`, `valid_from_ts`, `resource` — `"cpu"` |
+        `"gpu"`, the balance of the challenge's owner it is taken from,
+        `credits()` —, `credits_per_minute`, a four-decimal string like
+        every amount of credits, and `source_note`; None on a machine
+        without a rate: nothing that runs there is charged).
 
         A non-admin sees only the machines with a queue visible to them
         (public, or granted to them) and only those queues; an admin sees
@@ -760,7 +867,11 @@ class MLArenaClient:
 
         `courses`: the courses you own or assist on, archived ones included.
         A row carries `id`, `name`, `code`, `slug`, `visibility`,
-        `start_date`, `end_date`, `archived_at_ts`, `enrollment_state`
+        `start_date`, `end_date`, `archived_at_ts`, `single_challenge_id`
+        (the id of the course's only challenge when the course holds exactly
+        one module, one challenge and no lesson, else None: the course is
+        then shown as that challenge, one of `challenges` and of the
+        challenge rows above), `enrollment_state`
         (`open`, `archived` or `ended`: whether the course takes a new
         enrollment now), `join_code`, `role`, `can_edit` (you may open its
         workspace: true on every row), `owner_username`, `enrollment_count`,
@@ -787,7 +898,9 @@ class MLArenaClient:
         challenge with submissions whose deploy failed: the count and its
         split by owner), `draft_blocked` (a draft whose `start_blockers`
         include a platform conflict — `platform_conflict` true: its machine
-        or queue, its size against the machine's ceilings, its image rows;
+        or queue, its size against the machine's ceilings, its image rows,
+        its owner's limit of started challenges or exercise sets, its
+        owner's credits;
         the item's `start_blockers` are those conflicts only, the row has
         the full list; a draft that only lacks authoring raises nothing),
         `draft_unreadable` (the gate could not run: the row's
@@ -812,8 +925,8 @@ class MLArenaClient:
         The challenges you own or assist on, built from `workspace()`: each
         item is the row's challenge reference (`id`, `name`, `slug`,
         `status`, `end_date_ts`, `is_public`, `kernel_version`, `kind_label`,
-        `user_id`, `owner_username`, `role`, `can_edit`, `statistics`) plus
-        `created_at_ts`. The list route this method called
+        `user_id`, `owner_username`, `role`, `can_edit`, `can_copy`,
+        `statistics`) plus `created_at_ts`. The list route this method called
         (`GET /api/creator_challenge/challenges`) is gone, and with it
         `description`, `has_configuration`, `has_environment` and
         `machine_name` (read them from `creator_challenge(id)`). An admin
@@ -868,18 +981,34 @@ class MLArenaClient:
         applied). `config_fields()` describes every key.
 
         `start_blockers` lists every reason `start_challenge` would refuse
-        now, each `{code, message, fix_by, can_fix, place}`: `fix_by` is who
-        fixes it (`"author"`: any editor of the challenge; `"admin"`),
-        `can_fix` whether you can, and `place` the part of the challenge
-        workspace where (`files`, `benchmark`, `chat_agent`,
-        `scoring_settings` under Scoring; `advanced`, `platform` under
-        Settings; None when no part does).
-        Codes: (`env_missing`, `configuration_missing`,
+        now, each `{code, message, fix_by, can_fix, place,
+        platform_conflict}`: `fix_by` is who fixes it (`"author"`: any editor
+        of the challenge; `"admin"`), `can_fix` whether you can, `place` the
+        part of the challenge workspace where (`files`, `benchmark`,
+        `chat_agent`, `scoring_settings` under Scoring; `advanced`,
+        `platform` under Settings; None when no part does) and
+        `platform_conflict` whether it is a conflict with the platform's
+        state rather than authoring still to do (`start_challenge` answers
+        409 when the first blocker is one, 400 otherwise).
+        Codes, in the order the checks run (`StartBlockerCode`):
+        `env_missing`, `configuration_missing`,
         `image_inconsistent`, `config_not_applied`, `required_file_missing`,
         `runtime` — the size, the run timeout, the agents per run or where
         the challenge is placed —,
-        `env_invalid`, `chat_missing`, `llm_not_configured`,
-        `ground_truth_missing`, `benchmark_missing`, `benchmark_unscored`);
+        `env_invalid`, `chat_missing`, `exercise_missing` (an exercise set
+        without its row: an admin's repair), `started_sets_cap` (the owner
+        already has 15 exercise sets started, the limit: stop one),
+        `out_of_credits` (the challenge's owner has no credits left on the
+        balance its machine draws from, `credits()`: more come from an
+        admin; never while credits are not enforced),
+        `started_challenges_cap` (a course challenge that is not an
+        exercise set: its owner already has `max_started_challenges_limit`
+        of them started, 10 unless an admin changed it; "Limit of started
+        challenges reached: this challenge's owner has 10 started and may
+        have 10 (exercise sets are not counted). Stop one to start
+        another."; competitions and an admin's challenges are not limited),
+        `llm_not_configured`,
+        `ground_truth_missing`, `benchmark_missing`, `benchmark_unscored`;
         `[]` means ready, None while started, and None with
         `start_blockers_error` set (a sentence) when the challenge's files
         could not be read, it is incomplete or computing the list failed, so
@@ -887,7 +1016,7 @@ class MLArenaClient:
         is a blocker, not such a fault: an `env.py` that is not UTF-8 text is
         `env_invalid`, a `challenge.toml` that is not is `config_not_applied`.
         A `runtime` message is worded
-        for the caller: what to change (or "ask an admin") for a creator,
+        for the caller: what to change (or "ask an admin") for an author,
         the machine, its limits and the rule that failed for an admin key. `start_recommendations` lists,
         the same way, what participants would miss if it started now — advice
         `start_challenge` never checks: `description_missing` (no card
@@ -902,12 +1031,10 @@ class MLArenaClient:
         restart. `miniature` is the image route, None when none was
         uploaded.
 
-        `can_write_author_code` says whether you may change the challenge's
-        code and files (env files, bundle, scoring form, datasets, benchmark
-        files): for a file, code or chat challenge the creator entitlement,
-        until authoring opens; always true on an exercise set. Without it a
-        write is a 403 ("Changing a challenge's code and files needs creator
-        access for now. You can …"). Gate on this flag, not on the kind.
+        Whoever reads this payload may also write the challenge's code and
+        files (env files, bundle, scoring form, datasets, benchmark files),
+        whatever its kind: every member of a challenge's staff is its
+        author.
 
         Unlike `challenge()` this works on your own hidden challenges and
         shows the authoring state; `challenge()` is the participant view.
@@ -925,7 +1052,8 @@ class MLArenaClient:
         `key` (the column, `update_settings` keyword and `challenge.toml`
         key), `group` (`evaluation` | `participation` | `data_feed` |
         `resources` | `chat` | `exercise` | `partner`), `writer`
-        (`creator` | `admin`), `capability` (the `available_kinds()`
+        (`creator`: the challenge's staff; `admin`: admins only),
+        `capability` (the `available_kinds()`
         capability a kind needs for it, None = every kind),
         `fixed_capability` (the capability of the kinds that hold the key
         fixed: served read-only at the kind's value and refused on every
@@ -1015,7 +1143,7 @@ class MLArenaClient:
         "files": [{"id", "label", "download_url", "file_size_bytes", ...}]}]}``
         where each ``download_url`` is a short-lived (60 min) signed URL the
         caller can GET directly. This is how a participant pulls the training /
-        test data a creator published for a file challenge. Requires any
+        test data an author published for a file challenge. Requires any
         valid token scope.
         """
         resp = self._request("GET",
@@ -1098,7 +1226,10 @@ class MLArenaClient:
         challenge for a class is created in its course instead
         (`add_course_challenge`, or `create_challenge_for_class` for a new
         course around it); anyone else is refused here with
-        `PermissionDeniedError` (403).
+        `PermissionDeniedError` (403). Whoever may publish has accepted the
+        terms of use first, an admin included (`accept_terms`, once per
+        account): 403 with `.body["reason"] == "terms_required"` otherwise,
+        and nothing is created.
 
         Mirrors `POST /api/creator_challenge/challenge`. `kernel_version` is
         a kind: the keys `available_kinds()` serves (call it for the live
@@ -1235,7 +1366,7 @@ class MLArenaClient:
                      params: dict | None = None):
         """GET one creator_challenge sub-resource of a challenge.
 
-        Every creator read answers the same way — 404 for a challenge you
+        Every authoring read answers the same way — 404 for a challenge you
         cannot edit, the handler's own `error` otherwise — so they share one
         call site instead of fifteen copies of it.
         """
@@ -1505,7 +1636,7 @@ class MLArenaClient:
         weights, initial rating and variance) are platform constants: the
         `elo_*` keywords left in SDK 4.12.0.
 
-        Run budgets (creator keys; strictly positive; frozen while the
+        Run budgets (author keys; strictly positive; frozen while the
         challenge runs):
             simulation_timeout_sec: the wallclock of one run, in seconds, at
                 most the challenge's machine's `job_timeout_max_sec`
@@ -1553,8 +1684,8 @@ class MLArenaClient:
         ≤ limit, one job within the machine's `job_cpu_max` /
         `job_memory_max`, GPUs within its inventory) and answers 400. The
         message is worded for the caller: what to change (a smaller size, a
-        shorter run timeout, the agents per run, or "ask an admin") for a
-        creator, the machine, its limit and the rule that failed for an
+        shorter run timeout, the agents per run, or "ask an admin") for an
+        author, the machine, its limit and the rule that failed for an
         admin key; `.body["details"]` lists each reason. A refused
         `challenge.toml` adds the lines of the keys concerned:
             machine_id: a machine from `machines(kernel_version)` whose queue
@@ -1575,7 +1706,7 @@ class MLArenaClient:
             docker_image_env_runtime_id: the env runtime image, of the
                 challenge's own kernel.
 
-        Agent runtimes (creator keys, kinds with `agent_containers`;
+        Agent runtimes (author keys, kinds with `agent_containers`;
         editable while the challenge runs — an offer changes no score):
             agent_runtime_ids: the agent runtime images participants may pick,
                 the whole set (it replaces the stored one): non-empty, unique
@@ -1591,12 +1722,12 @@ class MLArenaClient:
             the set. `challenge(id)["runtime_options"]` /
             `["default_agent_runtime_id"]` serve them back.
 
-        Replay (a creator key, editable while started):
+        Replay (an author key, editable while started):
             render_delay_second: the default frame duration (s, >= 0): how
                 long a replay frame that sets no `duration_s` of its own is
                 shown. Editing it changes the playback of stored replays too.
 
-        Exercise limits (creator keys, kinds with `exercises`; editable while
+        Exercise limits (author keys, kinds with `exercises`; editable while
         the challenge runs except `memory_limit_mb`, which sizes the checker):
             time_limit_sec: the CPU time one attempt may use, 1..30 s
                 (default 5); past it the attempt fails `timeout`.
@@ -1693,7 +1824,9 @@ class MLArenaClient:
         (`env_files.py`). Accepted on a started challenge too: the delete is
         an update of the env folder (`env_update`), put in place once the
         running runs have ended, and the reply carries its state under
-        `env_update`.
+        `env_update`. On a started challenge whose owner has no compute
+        credits left it is refused like every update of its files (409,
+        `.body["reason"] == "out_of_credits"`, see `upload_env_file`).
         """
         return self._creator_delete(
             challenge_id, f"/env/files/{filename}", "delete_env_file"
@@ -1732,7 +1865,17 @@ class MLArenaClient:
         (the shape of `env_update(id)`) says whether it is in place or
         waiting for the challenge's running runs; on a started file or code
         challenge the benchmark then runs before any participant's run, and
-        a failure puts the previous files back (`wait_for_env_update`).
+        a failure puts the previous files back (`wait_for_env_update`). That
+        check is a run (or, for a chat challenge or an exercise set, a new
+        pod) the challenge's owner pays: when the owner has no compute
+        credits left on the balance the challenge's machine draws from
+        (`credits()`), an update of a started challenge's files is refused
+        with a 409 whose `.body` carries `reason: "out_of_credits"` beside
+        `error`, and nothing is written. The same refusal holds for
+        `update_env_file_content`, `delete_env_file`, `push_challenge`,
+        `import_challenge_from_github`, `set_scoring_form`,
+        `update_exercise_definition` and `revert_env`; a challenge that is
+        not started is never refused for credits.
 
         `challenge.toml` is the challenge config's file editor: it is applied
         when it is saved — validated like `update_settings`, with the same
@@ -1780,8 +1923,13 @@ class MLArenaClient:
         like `upload_env_file` does, `env.py` is checked, and a refused
         bundle raises `MLArenaError` with the server's message (its details
         on `.body`) and changes nothing. `dry_run=True` runs the same checks
-        and writes nothing. Refused once the challenge has started, as the
-        file routes are.
+        and writes nothing. Accepted on a started challenge too, as the file
+        routes are: the env files become the folder's pending update
+        (`env_update`), `challenge.toml` applies the keys a started challenge
+        still accepts and an `agent.py` that differs from the stored agent
+        template is a 400. On a started
+        challenge whose owner has no compute credits left the push is a 409
+        with `.body["reason"] == "out_of_credits"` (see `upload_env_file`).
 
         Returns the server's report: what was written, the config result,
         the `env.py` validation and the entries it ignored. From a GitHub
@@ -1844,7 +1992,8 @@ class MLArenaClient:
         JSON PUT to the same endpoint as `upload_env_file`. The backend runs
         the kernel-specific AST validator on env.py and returns a
         `validation` block in the response. `challenge.toml` is applied on
-        save, as `upload_env_file` describes.
+        save, as `upload_env_file` describes; so are the write on a started
+        challenge and its 409 `reason: "out_of_credits"`.
         """
         resp = self._request("PUT",
             self._url(
@@ -1884,7 +2033,7 @@ class MLArenaClient:
         """Download the challenge thumbnail (`miniature.png`); returns the path.
 
         Mirrors `GET /api/creator_challenge/challenge/{id}/image`
-        (`assets.py`), the creator-scoped read of the same file the public
+        (`assets.py`), the author-scoped read of the same file the public
         `/api/challenge_asset/{id}/image/miniature` serves. Raises
         `ChallengeNotFoundError` when the challenge has no image yet.
         """
@@ -1918,7 +2067,7 @@ class MLArenaClient:
 
         Mirrors `GET /api/creator_challenge/challenge/{id}/markdown`
         (`assets.py`). Returns `{"content": "..."}` — the empty string when
-        the creator has never written one.
+        none was ever written.
         """
         return self._creator_get(challenge_id, "/markdown", "challenge_markdown")
 
@@ -2025,6 +2174,16 @@ class MLArenaClient:
         empty file, or a CSV holding only the ground truth's header line.
         The call itself is fire-and-forget; poll `benchmark_status` for
         completion.
+
+        The run is the challenge's owner's to pay, whoever asks for it: a 409
+        whose `.body` carries `reason: "out_of_credits"` beside `error` when
+        the owner has no compute credits left on the balance the challenge's
+        machine draws from (`credits()`), started or not; no run is queued.
+        A 409 with `reason: "test_runs_cap"` when the owner already has 3
+        test runs queued or running, all their challenges together
+        (benchmark runs and exercise self-tests, whoever of the staff asked;
+        an admin owner is exempt): nothing is queued, wait for one to finish
+        (`benchmark_status`) and call again.
         """
         resp = self._request("POST",
             self._url(
@@ -2077,7 +2236,7 @@ class MLArenaClient:
 
     def start_challenge(self, challenge_id: int, *,
                         clean_redeploy_all: bool = False) -> dict:
-        """Move a creator challenge to ``status="started"``.
+        """Move a challenge to ``status="started"``.
 
         Mirrors `PUT /api/creator_challenge/challenge/{id}/start`. Accepted
         from ``draft``, ``stopped`` or ``ended`` (400 when already started;
@@ -2112,9 +2271,16 @@ class MLArenaClient:
         `creator_challenge(id)["start_blockers"]` lists ahead of time. A
         refusal bubbles up as MLArenaError whose message is the first
         blocker's (409 when that blocker is a `platform_conflict` — image
-        consistency, or a runtime rule measured against the machine: the
+        consistency, a runtime rule measured against the machine: the
         machine, its queue, its GPUs, a valid size or timeout above its
-        ceiling —, 400 for missing authoring, which includes a size that is
+        ceiling, the owner's limit of started exercise sets
+        (`started_sets_cap`: 15), the owner's limit of started course
+        challenges that are not exercise sets (`started_challenges_cap`:
+        `max_started_challenges_limit`, 10 by default, admins exempt; stop
+        one to start another), or an owner with no compute credits left on
+        the balance the challenge's machine draws from (`out_of_credits`:
+        the code of the blocker, in `.body["start_blockers"]`; this refusal
+        has no `reason` key) —, 400 for missing authoring, which includes a size that is
         invalid on any machine and a seat count the challenge's own settings
         refuse) and whose
         `.body["details"]` lists every blocker's message, each worded for
@@ -2139,7 +2305,7 @@ class MLArenaClient:
         return resp.json()
 
     def stop_challenge(self, challenge_id: int) -> dict:
-        """Move a started creator challenge to ``status="stopped"``.
+        """Move a started challenge to ``status="stopped"``.
 
         Mirrors `PUT /api/creator_challenge/challenge/{id}/stop`. Accepted
         only from ``started`` (400 otherwise). Stopping leaves submissions,
@@ -2164,7 +2330,7 @@ class MLArenaClient:
         return resp.json()
 
     def end_challenge(self, challenge_id: int) -> dict:
-        """Move a started creator challenge to ``status="ended"`` now.
+        """Move a started challenge to ``status="ended"`` now.
 
         Mirrors `PUT /api/creator_challenge/challenge/{id}/end`. Accepted only
         from ``started`` (400 otherwise). Submissions close, the leaderboard
@@ -2271,8 +2437,12 @@ class MLArenaClient:
         "user", "created_at_ts", "applied_at_ts", "reverted_at_ts",
         "benchmark_simulation_result_id", "benchmark_passed",
         "benchmark_failure", "is_live", "is_previous", "is_pending", …}`;
-        `transport` says what changed the folder (`file_write`,
-        `file_delete`, `form`, `bundle`, `revert`, or the GitHub ones).
+        `transport` says what changed the folder (`SourceTransport`:
+        `file_write`, `file_delete`, `form`, `bundle`, `revert`, `baseline`
+        — the files as they were when the folder's first revision was
+        recorded —, or the GitHub ones, `actions_oidc` — a GitHub Actions
+        run — and `public_fetch` — a public repository read by the
+        platform).
         Reading the state also moves a pending update forward.
         """
         return self._json_call(
@@ -2344,9 +2514,10 @@ class MLArenaClient:
         started challenge), so a second call then undoes the first. 409 when
         no previous version is kept, when it never served a started
         challenge, failed its check or is the current one, when its folder
-        is no longer what was recorded, or while an update is pending; 403
-        on an exercise set when the folder to restore holds Python checks
-        and you have no creator access. Returns the state (`env_update`).
+        is no longer what was recorded, or while an update is pending; 409
+        with `.body["reason"] == "out_of_credits"` on a started challenge whose owner has no compute
+        credits left, as every update of its files (`upload_env_file`).
+        Returns the state (`env_update`).
         """
         return self._json_call(
             "POST", f"/creator_challenge/challenge/{challenge_id}/env/revert",
@@ -2432,20 +2603,25 @@ class MLArenaClient:
     def challenge_deletion(self, challenge_id: int) -> dict:
         """What `delete_challenge` would do, without doing it — owner or admin.
 
-        Mirrors `GET /api/creator_challenge/challenge/{id}/deletion`. Returns
-        `can_delete` and what decides it: `status` (only a `draft` is
-        deleted), `submission_count` (submissions other than the benchmark),
-        `team_count`, `module_link_count` (course modules linking it),
-        `lesson_count` (lessons naming it in a directive), `runs_in_flight`
-        (a benchmark test on its way); and what goes with the challenge:
-        `env_files` (names in its env folder), `benchmark_files` (names in
-        its benchmark folder), `has_benchmark`, `run_count`
-        (every run of its environment), `exercise_count`,
-        `chat_session_count`, `deleted_datasets` (`[{id, label,
-        file_count}]`, attached to this challenge alone: deleted with their
-        stored files) and `kept_datasets` (attached to another challenge
-        too). `replay_count` replay files of those runs are not removed:
-        they expire from storage after 365 days. `storage_left` is `[]` here.
+        Mirrors `GET /api/creator_challenge/challenge/{id}/deletion`
+        (`ChallengeDeletionOut`). Returns `can_delete` and what decides it:
+        `status` (only a `draft` is deleted), `submission_count` (submissions
+        other than the benchmark and the deleted ones), `team_count`,
+        `lesson_count` and `lessons` (`[{id, title, module_id, course_id}]`,
+        in id order: the lessons, anyone's, whose text names the challenge in
+        a directive; remove its card from each first), `runs_in_flight` (runs
+        pending or running, a benchmark test on its way); and what goes with
+        the challenge: `module_deleted` (a course challenge's module is
+        deleted with it, because it then holds no lesson and no other
+        challenge; False for a competition), `env_files` (names in its env
+        folder), `benchmark_files` (names in its benchmark folder),
+        `has_benchmark`, `run_count` (every run of its environment),
+        `exercise_count`, `chat_session_count`, `deleted_datasets` (`[{id,
+        label, file_count}]`, attached to this challenge alone: deleted with
+        their stored files) and `kept_datasets` (attached to another
+        challenge too). `replay_count` replay files of those runs are not
+        removed: they expire from storage after 365 days. `storage_left` is
+        `[]` here.
         """
         return self._json_call(
             "GET", f"/creator_challenge/challenge/{challenge_id}/deletion",
@@ -2456,17 +2632,21 @@ class MLArenaClient:
         """Delete your own draft challenge — its owner or an admin.
 
         Mirrors `DELETE /api/creator_challenge/challenge/{id}`. Only a draft
-        with no submission but the benchmark, no team, no course module
-        linking it, no lesson naming it and no run on its way (409 otherwise,
-        the counts in `.body`; a challenge that ran is archived instead,
-        `archive_challenge`). Deletes its rows (configuration, environment,
-        evaluation, tags, assistants, an exercise set's exercises), its
-        benchmark submission, every run of its environment, its folder (env
-        files, overview, cover, benchmark files) and the datasets attached
-        to it alone with their stored files. Returns what
-        `challenge_deletion` announced, with `storage_left`: what could not
-        be removed from storage although the rows are gone (`[]` when all of
-        it went; check it).
+        with no submission but the benchmark, no team, no run on its way and
+        no lesson naming it in a directive. 409 otherwise, with `status`,
+        `submission_count`, `team_count`, `lesson_count`, `lessons` (the
+        lessons to remove its card from) and `runs_in_flight` in `.body`; a
+        challenge that ran is archived instead (`archive_challenge`). Deletes
+        its rows (configuration, environment, evaluation, tags, assistants, a
+        chat challenge's conversations, an exercise set's exercises and their
+        attempts), its benchmark submission, every run of its environment,
+        its folder (env files, overview, cover, benchmark files) and the
+        datasets attached to it alone with their stored files. A course
+        challenge's module is deleted with it when it then holds no lesson
+        and no other challenge (`module_deleted`). Returns what
+        `challenge_deletion` announced (`ChallengeDeletionOut`), with
+        `storage_left`: what could not be removed from storage although the
+        rows are gone (`[]` when all of it went; check it).
         """
         return self._json_call(
             "DELETE", f"/creator_challenge/challenge/{challenge_id}",
@@ -2542,8 +2722,8 @@ class MLArenaClient:
         - `env_state`: `absent`, `default` (the untouched starting template),
           `generated` (still the form's text) or `edited` (your own code).
           `can_generate` says whether `set_scoring_form` would be accepted;
-          when not, `read_only_reason` (`started`, `env_edited`,
-          `config_file`) and `read_only_message` say why.
+          when not, `read_only_reason` (`env_edited`, `config_file`) and
+          `read_only_message` say why.
         - `ground_truth`: `{filename, columns, separator,
           suggested_id_column}` of the uploaded `y_test.csv`
           (`ground_truth_filename`), None until it is uploaded.
@@ -2608,7 +2788,9 @@ class MLArenaClient:
         holds `metrics`, or for a bad name. A 409 too when other writes of
         the environment files kept landing while this one was being
         prepared (it is prepared again up to three times first): call it
-        again.
+        again; and, on a started challenge whose owner has no compute
+        credits left, the 409 of every update of its files
+        (`.body["reason"] == "out_of_credits"`, see `upload_env_file`).
         """
         body = {
             "scoring_metric": scoring_metric,
@@ -2690,11 +2872,11 @@ class MLArenaClient:
         return resp.json()
 
     def creator_datasets(self, challenge_id: int) -> dict:
-        """List a challenge's datasets + files from the creator side.
+        """List a challenge's datasets + files from the authoring side.
 
         Mirrors `GET /api/creator_challenge/challenge/{id}/datasets`
         (`datasets.py`, `get_creator_datasets`). Like `datasets()` but
-        creator-scoped (works on your own hidden challenges). Returns
+        author-scoped (works on your own hidden challenges). Returns
         `{"datasets": [{"id","label","files":[…]}]}`.
 
         Requires an `author`-scope token.
@@ -2717,8 +2899,17 @@ class MLArenaClient:
         `/api/creator_challenge/challenge/{id}/datasets/{dataset_id}/files`
         (`datasets.py`, `upload_dataset_file`); the file is stored in R2 and
         exposed to participants through `datasets()` as a signed
-        `download_url`. Rejected once the challenge is started. Returns
-        `{"id", "label", "file_size_bytes"}`.
+        `download_url`, started or not (409 on a started challenge that
+        takes no update in place). Returns `{"id", "label",
+        "file_size_bytes"}`.
+
+        Refused on the file's size before it is stored: 400 above 1 GiB a
+        file (`.body["size_bytes"]`, `["max_bytes"]`); 409 with `reason:
+        "datasets_total_cap"` when it would take the datasets of the
+        challenge's owner over 20 GiB in total, all their challenges together
+        (`.body["used_bytes"]`, `["size_bytes"]`, `["max_bytes"]`; a dataset a
+        copy shares with its source counts on the source's owner; an admin
+        owner is exempt): remove a dataset, or ask for more.
 
         Requires an `author`-scope token.
         """
@@ -2806,7 +2997,7 @@ class MLArenaClient:
             raise _failed(MLArenaError, "delete_dataset_file", resp)
         return resp.json()
 
-    # ---- Creator: runs, submissions and assistants (author scope) ----------
+    # ---- Authoring: runs, submissions and assistants (author scope) --------
 
     def creator_runs(self, challenge_id: int, offset: int = 0,
                      limit: int = 30) -> dict:
@@ -2819,7 +3010,7 @@ class MLArenaClient:
         (at most 100) the page — `creator_runs(cid, offset=30)` is the page
         after the 30 most recent. The rows are the same `RunResult` the
         submission status and the admin runs page serve, but served to the
-        creator with the environment's error, its stdout and every agent's row
+        challenge's staff with the environment's error, its stdout and every agent's row
         inline. Includes benchmark tests, deployment games and participant runs.
         """
         return self._creator_get(
@@ -2864,7 +3055,11 @@ class MLArenaClient:
         `end_date_ts`, `is_public`, `kernel_version`, `kind_label`,
         `user_id`, `owner_username`, `role` (yours on it: `"owner"`,
         `"assistant"` or None), `can_edit` (whether you may open its
-        workspace: its owner, an assistant, or an admin) and `statistics` (`unique_participants`: teams
+        workspace: its owner, an assistant, or an admin), `can_copy`
+        (whether you may copy it into a course of yours, as on
+        `challenge()`: where it is False, `add_course_challenge(
+        copy_from_challenge_id=…)` and `use_example_challenge` answer 404)
+        and `statistics` (`unique_participants`: teams
         and solo users with an `active` submission; `running_submissions`).
 
         `counters` (a submission here is neither deleted nor the benchmark):
@@ -2915,6 +3110,9 @@ class MLArenaClient:
         tab. Allowed for an `active` or `deploy_failed` submission; anything
         else is a 400 naming the status. Returns `submission_id`,
         `deleted_results`, `deployment_id` and the submission's status block.
+        The runs of a re-score are the challenge's owner's to pay: a 409
+        whose `.body` carries `reason: "out_of_credits"` beside `error` when
+        the owner has no compute credits left, and nothing is wiped.
 
         Use it after changing how a run is scored: the old results were
         produced under the old rules, and this is what makes the leaderboard
@@ -2952,7 +3150,11 @@ class MLArenaClient:
         number of submissions the call would re-score now (both lists empty),
         in any status. The real call needs a started challenge (409
         otherwise): to restart a stopped one and re-score it in one step use
-        `start_challenge(id, clean_redeploy_all=True)`.
+        `start_challenge(id, clean_redeploy_all=True)`. It is also a 409,
+        with `.body["reason"] == "out_of_credits"` beside `error`, when the
+        challenge's owner has no compute credits left (the runs of a
+        re-score are the owner's to pay): nothing is re-scored. A dry run is
+        never refused for credits.
 
         `scored_by_another_revision=True` takes only the active submissions
         whose last scored run was scored by other environment files than the
@@ -2989,7 +3191,7 @@ class MLArenaClient:
         /api/creator_challenge/challenge/{cid}/submissions/{sid}`
         (`submissions.py`). Removes the submitter's files, cancels any deploy
         attempt still open and flips the row to `deleted` — the same effect as
-        the participant's own `delete_submission()`, from the creator's side.
+        the participant's own `delete_submission()`, from the staff's side.
         Returns `submission_id` and the status block.
         """
         return self._creator_delete(
@@ -3002,7 +3204,7 @@ class MLArenaClient:
 
         Mirrors `GET /api/creator_challenge/challenge/{id}/assistants`
         (`assistants.py`). Each entry carries `user_id`, `username` and
-        `created_at_ts` (no email). An assistant has the creator's editing
+        `created_at_ts` (no email). An assistant has the owner's editing
         rights on this challenge. Every editor of the challenge (its owner,
         an assistant, an admin) may read the list; only the owner (or an
         admin) may change it. The owner is not an entry:
@@ -3015,7 +3217,7 @@ class MLArenaClient:
         )
 
     def add_challenge_assistant(self, challenge_id: int, username: str) -> dict:
-        """Grant a user the creator's rights on this challenge — owner only.
+        """Grant a user the editing rights on this challenge — owner only.
 
         Mirrors `POST /api/creator_challenge/challenge/{id}/assistants`
         (`assistants.py`). Returns `message`, `user_id` and `username`.
@@ -3115,8 +3317,8 @@ class MLArenaClient:
 
         Mirrors `POST /api/author/assistant_invitations/{token}/accept`; a key
         of any scope. Returns `challenge_id` / `course_id` (one of the two)
-        and `name`. Note that a `user` key does not reach the creator or
-        teacher routes afterwards: create a key of that scope.
+        and `name`. Note that a `user` key does not reach the authoring
+        routes afterwards: mint an `author` key.
         """
         return self._json_call(
             "POST", f"/author/assistant_invitations/{token}/accept",
@@ -3214,13 +3416,23 @@ class MLArenaClient:
         (`status == "deploy_queue"`), so no second read is needed.
 
         A refusal is a 409 raised as `SubmissionError`: the submission is not
-        in a deployable state, the daily deploy quota is used up, or the
-        participant already holds `max_active_submissions` slots. Its body,
-        on the error's `.body`, is `{"error", "deployment_limits",
+        in a deployable state (`.body` is `{"error"}`), the daily deploy
+        quota is used up, the participant already holds
+        `max_active_submissions` slots, or the challenge's owner has no
+        compute credits left. For a quota or a credits refusal the body, on
+        the error's `.body`, is `{"error", "reason", "deployment_limits",
         "active_submission_limits"}` — the same two blocks
         `submission_deploy_status()` returns, so the caller can read
         `next_deploy_available_at` or `active_submissions_remaining` off the
-        exception without another call.
+        exception without another call. `reason` is always there: None on a
+        quota refusal, which the two blocks describe, and
+        `"out_of_credits"` on a credits refusal: the owner of the challenge
+        pays for the runs a deploy queues, so the deploy waits for their
+        credits. That refusal uses none of your daily deploys, leaves the
+        submission and its files as they are and names no figure (`error`
+        is the sentence: "… your submission cannot be scored yet. It is
+        saved; deploy it again later."). `EnrollmentRequiredError` on a
+        course challenge whose course you are not enrolled in.
         """
         resp = self._request("PUT",
             self._url(
@@ -3294,7 +3506,7 @@ class MLArenaClient:
     # ---- Runner / runtime selection (DockerImageAgentRuntime) ----
 
     def agent_runtimes(self, kernel_version: str = "flex_v1"):
-        """The agent runtime images of a kernel: the catalogue a creator picks
+        """The agent runtime images of a kernel: the catalogue an author picks
         a challenge's offered set from (`update_settings(agent_runtime_ids=…,
         default_agent_runtime_id=…)`).
 
@@ -3306,7 +3518,7 @@ class MLArenaClient:
         name such as "v1kart" on one built for that family),
         as a DataFrame when pandas is installed (a list of dicts otherwise).
         A runtime synced after the challenge was created is offered only once
-        a creator adds it to the set. An unknown kernel answers 400.
+        an author adds it to the set. An unknown kernel answers 400.
 
         Requires an `author`-scope token.
         """
@@ -3322,7 +3534,7 @@ class MLArenaClient:
         """The agent runtimes (language × framework × version) this challenge offers.
 
         The challenge's own `runtime_options` (`challenge(challenge_id)`,
-        `GET /api/challenges/{id}`): the set its creator chose
+        `GET /api/challenges/{id}`): the set its staff chose
         (`update_settings(agent_runtime_ids=…)`), ordered by id — the only
         runtimes `set_agent_runtime` accepts on it. The one a new submission
         gets is `challenge(challenge_id)["default_agent_runtime_id"]`. Each
@@ -3453,7 +3665,7 @@ class MLArenaClient:
 
         Multipart PUT to the same upload endpoint as `upload_submission_file`,
         carrying the content as the `file` part. Sibling of
-        `update_env_file_content` on the creator side. The backend validates
+        `update_env_file_content` on the authoring side. The backend validates
         the resulting submission folder and returns `{status, validation_message}`.
         """
         resp = self._request("PUT",
@@ -3548,8 +3760,8 @@ class MLArenaClient:
 
         Mirrors `GET /api/submissions/submission/{sid}` (`read.py`,
         `SubmissionOut`). Readable by its owner, a member of the owner's team
-        on the challenge, the challenge's staff (admin, creator, creator
-        assistant), the owner's teacher, and anyone signed in when it is
+        on the challenge, the challenge's staff (its owner, its assistants,
+        an admin), the owner's teacher, and anyone signed in when it is
         public; a 404 (`SubmissionNotFoundError`) for everyone else.
 
         Returns `id`, `challenge_id`, `submission_name`, `created_at_ts`,
@@ -3577,7 +3789,7 @@ class MLArenaClient:
           `succeeded` | `failed` | `cancelled` —, `finished_at_ts`,
           `failure_message`, `failure_owner`, `initiated_by`), None before the
           first deploy. `initiated_by` says who started it: `participant`
-          (you, `deploy_submission`), `staff` (a creator's
+          (you, `deploy_submission`), `staff` (the challenge staff's
           `clean_redeploy_submission`) or `operator`; only `participant`
           attempts spend your daily deploy quota.
           `failure_owner` says who a `failed` attempt's verdict blames:
@@ -3715,7 +3927,7 @@ class MLArenaClient:
         `agent_error_message` and `agent_stdout_logs` are None on a row that
         is not this submission's, and for a `public` reader: they quote the
         owner's own traceback and stdout. `env_error_message` and
-        `env_stdout_logs` belong to the challenge's creator and are None
+        `env_stdout_logs` belong to the challenge's staff and are None
         here. Timestamps are ISO-8601 UTC with a `Z`.
         """
         params: dict = {"offset": offset, "limit": limit}
@@ -3964,7 +4176,7 @@ class MLArenaClient:
         `submission_id` is this submission's), then an
         `agent error[<agent_error_type>]: <agent_error_message>` line when
         your agent is why the run ended, an `env error[<env_error_type>]`
-        line when the challenge's code is (its message is the creator's, so
+        line when the challenge's code is (its message is the staff's, so
         it is not printed), and a `job error[<job_error_type>]` line when
         the platform lost a `failed` run, followed by `: <job_error_message>`
         only for the challenge's staff (the server serves the message to
@@ -4572,7 +4784,7 @@ class MLArenaClient:
         `manifest` (what the agent registered: `bot_name`, `tagline`,
         `welcome_message`, `charter_md`, `rules_public_md`, the public
         `scoring_rules`, its `tools`; None until the ChatPod is up),
-        `env_status` (the error text behind an `"error"` is creator-only:
+        `env_status` (the error text behind an `"error"` is the staff's:
         `chat_admin()`), `agent_online`, the limits
         (`max_turns_per_session`, `max_sessions_per_participant`; a None limit
         is unlimited), `participant` (your group on this challenge:
@@ -4653,8 +4865,12 @@ class MLArenaClient:
         `MLArenaError` with the server's reason when it refuses (409: the
         challenge is not started, the agent is offline or asleep — it sleeps
         after 30 idle minutes, see `wait_for_chat_agent` —,
-        `max_sessions_per_participant` is reached, or the agent is still
-        answering a message of your open session — wait for it first).
+        `max_sessions_per_participant` is reached, the agent is still
+        answering a message of your open session — wait for it first —, or
+        the challenge's owner has no compute credits left: that 409 carries
+        `.body["reason"] == "out_of_credits"` beside `error`, and no
+        conversation is opened). `EnrollmentRequiredError` when you are not
+        enrolled in the challenge's course.
         """
         return self._chat_call(
             "POST", f"/chat/challenge/{challenge_id}/sessions",
@@ -4679,15 +4895,18 @@ class MLArenaClient:
         outgrew the model's context window and was closed: open a new one —
         | `turn_timeout` | `env_error` | `agent_offline` | `platform_error`;
         always set on a failed turn, None otherwise) — and `error_message`,
-        the raw text behind it, served to the challenge's creator /
+        the raw text behind it, served to the challenge's owner,
         assistants and admins only (None for everyone else); None before the
         first message), `participant` (your group's `total_amount_eur` and
         `scoreboard`, the same keys `chat_challenge()` serves) and `can_send`
-        with `can_send_reason` (`session_voided` | `session_closed` |
-        `turn_in_flight` | `challenge_not_started` | `challenge_stopped` |
-        `challenge_ended` | `agent_offline` |
-        `turn_limit_reached`, None exactly when `can_send` is true). Readable
-        by the session's user, their teammates, the challenge's creator /
+        with `can_send_reason` (`ChatCannotSendReason`: `session_voided` |
+        `session_closed` | `turn_in_flight` | `challenge_not_started` |
+        `challenge_stopped` | `challenge_ended` | `enrollment_required` —
+        the session's owner is no longer enrolled in the challenge's course
+        — | `out_of_credits` — the challenge's owner has no compute credits
+        left: nothing more is sent until they have some — | `agent_offline`
+        | `turn_limit_reached`, None exactly when `can_send` is true). Readable
+        by the session's user, their teammates, the challenge's owner,
         assistants and admins.
 
         Cheap enough to poll — `send_chat_message(wait=True)` does.
@@ -4730,9 +4949,13 @@ class MLArenaClient:
         With `wait=False` the 202 body is returned as-is.
 
         Raises `ChatSessionNotFoundError` when the session is not yours, and
-        `MLArenaError` with the server's reason when it refuses (409: a turn
-        is already in flight on this session, the session is not `open`, or
-        `max_turns_per_session` is reached).
+        `MLArenaError` with the server's reason when it refuses (409: the
+        challenge is not started, a turn is already in flight on this
+        session, the session is not `open`, `max_turns_per_session` is
+        reached, or the challenge's owner has no compute credits left: that
+        409 carries `.body["reason"] == "out_of_credits"` beside `error`,
+        the `can_send_reason` of the session). `EnrollmentRequiredError`
+        when you are no longer enrolled in the challenge's course.
         """
         accepted = self._chat_call(
             "POST", f"/chat/sessions/{session_id}/messages",
@@ -4851,10 +5074,10 @@ class MLArenaClient:
         return ChatConversation(self, challenge_id, timeout=timeout,
                                 poll_interval=poll_interval, echo=echo)
 
-    # ---- Chat challenges: creator routes (author scope + challenge access) ---
+    # ---- Chat challenges: staff routes (author scope + challenge access) -----
 
     def chat_admin(self, challenge_id: int) -> dict:
-        """The creator view of a chat challenge — `ChatChallengeAdminView`.
+        """The staff view of a chat challenge — `ChatChallengeAdminView`.
 
         Mirrors `GET /api/chat/challenge/{cid}/admin`. Returns the
         LLM connection (`llm_base_url`, `llm_model`, `llm_api_key_set` — a
@@ -4928,7 +5151,7 @@ class MLArenaClient:
 
     def chat_sessions(self, challenge_id: int,
                       status: str | None = None) -> dict:
-        """Every session of the challenge, for the creator.
+        """Every session of the challenge, for its staff.
 
         Mirrors `GET /api/chat/challenge/{cid}/sessions`. Returns
         `{"sessions": [...]}` — each a `ChatSessionSummary` (user, team's
@@ -5020,7 +5243,7 @@ class MLArenaClient:
         public, not archived course assigns the set (an exercise is part of
         its lesson); 404 otherwise.
         Returns `challenge_id`, `env_status` (`unknown` | `loading` | `ready`
-        | `error`: the checker's load of the creator's `env.py`, self-test
+        | `error`: the checker's load of the set's `env.py`, self-test
         included), `checker_online` (the resident checker claimed work within
         the last 30 s; a set idle for 30 min sleeps and wakes on the next
         attempt, which then takes 10–20 s), `time_limit_sec`, your group's
@@ -5088,11 +5311,15 @@ class MLArenaClient:
         inactive key or a hidden challenge; `MLArenaError` with the server's
         reason on a refusal — 409 while an attempt of this exercise is still
         in flight for your group (`.body["attempt_id"]` names it), when the
-        challenge is a draft (not started) or closed (stopped or ended); 429
+        challenge is a draft (not started) or closed (stopped or ended), or
+        when the set's owner has no compute credits left (`.body["reason"]
+        == "out_of_credits"` beside `error`: the Check is paused, nothing is
+        written; an attempt already queued is still checked); 429
         over the challenge's per-minute attempt cap (`.body
         ["max_attempts_per_minute"]`, per group, last 60 s); 400 for `code`
         on a text / choice exercise, `answer` on a code one, or a `choice`
-        answer that is not one of its `choices`.
+        answer that is not one of its `choices`. `EnrollmentRequiredError`
+        when you are not enrolled in the set's course.
         """
         if (code is None) == (answer is None):
             raise MLArenaError(
@@ -5147,7 +5374,7 @@ class MLArenaClient:
         checker's own text for the challenge's staff and a fixed sentence for
         everyone else.
 
-        Readable by the attempt's group, the challenge's creator / assistants,
+        Readable by the attempt's group, the challenge's owner and assistants,
         admins and the student's teachers. Cheap enough to poll —
         `submit_exercise(wait=True)` does.
 
@@ -5166,7 +5393,7 @@ class MLArenaClient:
         Mirrors `GET /api/exercise/challenge/{cid}/attempts?user_id=&key=`.
         Returns `{"attempts": [ExerciseAttemptOut, ...]}`, the submitted
         `code` / `answer` included. A participant reads their own group's;
-        the challenge's creator / assistants, admins and the teachers of a
+        the challenge's owner and assistants, admins and the teachers of a
         course the student is enrolled in read a student's (`user_id`).
         `key` keeps one exercise's. Only the filters passed are sent.
         """
@@ -5178,7 +5405,7 @@ class MLArenaClient:
         )
 
     def exercise_admin(self, challenge_id: int) -> dict:
-        """The creator view of an exercise set — `ExerciseChallengeAdminOut`.
+        """The staff view of an exercise set — `ExerciseChallengeAdminOut`.
 
         Mirrors `GET /api/exercise/challenge/{cid}/admin`. Returns the
         checker's health (`env_status`, `env_status_message` — the load or
@@ -5191,7 +5418,7 @@ class MLArenaClient:
         `position`, `kind`, `title`, `points`, `is_active` (False once a key
         left env.py; its attempts are kept), `attempt_count`, `solved_count`.
 
-        Readable by the challenge's creator / assistants and admins; anyone
+        Readable by the challenge's owner and assistants and admins; anyone
         else gets `ChallengeNotFoundError` (404), as for a non-exercise
         challenge.
         """
@@ -5216,8 +5443,8 @@ class MLArenaClient:
           set once).
 
         `reason` is also set when the file holds no exercise or does not fit
-        the format. For whoever may edit the set, and for the owner and
-        assistants of a course that links it; `ChallengeNotFoundError` (404)
+        the format. For whoever may edit the set: its staff (the owner and
+        assistants of its course) and admins; `ChallengeNotFoundError` (404)
         otherwise. Reading it is not activity: it wakes no checker.
         """
         return self._exercise_call(
@@ -5237,10 +5464,13 @@ class MLArenaClient:
         (whether env.py calls `load_exercises("exercises.json")`, that
         literal: when False the set serves what env.py declares, the file is
         not read and the form does not write it), `write_blocked_by`
-        (None, `started` or `env_py`) and `can_write_code_exercises` (whether
-        you may write `code` exercises, whose `check` is Python the checker
-        runs: creator access, for now; `text` and `choice` exercises need
-        none).
+        (None when `update_exercise_definition` is accepted now, else
+        `env_py`: the hand-written env.py does not load the file; a started
+        set is not a block, it takes the write as an update of its files)
+        and `env_update` (the state of the env folder's update, the
+        shape of `env_update(id)`: while one is pending, `file` is the
+        pending one's). Whoever reads it writes every kind of exercise, a
+        `code` exercise's Python `check` included.
 
         Each exercise has `key`, `kind`, `title` (the prompt), `points`
         (0 = practice) and `examples`, then by kind — `code`: `starter`,
@@ -5251,7 +5481,7 @@ class MLArenaClient:
         `workers/exercise_v1/PROCESS.md` ("exercises.json").
 
         For whoever may edit the set (owner, assistants, admins), with a
-        session or a creator / teacher key; anyone else gets
+        session or an `author` key; anyone else gets
         `ChallengeNotFoundError` (404), as for a challenge of another kind.
         """
         return self._exercise_call(
@@ -5283,15 +5513,15 @@ class MLArenaClient:
                  "points": 1, "choices": ["tuple", "list"], "solution": "list"},
             ])
 
-        Raises `PermissionDeniedError` (403) when the list has a `code`
-        exercise and you have no creator access ("Exercises checked by
-        Python code need creator access for now; short-answer and
-        multiple-choice exercises do not");
+        Every kind is the set's staff's to write, a `code` exercise and its
+        Python `check` included. Raises
         `MLArenaError` (409, `.body["write_blocked_by"]`: `env_py`) when its
         hand-written env.py does not load `exercises.json`. A started set
         takes the write too, as an update of its environment files: a new
         pod loads them about a minute later and its load is their check
-        (`env_update`); `MLArenaError` (400) for a
+        (`env_update`), a pod the set's owner pays, so the write is a 409
+        with `.body["reason"] == "out_of_credits"` when the owner has no
+        compute credits left; `MLArenaError` (400) for a
         document that does not fit the format, or whose file would be larger
         than 1 000 000 bytes (`.body["size"]`).
         """
@@ -5338,9 +5568,9 @@ class MLArenaClient:
         or no result after `timeout` seconds, raises `MLArenaError` with the
         last state as `.body`. With `wait=False` the 202 body is returned.
 
-        Raises `PermissionDeniedError` (403) when the set holds Python
-        checks (a `code` exercise, a hand-written env.py) and you have no
-        creator access (the same holds for `start_challenge`); `MLArenaError`
+        The set's staff write it, self-test it and start it, with the
+        Python it holds (a set copied from an example comes with its
+        checks). Raises `MLArenaError`
         with the server's reason: 409 on a started set
         (its checker self-tests at load: stop the set to self-test an edit),
         on an ended one (restart it), and while a self-test of this set is
@@ -5348,10 +5578,16 @@ class MLArenaClient:
         minutes); the start gate's refusal, since a self-test starts a
         checker where a start would (400 for authoring still to do, such as
         an `exercises.json` that is missing, invalid or empty; 409 when the
-        set cannot run on its machine; `.body["start_blockers"]` lists them);
+        set cannot run on its machine or its owner has no compute credits
+        left, the blocker `out_of_credits`; `.body["start_blockers"]` lists
+        them);
         429 when you already have 2 self-tests pending, or the platform 4
-        (`.body["limit"]`), and, without creator access, within 60 s of your
-        previous self-test request (`.body["retry_after_sec"]`).
+        (`.body["limit"]`), and within 60 s of your previous self-test
+        request, on any set (`.body["retry_after_sec"]`; an admin is exempt
+        from that wait); 409 with `reason: "test_runs_cap"` when the set's
+        owner already has 3 test runs queued or running (benchmark runs and
+        self-tests, all their challenges together; an admin owner is
+        exempt).
         """
         state = self._exercise_call(
             "POST", f"/exercise/challenge/{challenge_id}/self-test", ok=(202,),
@@ -5540,7 +5776,7 @@ class MLArenaClient:
         Mirrors `POST /api/academic_courses/` (`academic_courses/courses.py`).
         Creating a course works with a key of either scope. Each account may
         own at most `max_courses_limit` active (not archived) courses
-        (default 3); admins are exempt. At the limit the 403 states both
+        (default 10); admins are exempt. At the limit the 403 states both
         numbers; `archive_course` or `delete_course` frees a place. Authoring
         its content (modules, lessons, challenges) takes an `author`-scope
         key from your Profile page.
@@ -5691,16 +5927,18 @@ class MLArenaClient:
         (fetch the image with `course_cover(card["id"])`),
         `example_listed_at_ts`, `single_challenge_id` and, for a course
         shown as its one challenge, `single_challenge` (the challenge's
-        reference with its `description` and `miniature`).
+        reference with its `description` and `miniature`; its `can_copy`
+        says whether you may copy it into a course of yours).
 
         `example=True` lists the example courses only, newest listing
         first: public courses an admin offers to teachers as starting
         points (the console's teacher view of the courses page, titled
         Catalog). Start from one with `start_from_example_course`, or take
         one of its challenges into a course of yours with
-        `use_example_challenge`. Every copy starts with the same data and
-        the same scoring files: change the seed or the data before you
-        start a challenge.
+        `use_example_challenge`. A copy is a challenge you create: accept
+        the terms of use once first (`accept_terms`). Every copy starts with
+        the same data and the same scoring files: change the seed or the
+        data before you start a challenge.
         """
         params: dict = {}
         if search is not None:
@@ -5742,7 +5980,11 @@ class MLArenaClient:
         its `challenge` and `metric` are None, and it carries only its
         `pass_threshold`. No field of the draft is served before its first
         Start (`my_progress` has no cell for it, `enrollment_info` does not
-        name it). A challenge has one title, its name.
+        name it). A challenge has one title, its name. Each `challenge` is
+        the challenge's reference (see `challenge_overview`); its `can_copy`
+        says whether you may copy that challenge into a course of yours
+        (`use_example_challenge`; a 404 where it is False), which is how an
+        example course offers its challenges.
 
         `as_student=True` ("View as student", `?as_student=true`) serves a
         manager of the course what an enrolled student gets: no module or
@@ -5765,8 +6007,9 @@ class MLArenaClient:
         """A course module's overview: lesson list + its challenge cards.
 
         Mirrors `GET /api/academic_courses/{slug}/modules/{module_slug}`.
-        `as_student=True`: as on `course` (a module hidden from students is
-        then a 404).
+        Each challenge card's `challenge` is the challenge's reference, with
+        `can_copy` as on `course`. `as_student=True`: as on `course` (a
+        module hidden from students is then a 404).
         """
         return self._json_call(
             "GET", f"/academic_courses/{slug}/modules/{module_slug}",
@@ -5788,7 +6031,9 @@ class MLArenaClient:
         warning of a challenge that does not exist. A `challenge` /
         `competition` directive's payload is `{challenge_id, challenge,
         description}`, `challenge` being the challenge's reference (see
-        `challenge_overview`). `as_student=True`: as on `course` (a lesson
+        `challenge_overview`; its `can_copy` says whether you may copy the
+        challenge into a course of yours, a 404 from the copy methods where
+        it is False). `as_student=True`: as on `course` (a lesson
         hidden from students is then a 404, and a block whose challenge the
         course's students do not see is left out, with its warning).
         """
@@ -5868,7 +6113,8 @@ class MLArenaClient:
         `summary`, `icon`, `is_published`, `lesson_count`,
         `challenge_count`, `content_origin`, `source_revision`, `lessons`
         and `challenges` (each `challenge_id`, `challenge`, `position`,
-        `pass_threshold`, `metric`).
+        `pass_threshold`, `metric`; `challenge` is the challenge's
+        reference, `can_copy` included: see `challenge_overview`).
         """
         return self._json_call(
             "GET", f"/teacher/modules/{module_id}", error_label="get_module",
@@ -6216,7 +6462,9 @@ class MLArenaClient:
         """List a course's modules in order, each with its `lessons` (the
         lesson summaries of `get_module`, in order, each with
         `visible_to_students`) and its `challenges` (each `challenge_id`,
-        `challenge`, `position`, `pass_threshold`, `metric`).
+        `challenge`, `position`, `pass_threshold`, `metric`; `challenge` is
+        the challenge's reference, `can_copy` included: see
+        `challenge_overview`).
 
         Mirrors `GET /api/teacher/course/{id}/modules`. A row's one id is
         `module_id`: the id `reorder_modules`, `update_course_challenge` and
@@ -6270,7 +6518,10 @@ class MLArenaClient:
         untouched. Returns the course's new module row (the
         `list_course_modules` shape). The staff of this course; 409 when a
         challenge's files are being updated at this instant, 503 when no
-        machine runs a challenge's kind (nothing is copied then).
+        machine runs a challenge's kind, 403 with `.body["reason"] ==
+        "terms_required"` when the module holds a challenge and you have not
+        accepted the terms of use (`accept_terms`; a module of lessons only
+        needs no terms). Nothing is copied then.
         """
         return self._json_call(
             "POST", f"/teacher/course/{course_id}/modules/copy",
@@ -6304,18 +6555,18 @@ class MLArenaClient:
         there or copied there, owned by the course's owner (whoever of its
         staff calls), and a draft.
 
-        - **Build**: `name` (unique in the course) and `kernel_version`
-          (a kind of `available_kinds()`; `"exercise_v1"` for an exercise
-          set). Until authoring opens to everyone, a kind other than an
-          exercise set needs the creator entitlement (403 "Building a file,
-          code or chat challenge needs creator access for now. …", which
-          names what you can do instead: an exercise set, or a copy of an
-          example's challenge).
+        - **Build**: `name` (unique in the course) and `kernel_version`,
+          any kind of `available_kinds()`: `"file_v1"`, `"flex_v1"`,
+          `"chat_v1"` or `"exercise_v1"` (an exercise set). Every member of
+          the course's staff builds every kind and writes its code and
+          files.
         - **Copy**: `copy_from_challenge_id`, a challenge you may copy: a
           started, stopped or ended challenge of an example course
           (`course_catalog(example=True)`), one you are staff of, any for an
-          admin (404 otherwise). No entitlement is needed for the copy
-          itself. It takes the source's kind, evaluation, config, env folder,
+          admin. That rule is served as `can_copy` on the challenge
+          (`challenge(id)["can_copy"]`) and on every reference to it in a
+          course, module or lesson payload; where it is false the copy is a
+          404. It takes the source's kind, evaluation, config, env folder,
           benchmark, datasets, description and tags; not its submissions,
           runs, teams, assistants or dates; the data-feed keys only from an
           example course's challenge, the chat LLM key only when you have
@@ -6336,6 +6587,15 @@ class MLArenaClient:
         machine_name}` (201). 409 when the course already has a challenge of
         that `name`, 503 when no machine runs the kind: nothing is created
         then. The course's staff (owner, assistant, admin).
+
+        A build and a copy alike need the terms of use accepted, once per
+        account (`accept_terms`): until then the call is a
+        `PermissionDeniedError` (403) with `.body["reason"] ==
+        "terms_required"`, whose message names the page of the terms and
+        `accept_terms()`; nothing is created. The caller accepts for
+        themselves: an assistant who creates a challenge has accepted,
+        whether or not the course's owner has. No limit on the drafts of a
+        course; what is limited is what is started (`start_challenge`).
 
         Before 4.23.0 this method linked an existing challenge
         (`add_course_challenge(course_id, challenge_id)`): that is gone, and
@@ -6382,8 +6642,16 @@ class MLArenaClient:
         A course holding one challenge and no lesson is shown as that
         challenge: one page for students, one workspace for you.
 
-        If the second call is refused, the course stays (empty: add a
-        challenge to it, or `delete_course` it) and the refusal is raised
+        Creating a challenge needs the terms of use accepted
+        (`accept_terms`, once per account): `me()["terms_accepted_at_ts"]`
+        is read first, and an account that has not accepted is refused
+        before the course is created, with the error the challenge route
+        gives (`PermissionDeniedError`, 403, `.body["reason"] ==
+        "terms_required"`). Nothing is created then.
+
+        If the second call is refused for another cause (a name the course
+        cannot take, no machine for the kind), the course stays (empty: add
+        a challenge to it, or `delete_course` it) and the refusal is raised
         with a message naming the course, its id in `err.body["course_id"]`
         when the server's body had none.
 
@@ -6391,6 +6659,7 @@ class MLArenaClient:
         add_course_challenge answer>}`: share `course["join_code"]` (or the
         `/enroll/<join_code>` link) with students.
         """
+        self._refuse_without_terms()
         course = self.create_course(name, end_date=end_date)
         try:
             challenge = self.add_course_challenge(
@@ -6416,14 +6685,21 @@ class MLArenaClient:
           copy_from_challenge_id=challenge_id, name=…, module_id=…)`.
         - `course_id` None: a new private course named `name` or, without
           one, after the challenge (`challenge(challenge_id)["name"]`), and
-          the copy in it, as `create_challenge_for_class` does (if the copy
-          is refused the empty course stays and the error says so).
+          the copy in it, as `create_challenge_for_class` does (the terms of
+          use are checked before the course is created; if the copy is
+          refused for another cause the empty course stays and the error
+          says so).
+
+        A copy is a challenge you create: it needs the terms of use accepted
+        (`accept_terms`; 403 `.body["reason"] == "terms_required"`
+        otherwise, and nothing is created). `challenge(challenge_id)
+        ["can_copy"]` says whether the challenge is yours to copy (404
+        where it is false).
 
         Every copy starts with the same data and the same scoring files as
         its source: change the seed or the data before you start a
-        challenge. Until authoring opens to everyone, changing the copy's
-        files needs the creator entitlement; without it, run the benchmark
-        the copy came with (`run_benchmark`) and start it as it is. A copy
+        challenge. The copy is yours to change like a challenge you built:
+        its files, its scoring, its datasets, its benchmark. A copy
         of a chat challenge has no LLM key: set yours before Start
         (`update_chat_settings`). The copy's compute is paid from your
         credits (`credits()`).
@@ -6459,6 +6735,11 @@ class MLArenaClient:
         the same scoring files as its source: change the seed or the data
         before you start a challenge. Returns the new course
         (`teacher_course` shape).
+
+        A course that holds a challenge you would copy needs the terms of
+        use accepted (`accept_terms`): the one route refuses otherwise (403,
+        `.body["reason"] == "terms_required"`) and copies nothing, so no
+        course is left behind. A course of lessons only needs no terms.
         """
         course_id = self.course(course)["id"] if isinstance(course, str) else course
         return self.duplicate_course(course_id, name)
@@ -6573,7 +6854,11 @@ class MLArenaClient:
         is neither), `can_edit` (true: you may open its workspace),
         `has_owner_rights` (whether you may do what only its owner may: the
         assistant roster, archive, delete, unlist from the examples — the
-        owner and an admin), `owner_username`, `created_at_ts`, the settings
+        owner and an admin), `may_list_as_example` (whether you may list it
+        as an example, `list_course_as_example`: the publishing right with
+        the owner's rights; that the course must be public and not archived
+        is the route's 409, not this flag), `owner_username`,
+        `created_at_ts`, the settings
         (`ask_student_identity`, `report_recipients`, `report_to_assistants`,
         `report_last_sent_at_ts`) and the counts `enrollment_count`,
         `assistant_count`, `module_count`, `challenge_count` (entries hidden
@@ -6642,8 +6927,11 @@ class MLArenaClient:
         the new course (the `teacher_course` shape). 409 when another course
         took the copy's address at the same moment (call it again), when the
         source's cover file is missing from storage or a challenge's files
-        are being updated; 503 when no machine runs a challenge's kind.
-        Nothing is copied then.
+        are being updated; 503 when no machine runs a challenge's kind; 403
+        with `.body["reason"] == "terms_required"` when the course holds a
+        challenge you would copy and you have not accepted the terms of use
+        (`accept_terms`; a course without one needs no terms). Nothing is
+        copied then, and no course is left behind.
         """
         body: dict = {}
         if name is not None:
@@ -7611,19 +7899,52 @@ def _accepts_legacy_kwargs(fn):
     return wrapper
 
 
+def _positional_only_names(method) -> tuple[str, ...]:
+    """The positional-only parameters of `method`, `self` left out."""
+    return tuple(
+        name for name, parameter in inspect.signature(method).parameters.items()
+        if parameter.kind is inspect.Parameter.POSITIONAL_ONLY and name != "self"
+    )
+
+
 def _deprecated_alias(old_name, new_name, *, drops_challenge_id=False):
+    # The old method took every parameter by position or by keyword. Where
+    # its replacement takes some by position only (`update_course_challenge
+    # (module_id, challenge_id, /, **fields)`, so that `module_id=` can be a
+    # body key), the alias keeps the old signature: it binds those names
+    # itself and hands them over by position. The old keyword spelling
+    # (`competition_id=`) was renamed before this runs (`_accepts_legacy_kwargs`).
+    positional = _positional_only_names(getattr(MLArenaClient, new_name))
+
     def alias(self, *args, **kwargs):
         warnings.warn(
             f"MLArenaClient.{old_name}() is deprecated, "
             f"use .{new_name}() instead",
             DeprecationWarning,
-            stacklevel=2,
+            # The caller's line: every alias is called through
+            # `_accepts_legacy_kwargs`, one frame above this one.
+            stacklevel=3,
         )
         if drops_challenge_id:
             if args:
                 args = args[1:]
-            else:
+            elif "challenge_id" in kwargs:
                 del kwargs["challenge_id"]
+            else:
+                raise TypeError(
+                    f"{old_name}() missing required argument: 'challenge_id'"
+                )
+        for name in positional[:len(args)]:
+            if name in kwargs:
+                raise TypeError(
+                    f"{old_name}() got multiple values for argument {name!r}"
+                )
+        for name in positional[len(args):]:
+            if name not in kwargs:
+                raise TypeError(
+                    f"{old_name}() missing required argument: {name!r}"
+                )
+            args += (kwargs.pop(name),)
         return getattr(self, new_name)(*args, **kwargs)
     alias.__name__ = old_name
     alias.__qualname__ = f"MLArenaClient.{old_name}"
@@ -7640,7 +7961,10 @@ for _old, _new in _RENAMED_METHODS.items():
         raise AttributeError(
             f"compat map is stale: MLArenaClient has no .{_new}()"
         )
-    setattr(MLArenaClient, _old, _deprecated_alias(_old, _new))
+    # Wrapped so an old keyword (`competition_id=`) is renamed before the
+    # alias binds it.
+    setattr(MLArenaClient, _old, _accepts_legacy_kwargs(
+        _deprecated_alias(_old, _new)))
 
 def _gone_alias(old_name):
     def gone(self, *args, **kwargs):

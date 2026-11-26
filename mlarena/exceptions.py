@@ -5,7 +5,37 @@ class MLArenaError(Exception):
     its HTTP status and `body` its decoded JSON object, so a caller can read
     what the server said beyond the message — a deploy refused with 409
     exposes `err.body["deployment_limits"]` / `err.body["active_submission_limits"]`,
-    the same two blocks `submission_deploy_status()` returns. Both are None
+    the same two blocks `submission_deploy_status()` returns. A refusal with
+    a cause a program may act on names it in `err.body["reason"]`, beside
+    `error` (the sentence, which is the message here):
+
+    - `"out_of_credits"` (409): the owner of the challenge has no compute
+      credits left on the balance its machine draws from. A deploy, a chat
+      conversation or message, an exercise Check, a benchmark run, a re-score
+      and an update of a started challenge's files are refused with it;
+      nothing is written, and the call succeeds again once the owner has
+      credits (`credits()`). A participant's sentence names no figure.
+    - `"test_runs_cap"` (409): the owner of the challenge already has 3
+      test runs queued or running (benchmark runs and exercise self-tests,
+      all their challenges together): `run_benchmark` and
+      `self_test_exercises` queue nothing; call again once one finished.
+    - `"datasets_total_cap"` (409): `upload_dataset_file` would take the
+      datasets of the challenge's owner over 20 GiB in total; nothing is
+      stored (`err.body["used_bytes"]`, `["size_bytes"]`, `["max_bytes"]`).
+    - `"enrollment_required"` (403): `EnrollmentRequiredError`.
+    - `"terms_required"` (403, `PermissionDeniedError`): a challenge was
+      about to be created (built or copied, in a course or as a competition;
+      a module or a course copied with a challenge in it) by an account that
+      has not accepted the terms of use. Nothing is created. The message
+      names the page of the terms and `client.accept_terms()`, which the
+      account's holder calls once, after reading them; the SDK never
+      accepts on its own. The compositions that would create a course first
+      (`create_challenge_for_class`, `use_example_challenge` into a new
+      course) raise it before they create anything.
+    - `"files_unreadable"` (503): the challenge's files could not be read;
+      nothing was changed, try again.
+
+    `status_code` and `body` are None
     when the error is not an HTTP refusal (a local validation, a timeout, a
     `submit(wait=True)` that ended `deploy_failed` — there `body` is the final
     status payload and `status_code` is None) or when the reply had no JSON
@@ -116,7 +146,7 @@ class ChatSessionNotFoundError(NotFoundError):
     """Raised when a chat session is not found, or is not yours to read.
 
     A session is readable by its user, their teammates, the challenge's
-    creator / assistants and admins; anyone else gets the same 404 as for an
+    staff (its owner and assistants) and admins; anyone else gets the same 404 as for an
     id that does not exist (see `SubmissionNotFoundError`).
     """
     pass
@@ -126,8 +156,8 @@ class ExerciseAttemptNotFoundError(NotFoundError):
     """Raised when an exercise attempt is not found, or is not yours to read.
 
     An attempt is readable by its group (the user, or their team), the
-    challenge's creator / assistants, admins and the student's teachers;
-    anyone else gets the same 404 as for an id that does not exist (see
+    challenge's staff (its owner and assistants), admins and the student's
+    teachers; anyone else gets the same 404 as for an id that does not exist (see
     `SubmissionNotFoundError`).
     """
     pass

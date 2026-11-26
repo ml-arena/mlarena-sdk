@@ -155,12 +155,12 @@ def test_workspace_takes_no_scope():
 
 
 def test_workspace_refuses_a_user_key_with_the_servers_sentence():
-    body = {"error": "Key scope 'user' cannot access this route: it takes a 'creator' or 'teacher' key"}
+    body = {"error": "Key scope 'user' cannot access this route: it takes an 'author' key"}
     c, _rec = make_client(lambda *_: (403, body), scope="user")
     try:
         c.workspace()
     except mlarena.PermissionDeniedError as e:
-        _expect("'creator' or 'teacher' key" in str(e), str(e))
+        _expect("it takes an 'author' key" in str(e), str(e))
     else:
         raise AssertionError("expected PermissionDeniedError")
 
@@ -642,16 +642,23 @@ def test_credit_usage_sends_only_what_was_given():
 
 
 def test_add_course_challenge_refusal_raises_with_the_reason():
-    reason = ("Building a file, code or chat challenge needs creator access for now. You"
-              " can build an exercise set, or start from an example: copy a challenge of an example course into yours.")
-    c, _rec = make_client(lambda *_: (403, {"error": reason}))
-    try:
-        c.add_course_challenge(7, "Maze", kernel_version="flex_v1")
-    except mlarena.PermissionDeniedError as e:
-        _expect(reason in str(e), str(e))
-        _expect(e.status_code == 403, e.status_code)
-    else:
-        raise AssertionError("expected PermissionDeniedError")
+    """Every kind is built by the course's staff; the 403 a build still
+    meets is the terms of use, not yet accepted (`test_terms.py`)."""
+    sentence = ("Accept the terms of use before you create a challenge: once per account, "
+                "in the console when you create your first challenge, or with "
+                "POST /api/auth/terms/accept.")
+    body = {"error": sentence, "reason": "terms_required"}
+    for kind in ("file_v1", "flex_v1", "chat_v1", "exercise_v1"):
+        c, rec = make_client(lambda *_: (403, body))
+        try:
+            c.add_course_challenge(7, "Maze", kernel_version=kind)
+        except mlarena.PermissionDeniedError as e:
+            _expect(sentence in str(e), str(e))
+            _expect(e.status_code == 403 and e.body == body, e.body)
+        else:
+            raise AssertionError("expected PermissionDeniedError")
+        # The kind goes out as asked: no kind is held back client-side.
+        _expect(rec.last["json"] == {"name": "Maze", "kernel_version": kind}, rec.last["json"])
 
 
 def test_a_removed_route_reads_its_410_sentence():

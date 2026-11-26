@@ -264,12 +264,14 @@ def test_a_team_403_is_a_permission_denied_error():
 # --------------------------------------------------------------------------- #
 
 
+# `CurrentUserOut` (`backend/app/auth/routes/_schemas.py`), every key.
 ME = {
     "is_authenticated": True, "id": 2, "username": "alice",
     "email": "alice@example.com", "avatar_key": None,
     "is_admin": False,
     "is_human_verified": True, "has_teacher_access": False,
-    "has_creator_access": True, "can_create_course": True,
+    "can_create_course": True, "max_courses_limit": 10, "active_course_count": 0,
+    "github_login": None, "terms_accepted_at_ts": None,
 }
 
 

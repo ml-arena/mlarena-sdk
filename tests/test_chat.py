@@ -3,7 +3,7 @@
 
 Covers, over a fake transport:
 
-* the URL / method / body of every participant and creator method
+* the URL / method / body of every participant and staff method
   (`/api/chat/*`, payload keys the backend's `extra="forbid"` schemas accept);
 * `send_chat_message(wait=True)`: pending → running → completed for *that*
   turn, the failed-turn error, the timeout;
@@ -314,7 +314,7 @@ def test_export_chat_session_rejects_an_unknown_format(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# Creator routes
+# Staff routes
 # --------------------------------------------------------------------------- #
 
 

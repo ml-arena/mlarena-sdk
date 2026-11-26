@@ -251,7 +251,7 @@ def test_submit_exercise_returns_a_failed_attempt(monkeypatch, clock):
 
 def test_submit_exercise_raises_on_an_errored_attempt_with_the_attempt_as_body(monkeypatch, clock):
     errored = _attempt(31, "error", error_type="grader_error",
-                       message="The checker failed — not your fault; the creator was told.")
+                       message="The checker failed — not your fault; the exercise set's owner was told.")
     c, _ = make_client(monkeypatch, _poll_router([_attempt(31, "running"), errored]))
     with pytest.raises(MLArenaError, match=r"attempt 31 errored \(grader_error\): The checker failed") as e:
         c.submit_exercise(42, "imc", code="x = 1")
@@ -421,12 +421,22 @@ def test_exercise_definition_routes(monkeypatch):
 
 
 def test_update_exercise_definition_refusals_carry_the_reason(monkeypatch):
-    blocked = {"error": "Cannot modify the exercises of a started set: stop it first",
-               "write_blocked_by": "started"}
+    # The one value of `ExerciseDefinitionWriteBlock`: a started set is not a
+    # block, it takes the write as an update of its files.
+    blocked = {"error": "This set's env.py is hand-written and does not call "
+                        "load_exercises(\"exercises.json\")",
+               "write_blocked_by": "env_py"}
     c, _ = make_client(monkeypatch, lambda m, p, k: (409, blocked))
     with pytest.raises(MLArenaError) as raised:
         c.update_exercise_definition(7, EXERCISES)
-    assert raised.value.status_code == 409 and raised.value.body["write_blocked_by"] == "started"
+    assert raised.value.status_code == 409 and raised.value.body["write_blocked_by"] == "env_py"
+    # At zero credits a started set's write is refused with the credits reason.
+    c, _ = make_client(monkeypatch, lambda m, p, k: (
+        409, {"error": "This account has no CPU credits left. Ask for more from Usage.",
+              "reason": "out_of_credits"}))
+    with pytest.raises(MLArenaError) as raised:
+        c.update_exercise_definition(7, EXERCISES)
+    assert raised.value.body["reason"] == "out_of_credits"
     c, _ = make_client(monkeypatch, lambda m, p, k: (404, {"error": "Not an exercise challenge"}))
     with pytest.raises(ChallengeNotFoundError):
         c.exercise_definition(7)
@@ -520,16 +530,23 @@ def test_exercise_list_reads_the_authors_listing(monkeypatch):
         c.exercise_list(7)
 
 
-def test_python_checks_without_creator_access_are_a_permission_error(monkeypatch, clock):
+def test_python_checks_are_written_by_every_author_and_a_403_is_the_guards(monkeypatch, clock):
+    """One kind of author: a `code` exercise and its Python check go out as
+    written, like a `text` one. The 403 these routes still give is their
+    guard's (here a `user` key), raised without a poll."""
     from mlarena.exceptions import PermissionDeniedError
 
-    body = {"error": "Exercises checked by Python code need creator access for now; "
-                     "short-answer and multiple-choice exercises do not",
-            "reason": "code_needs_creator_access"}
+    c, rec = make_client(monkeypatch, lambda m, p, k: (200, {"file": None}))
+    c.update_exercise_definition(7, EXERCISES)
+    assert rec.last["json"] == {"version": 1, "exercises": EXERCISES}
+    assert [exercise["kind"] for exercise in rec.last["json"]["exercises"]] == ["code", "text"]
+
+    body = {"error": "Key scope 'user' cannot access this route: it takes an 'author' key"}
     c, rec = make_client(monkeypatch, lambda m, p, k: (403, body))
     for call in (lambda: c.update_exercise_definition(7, EXERCISES), lambda: c.self_test_exercises(7)):
-        with pytest.raises(PermissionDeniedError, match="need creator access for now"):
+        with pytest.raises(PermissionDeniedError, match="it takes an 'author' key") as raised:
             call()
+        assert raised.value.body == body
     assert clock.sleeps == []
 
 

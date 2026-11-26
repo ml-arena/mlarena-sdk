@@ -1180,6 +1180,39 @@ def test_cli_course_push_refused_exits_1(fake, tmp_path, capsys):
     assert "is listed twice" in capsys.readouterr().err
 
 
+def test_cli_prints_a_terms_refusal_and_who_accepts_in_a_github_actions_run(
+        monkeypatch, tmp_path, capsys, actions):
+    """No command creates a challenge (`challenge push` and `course push`
+    write existing ones), so none meets the terms of use today. A route a
+    command calls that answers 403 `terms_required` is printed like any
+    refusal: the server's sentence, the page of the terms, and who accepts.
+    In a workflow that is the account's holder: its token cannot."""
+    _write(str(tmp_path), "course.yaml", b"course:\n  name: RL\n  slug: rl\nmodules: []\n")
+    client = mlarena.MLArenaClient(
+        token=CI_TOKEN, base_url="https://example.com",
+        credentials=ci_auth.Credentials(
+            token=CI_TOKEN, kind="github_actions", scope="author", username="alice",
+            source_revision=REVISION))
+    sentence = ("Accept the terms of use before you create a challenge: once per account, "
+                "in the console when you create your first challenge, or with "
+                "POST /api/auth/terms/accept.")
+    rec = Recorder(lambda *_: (403, {"error": sentence, "reason": "terms_required"}))
+    client._request = rec
+    monkeypatch.setattr(cli, "_connect", lambda base_url, scope, audience: client)
+
+    assert cli.main(["course", "push", str(tmp_path)]) == 1
+
+    captured = capsys.readouterr()
+    message = (f"{sentence} Read them at https://example.com/terms . A GitHub Actions run "
+               "cannot accept them for the account: its holder accepts once, in the "
+               "console or with an API key (client.accept_terms()).")
+    assert f"error: {message}" in captured.err
+    assert f"::error title=mlarena::{message}" in captured.out
+    assert message in actions.read_text()
+    # The command sent its one request and accepted nothing for the account.
+    assert [call["path"] for call in rec.calls] == ["/teacher/courses/rl/bundle"]
+
+
 def test_cli_site_url_follows_the_audience(fake, tmp_path, capsys, monkeypatch):
     # Local stack: API on :4999, console (and OIDC audience) on :3000.
     monkeypatch.setenv("MLARENA_OIDC_AUDIENCE", "http://localhost:3000")

@@ -3,7 +3,7 @@
 Covers what the challenge/submission rename changed:
 
 * every participant method hits `/api/submissions/...` with `submission_*`
-  payload keys, and the creator/public methods hit `/api/challenges`,
+  payload keys, and the authoring/public methods hit `/api/challenges`,
   `/api/creator_challenge`, `/api/challenge_tags`, `/api/leaderboard/challenge`;
 * `submit()` returns exactly `{"submission_id", "deploy"}`;
 * the old Python names (methods and keyword arguments) still work, warn, and
@@ -419,7 +419,7 @@ def test_tail_logs_emits_a_run_line_again_when_it_changes():
     are the run's, the caller's steps / reward / errors are on *their own*
     `submission_results` row — the one whose `submission_id` is theirs, not
     the first one (here an opponent's, whose failure must not be printed).
-    The env's message is the creator's (null on a participant read), so the
+    The env's message is the staff's (null on a participant read), so the
     env line has no message."""
     def poll(steps, job_status, agent_error, env_error):
         return (_sub("deploy_run", "running", is_settled=False), [
@@ -558,8 +558,10 @@ def _submit_router(is_deployable=True):
     return router
 
 
+# `DeployRefusedResponse`: `reason` is always served, null on a quota refusal.
 _DEPLOY_409 = {
     "error": "Daily deployment limit (5) reached",
+    "reason": None,
     "deployment_limits": {
         "daily_deploy_limit": 5, "daily_deploys_used": 5,
         "daily_deploys_remaining": 0,
@@ -1477,6 +1479,251 @@ def test_challenge_rename_aliases_still_work():
     assert CompetitionNotFoundError is ChallengeNotFoundError
 
 
+# Every deprecated method name, called the way it could be called in the last
+# release that defined it: each parameter by its old keyword (the signatures
+# are the ones in this repository's history). `_FILE` stands for a path on
+# disk. Beside it, the same request made through the method that replaced it.
+_FILE = object()
+
+_OLD_KEYWORD_CALLS = {
+    "competitions": (
+        {"q": "maze", "tags": ["rl"], "status": "started", "page": 2, "per_page": 5},
+        lambda c, f: c.challenges(q="maze", tags=["rl"], status="started", page=2, per_page=5),
+    ),
+    "competition": (
+        {"competition_id": 4},
+        lambda c, f: c.challenge(4),
+    ),
+    "creator_competitions": (
+        {},
+        lambda c, f: c.creator_challenges(),
+    ),
+    "create_competition": (
+        {"name": "N", "kernel_version": "file_v1", "description": "d",
+         "copy_from_competition_id": 3, "tag_names": ["rl"], "is_public": False},
+        lambda c, f: c.create_challenge("N", "file_v1", "d", 3, ["rl"], False),
+    ),
+    "set_competition_tags": (
+        {"competition_id": 4, "tag_names": ["rl"]},
+        lambda c, f: c.set_challenge_tags(4, ["rl"]),
+    ),
+    "update_competition": (
+        {"competition_id": 4, "name": "N", "description": "d", "is_public": True},
+        lambda c, f: c.update_challenge(4, name="N", description="d", is_public=True),
+    ),
+    "set_competition_image": (
+        {"competition_id": 4, "image_path": _FILE},
+        lambda c, f: c.set_challenge_image(4, f),
+    ),
+    "set_competition_markdown": (
+        {"competition_id": 4, "content": "# hi"},
+        lambda c, f: c.set_challenge_markdown(4, "# hi"),
+    ),
+    "start_competition": (
+        {"competition_id": 4},
+        lambda c, f: c.start_challenge(4),
+    ),
+    "stop_competition": (
+        {"competition_id": 4},
+        lambda c, f: c.stop_challenge(4),
+    ),
+    "update_competition_link": (
+        {"module_id": 2, "competition_id": 42, "pass_threshold": 50.0},
+        lambda c, f: c.update_course_challenge(2, 42, pass_threshold=50.0),
+    ),
+    "reorder_module_competitions": (
+        {"module_id": 2, "ordered_competition_ids": [3, 1]},
+        lambda c, f: c.reorder_module_challenges(2, [3, 1]),
+    ),
+    "create_attached_agent": (
+        {"competition_id": 4, "agent_name": "old", "copy_from_agent_id": 9},
+        lambda c, f: c.create_submission(4, "old", 9),
+    ),
+    "upload_agent_file": (
+        {"competition_id": 4, "attache_agent_id": 11, "file_path": _FILE},
+        lambda c, f: c.upload_submission_file(4, 11, f),
+    ),
+    "deploy_agent": (
+        {"competition_id": 4, "attache_agent_id": 11},
+        lambda c, f: c.deploy_submission(4, 11),
+    ),
+    "agent_deploy_status": (
+        {"competition_id": 4, "attache_agent_id": 11},
+        lambda c, f: c.submission_deploy_status(4, 11),
+    ),
+    "delete_agent": (
+        {"competition_id": 4, "attache_agent_id": 11},
+        lambda c, f: c.delete_submission(4, 11),
+    ),
+    "list_agent_files": (
+        {"competition_id": 4, "attache_agent_id": 11},
+        lambda c, f: c.list_submission_files(4, 11),
+    ),
+    "get_agent_file_content": (
+        {"competition_id": 4, "attache_agent_id": 11, "filename": "agent.py"},
+        lambda c, f: c.get_submission_file_content(4, 11, "agent.py"),
+    ),
+    "update_agent_file_content": (
+        {"competition_id": 4, "attache_agent_id": 11, "filename": "agent.py", "content": "x"},
+        lambda c, f: c.update_submission_file_content(4, 11, "agent.py", "x"),
+    ),
+    "delete_agent_file": (
+        {"competition_id": 4, "attache_agent_id": 11, "filename": "agent.py"},
+        lambda c, f: c.delete_submission_file(4, 11, "agent.py"),
+    ),
+    "agent_games": (
+        {"attache_agent_id": 11},
+        lambda c, f: c.submission_runs(11),
+    ),
+    "submission_games": (
+        {"submission_id": 11},
+        lambda c, f: c.submission_runs(11),
+    ),
+    # These three took the challenge id first; `submission()` takes the
+    # submission alone.
+    "agent_status": (
+        {"competition_id": 4, "attache_agent_id": 11},
+        lambda c, f: c.submission(11),
+    ),
+    "submission_status": (
+        {"challenge_id": 4, "submission_id": 11},
+        lambda c, f: c.submission(11),
+    ),
+    "submission_overview": (
+        {"challenge_id": 4, "submission_id": 11},
+        lambda c, f: c.submission(11),
+    ),
+}
+
+
+def _alias_router(method, path, kwargs):
+    """A reply every method above accepts."""
+    if path == "/challenge_tags/tags":
+        return 200, [{"id": 7, "name": "rl"}]
+    if method == "POST" and re.fullmatch(r"/submissions/challenge/\d+", path):
+        return 201, {"submission_id": 11}
+    return 200, {"items": [], "metadata": {}, "challenges": [], "courses": [],
+                 "content": "src", "runs": []}
+
+
+def _sent(rec):
+    """What each recorded request sent, without the transport's own keys; an
+    uploaded file by its name and its bytes, or the path it was read from
+    when it was a handle on disk (closed by now)."""
+    def content(body):
+        if hasattr(body, "getvalue"):
+            return body.getvalue()
+        return body.name if hasattr(body, "read") else body
+
+    sent = []
+    for call in rec.calls:
+        files = {
+            field: (name, content(body))
+            for field, (name, body, *_) in (call.get("files") or {}).items()
+        }
+        sent.append({
+            "method": call["method"], "path": call["path"],
+            "json": call.get("json"), "params": call.get("params"),
+            "data": call.get("data"), "files": files,
+        })
+    return sent
+
+
+def test_the_old_keyword_call_of_every_alias_is_listed():
+    assert set(_OLD_KEYWORD_CALLS) == (
+        set(client_module._RENAMED_METHODS)
+        | set(client_module._KEYED_BY_SUBMISSION_METHODS)
+    )
+    # ... and every old keyword of the compat map is passed by one of them or
+    # by a method that kept its name (tested above).
+    passed = {name for kwargs, _ in _OLD_KEYWORD_CALLS.values() for name in kwargs}
+    assert set(client_module._LEGACY_KWARGS) - passed == {
+        "agent_id",                           # status(agent_id=)
+        "max_active_agents_per_participant",  # update_settings(...)
+    }
+
+
+@pytest.mark.parametrize("old_name", sorted(_OLD_KEYWORD_CALLS))
+def test_an_alias_called_with_its_old_keywords_reaches_the_new_method(old_name, tmp_path):
+    """A frozen alias keeps accepting what its method accepted: every
+    parameter by keyword, under its old name. `update_competition_link`
+    raised a bare TypeError on such a call, its replacement taking the two
+    ids by position only."""
+    path = str(tmp_path / "agent.py")
+    with open(path, "wb") as fh:
+        fh.write(b"x = 1\n")
+    old_kwargs, new_call = _OLD_KEYWORD_CALLS[old_name]
+    old_kwargs = {key: path if value is _FILE else value for key, value in old_kwargs.items()}
+
+    c, expected = make_client(_alias_router, scope="author")
+    with warnings.catch_warnings():
+        # `creator_challenges` is itself deprecated.
+        warnings.simplefilter("ignore", DeprecationWarning)
+        new_call(c, path)
+    assert expected.calls, old_name
+
+    c, rec = make_client(_alias_router, scope="author")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        getattr(c, old_name)(**old_kwargs)
+    assert _sent(rec) == _sent(expected)
+
+    deprecations = [w for w in caught if issubclass(w.category, DeprecationWarning)]
+    assert any(f"{old_name}() is deprecated" in str(w.message) for w in deprecations)
+    # Each warning names the caller's line, where the default filter shows it.
+    assert {w.filename for w in deprecations
+            if "is deprecated, use" in str(w.message)
+            and ("= is deprecated" in str(w.message) or old_name in str(w.message))} == {__file__}
+
+
+def test_update_competition_link_keeps_its_old_signature():
+    """`(module_id, competition_id, **fields)`: both ids by position or by
+    keyword. `module_id=` is the path's module, as it always was for this
+    name (on `update_course_challenge` the keyword is the module to move to)."""
+    c, rec = make_client(lambda *_: (200, {"challenge_id": 42}), scope="author")
+    for args, kwargs in (
+        ((2, 42), {}),
+        ((2,), {"competition_id": 42}),
+        ((2,), {"challenge_id": 42}),
+        ((), {"module_id": 2, "competition_id": 42}),
+        ((), {"competition_id": 42, "module_id": 2}),
+    ):
+        _call_warns(c.update_competition_link, *args, pass_threshold=None, **kwargs)
+        assert rec.last["path"] == "/teacher/modules/2/challenges/42", (args, kwargs)
+        assert rec.last["json"] == {"pass_threshold": None}, (args, kwargs)
+
+    calls = len(rec.calls)
+    with pytest.raises(TypeError, match="multiple values for argument 'module_id'"):
+        _call_warns(c.update_competition_link, 2, 42, module_id=5)
+    with pytest.raises(TypeError, match="missing required argument: 'challenge_id'"):
+        _call_warns(c.update_competition_link, 2, pass_threshold=1.0)
+    with pytest.raises(TypeError, match="got both competition_id= and challenge_id="):
+        _call_warns(c.update_competition_link, 2, competition_id=42, challenge_id=42)
+    # A field the route no longer has is refused by the method, by name.
+    with pytest.raises(MLArenaError, match="unknown field"):
+        _call_warns(c.update_competition_link, 2, 42, label="Final")
+    assert len(rec.calls) == calls
+
+
+def test_an_alias_that_dropped_the_challenge_id_names_it_when_missing():
+    c, rec = make_client()
+    with pytest.raises(TypeError, match="missing required argument: 'challenge_id'"):
+        _call_warns(c.agent_status, attache_agent_id=11)
+    assert rec.calls == []
+
+
+def test_the_gone_aliases_raise_their_sentence_on_any_old_call():
+    c, rec = make_client(scope="author")
+    for name, kwargs in (
+        ("attach_competition", {"module_id": 2, "competition_id": 42, "label": "Final",
+                                "position": 0, "pass_threshold": 50.0}),
+        ("detach_competition", {"module_id": 2, "competition_id": 42}),
+    ):
+        with pytest.raises(MLArenaError, match="create it with `add_course_challenge`"):
+            getattr(c, name)(**kwargs)
+    assert rec.calls == []
+
+
 # --------------------------------------------------------------------------- #
 # Hard cut: the client source only speaks the new wire
 # --------------------------------------------------------------------------- #
@@ -1562,9 +1809,10 @@ def test_a_failed_deploy_status_keeps_the_servers_reason():
 
 
 def test_a_refused_deploy_carries_the_servers_limits():
-    """A deploy 409 body is `{"error", "deployment_limits",
+    """A deploy 409 body is `{"error", "reason", "deployment_limits",
     "active_submission_limits"}` — the blocks `submission_deploy_status()`
-    returns. The message is unchanged; the body is new, on the exception."""
+    returns, and a `reason` that is null on a quota refusal. The message is
+    unchanged; the body is on the exception."""
     c, _ = make_client(lambda *_: (409, _DEPLOY_409))
     try:
         c.deploy_submission(4, 11)
@@ -1575,7 +1823,26 @@ def test_a_refused_deploy_carries_the_servers_limits():
         assert exc.status_code == 409
         assert exc.body["deployment_limits"]["next_deploy_available_at"] == "2026-09-23T00:00:00+00:00"
         assert exc.body["active_submission_limits"]["max_active_submissions"] == 3
+        assert exc.body["reason"] is None
         assert isinstance(exc, mlarena.MLArenaError)
+
+
+def test_a_deploy_refused_for_credits_carries_its_reason_beside_the_limits():
+    """The challenge's owner has no compute credits left: the same 409 and
+    the same two blocks, plus `reason: "out_of_credits"`; `error` is the
+    participant's sentence (no figure)."""
+    sentence = ("This course has used its compute credits for now, so your submission "
+                "cannot be scored yet. It is saved; deploy it again later. Your teacher "
+                "has been told.")
+    body = {**_DEPLOY_409, "error": sentence, "reason": "out_of_credits"}
+    c, _ = make_client(lambda *_: (409, body))
+    with pytest.raises(SubmissionError) as raised:
+        c.deploy_submission(4, 11)
+    assert raised.value.status_code == 409
+    assert raised.value.body["reason"] == "out_of_credits"
+    assert set(raised.value.body) == {
+        "error", "reason", "deployment_limits", "active_submission_limits"}
+    assert str(raised.value) == f"deploy_submission failed: {sentence}"
 
 
 def test_every_http_refusal_carries_status_code_and_body():

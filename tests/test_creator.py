@@ -1033,17 +1033,48 @@ def test_wait_for_env_update_polls_until_in_place_settled_and_judged():
 
 
 def test_a_refused_delete_carries_the_counts():
-    body = {"error": "The challenge cannot be deleted while it has 2 submission(s).",
+    # The 409 of `DELETE …/challenge/{id}` (creator_challenge/deletion.py).
+    lesson = {"id": 31, "title": "Week 2", "module_id": 5, "course_id": 3}
+    body = {"error": "The challenge cannot be deleted while it has 2 submission(s). "
+                     "A lesson names this challenge: remove its card from lesson "
+                     "'Week 2' first.",
             "status": "draft", "submission_count": 2, "team_count": 0,
-            "module_link_count": 0, "runs_in_flight": 0}
+            "lesson_count": 1, "lessons": [lesson], "runs_in_flight": 0}
     c, _rec = make_client(lambda *_: (409, body))
     try:
         c.delete_challenge(7)
     except MLArenaError as exc:
         _expect(exc.status_code == 409, exc.status_code)
         _expect(exc.body["submission_count"] == 2, exc.body)
+        _expect(exc.body["lessons"] == [lesson], exc.body)
+        _expect("remove its card" in str(exc), str(exc))
     else:
         raise AssertionError("delete_challenge did not raise on a 409")
+
+
+def test_a_credits_refusal_carries_its_reason():
+    """Every 409 at zero credits has `reason: "out_of_credits"` beside
+    `error` (services/credit_refusals.py); the exception's `.body` is the
+    reply, so a caller tells it from the method's other 409s."""
+    sentence = "The owner of this challenge has no CPU credits left. They can ask for more from Usage."
+    c, _rec = make_client(lambda *_: (409, {"error": sentence, "reason": "out_of_credits"}))
+    for call in (
+        lambda: c.run_benchmark(7),
+        lambda: c.clean_redeploy_submission(7, 11),
+        lambda: c.clean_redeploy_all(7),
+        lambda: c.update_env_file_content(7, "env.py", "x = 1\n"),
+        lambda: c.delete_env_file(7, "data.csv"),
+        lambda: c.revert_env(7),
+        lambda: c.set_scoring_form(7, "rmse", "price", "house_id"),
+    ):
+        try:
+            call()
+        except MLArenaError as exc:
+            _expect(exc.status_code == 409, exc.status_code)
+            _expect(exc.body["reason"] == "out_of_credits", exc.body)
+            _expect(sentence in str(exc), str(exc))
+        else:
+            raise AssertionError("a 409 must raise")
 
 
 def _run_all():
