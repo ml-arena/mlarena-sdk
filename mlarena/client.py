@@ -2851,9 +2851,9 @@ class MLArenaClient:
         Mirrors `POST /api/creator_challenge/challenge/{id}/datasets`
         (`datasets.py`, `create_creator_dataset`). Returns
         `{"id", "label", "description"}`; use the returned `id` with
-        `upload_dataset_file`. The backend rejects this once
-        the challenge is started, so call it before `start_challenge`.
-        Files uploaded here are served to participants via `datasets()`.
+        `upload_dataset_file`. Accepted on a started challenge too, except
+        one that takes no update in place (409: a started challenge on a
+        `vm` machine). Files uploaded here are served to participants via `datasets()`.
 
         Requires an `author`-scope token.
         """
@@ -2901,7 +2901,8 @@ class MLArenaClient:
         exposed to participants through `datasets()` as a signed
         `download_url`, started or not (409 on a started challenge that
         takes no update in place). Returns `{"id", "label",
-        "file_size_bytes"}`.
+        "file_size_bytes"}`. A file uploaded under a name the dataset
+        already holds replaces that file (same `id`, new size).
 
         Refused on the file's size before it is stored: 400 above 1 GiB a
         file (`.body["size_bytes"]`, `["max_bytes"]`); 409 with `reason:
