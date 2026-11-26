@@ -56,6 +56,7 @@ The SDK and the React console are peers over one REST surface; every user-facing
 | `submission`, `update_submission` (`rename_submission`, `set_submission_visibility`), `submission_runs`, `submission_deploys`; `agent_runtime` reads `submission()["agent_runtime"]` | `GET` / `PATCH /api/submissions/submission/{sid}`, `GET …/{sid}/runs`, `GET …/{sid}/deploys` | `submissionsApi.ts` |
 | `leaderboard` | `/api/leaderboard/challenge/{id}` | `leaderboardApi.ts` |
 | `global_ranking`, `user_global_rank` | `/api/ranking/`, `/api/ranking/user/{id}` | `leaderboardApi.ts` |
+| `user_profile` | `GET /api/users/{username}` | `usersApi.ts` |
 | `chat_challenge` (+ `wait_for_chat_agent`, a client-side poll of it), `open_chat_session`, `chat_session`, `send_chat_message`, `close_chat_session`, `export_chat_session` (user); `chat_admin`, `update_chat_settings`, `chat_sessions`, `void_chat_session`, `unvoid_chat_session`, `export_chat_evidence` (the challenge's staff) | `/api/chat/*` | `chatApi.ts` |
 | `exercise_challenge`, `submit_exercise`, `exercise_attempt`, `exercise_attempts` (user); `exercise_admin` (the set's staff) | `/api/exercise/*` | `exerciseApi.ts` |
 | `exercise_definition`, `update_exercise_definition` (the set's `exercises.json` as data), `exercise_self_test`, `self_test_exercises` (+ a client-side poll of the state) (the set's staff, an author key) | `GET` / `PUT /api/exercise/challenge/{cid}/definition`, `POST` / `GET /api/exercise/challenge/{cid}/self-test` | `exerciseApi.ts` |

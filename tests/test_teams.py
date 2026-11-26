@@ -13,7 +13,9 @@ import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import mlarena
-from mlarena.exceptions import MLArenaError, PermissionDeniedError
+import pytest
+
+from mlarena.exceptions import MLArenaError, NotFoundError, PermissionDeniedError
 
 
 _NO_BODY = object()
@@ -327,6 +329,20 @@ def test_user_global_rank_is_flat():
     c, rec = make_client(lambda *_: (200, flat))
     assert c.user_global_rank(2) == flat
     assert rec.last["path"] == "/ranking/user/2"
+
+
+def test_user_profile_reads_the_public_profile_by_name():
+    profile = {"user_id": 2, "username": "Jo Jo", "organized_challenges": [],
+               "taught_courses": []}
+    c, rec = make_client(lambda *_: (200, profile))
+    assert c.user_profile("Jo Jo") == profile
+    assert rec.last["path"] == "/users/Jo%20Jo"
+
+
+def test_user_profile_of_an_unknown_name_is_not_found():
+    c, _ = make_client(lambda *_: (404, {"error": "User not found"}))
+    with pytest.raises(NotFoundError):
+        c.user_profile("nobody")
 
 
 # --------------------------------------------------------------------------- #

@@ -322,7 +322,7 @@ class MLArenaClient:
         account has accepted them, every method that creates a challenge is
         refused with a `PermissionDeniedError` (403) whose
         ``.body["reason"]`` is ``"terms_required"``: `add_course_challenge`
-        (a build and a copy), `create_challenge` (a competition),
+        (a build and a copy), `create_challenge` (a challenge with no course),
         `copy_module_into_course` and `duplicate_course` when a challenge
         would be copied, and the compositions over them
         (`create_challenge_for_class`, `use_example_challenge`,
@@ -629,13 +629,13 @@ class MLArenaClient:
         page: int | None = None,
         per_page: int | None = None,
     ):
-        """List the competitions: the challenges with no course. Public; no
+        """List the challenges with no course. Public; no
         auth required.
 
         A challenge of a course is never listed here: it is reached from its
         course (`list_courses`, `course(slug)`, `workspace()` for its staff).
-        Anonymous callers get the public competitions; a signed-in caller also
-        gets the competitions they own or assist on.
+        Anonymous callers get the public ones; a signed-in caller also
+        gets the ones they own or assist on.
 
         With no args, returns all matching challenges as a DataFrame
         (auto-paginates internally). Pass ``page``/``per_page`` to fetch a
@@ -715,10 +715,10 @@ class MLArenaClient:
 
         Where it sits: `course_id`, `module_id` and `pass_threshold` (the
         course's bar on its score, None = no bar), all None for a
-        competition; `course` is the course a course challenge belongs to
+        challenge with no course; `course` is the course a course challenge belongs to
         (`{id, slug, name, visibility, single_challenge_id,
         example_listed_at_ts, enrollment_state, is_enrolled, join_code}`,
-        None for a competition): what a reader who is not enrolled needs to
+        None for a challenge with no course): what a reader who is not enrolled needs to
         enroll (`enroll_in_course(join_code)`) while `enrollment_state` is
         `open` (`open` | `archived` | `ended`). `single_challenge_id` is
         this challenge's id when it is the course's only content (the course
@@ -726,13 +726,13 @@ class MLArenaClient:
         is when the course was listed as an example (None = not an example).
         `copied_from_challenge_id` is the challenge it was copied from (None
         when it was not); `copied_from_challenge` (`{id, name, slug}`) names
-        that source when it is a public competition ("Based on the
-        competition X"), None otherwise.
+        that source when it is a public challenge with no course ("Based on
+        the challenge X"), None otherwise.
 
         You on it: `role` (`"owner"`, `"assistant"` or None; an admin who is
         neither reads None), `can_edit` (you may open its workspace: its
         staff, an admin), `can_participate` (you may submit, deploy,
-        chat, check an exercise or team up: on a competition any signed-in
+        chat, check an exercise or team up: on a challenge with no course any signed-in
         user who sees it, on a course challenge the course's staff and the
         users enrolled in it; a refusal raises `EnrollmentRequiredError`)
         and `can_copy` (you may copy it into a course of yours,
@@ -1006,7 +1006,7 @@ class MLArenaClient:
         of them started, 10 unless an admin changed it; "Limit of started
         challenges reached: this challenge's owner has 10 started and may
         have 10 (exercise sets are not counted). Stop one to start
-        another."; competitions and an admin's challenges are not limited),
+        another."; challenges with no course and an admin's are not limited),
         `llm_not_configured`,
         `ground_truth_missing`, `benchmark_missing`, `benchmark_unscored`;
         `[]` means ready, None while started, and None with
@@ -1217,10 +1217,10 @@ class MLArenaClient:
                          copy_from_challenge_id: int | None = None,
                          tag_names: list[str] | None = None,
                          is_public: bool | None = None) -> dict:
-        """Create a competition: a challenge with no course (author scope,
+        """Create a challenge with no course, for everyone (author scope,
         and the publishing right: an admin, for now).
 
-        A competition is open to every signed-in user and awards medals and
+        It is open to every signed-in user and awards medals and
         ranking points by default (`is_award_points`, `update_challenge`).
         It is the platform's: a sponsored challenge or a hard benchmark. A
         challenge for a class is created in its course instead
@@ -1262,7 +1262,7 @@ class MLArenaClient:
         `MLArenaError` (fail fast — the catalog is admin-curated; new tags
         are not auto-created).
 
-        A new competition is private unless `is_public=True` is passed:
+        A new challenge with no course is private unless `is_public=True` is passed:
         hidden from listings and direct URLs, seen by its owner, its
         assistants and admins only. `update_challenge(is_public=...)`
         changes it later.
@@ -1270,7 +1270,7 @@ class MLArenaClient:
         if copy_from_challenge_id is None and (name is None or kernel_version is None):
             raise TypeError(
                 "create_challenge needs name and kernel_version for a new "
-                "competition (or copy_from_challenge_id for a copy)"
+                "challenge with no course (or copy_from_challenge_id for a copy)"
             )
         body: dict = {}
         if name is not None:
@@ -1430,14 +1430,14 @@ class MLArenaClient:
         the links and course material already pointing at it.
         ``description`` stays editable while it runs.
 
-        ``is_public`` and ``is_award_points`` are a competition's (a
-        challenge with no course): a course challenge is seen by whoever
+        ``is_public`` and ``is_award_points`` are a challenge's with no
+        course: a course challenge is seen by whoever
         reads its course and never awards points, so ``True`` on one is a
         400. Changing either needs the owner's rights (403 for an
-        assistant), and making a competition public needs the publishing
+        assistant), and making such a challenge public needs the publishing
         right as well (an admin, for now); ``is_public=False`` is always the
-        owner's to set, so an owner can withdraw their competition. A
-        private competition is seen by its owner, its assistants and admins.
+        owner's to set, so an owner can withdraw their challenge. A
+        private one is seen by its owner, its assistants and admins.
 
         ``end_date_ts`` schedules the end: an ISO-8601 instant in the future
         (``"2026-12-01T18:00:00Z"``; an offset is converted to UTC, a bare
@@ -2244,8 +2244,8 @@ class MLArenaClient:
         Returns `{"message", "clean_redeploy"}`.
 
         Any of the challenge's staff starts it (a course challenge's: the
-        course's owner and assistants). A competition that is public is
-        started only by an admin (the publishing right); a stopped one too.
+        course's owner and assistants). A public challenge with no course
+        is started only by an admin (the publishing right); a stopped one too.
 
         `clean_redeploy_all=True` restarts a stopped or ended challenge and
         re-scores every eligible submission in one transaction (the last step
@@ -2613,7 +2613,7 @@ class MLArenaClient:
         pending or running, a benchmark test on its way); and what goes with
         the challenge: `module_deleted` (a course challenge's module is
         deleted with it, because it then holds no lesson and no other
-        challenge; False for a competition), `env_files` (names in its env
+        challenge; False for a challenge with no course), `env_files` (names in its env
         folder), `benchmark_files` (names in its benchmark folder),
         `has_benchmark`, `run_count` (every run of its environment),
         `exercise_count`, `chat_session_count`, `deleted_datasets` (`[{id,
@@ -3209,7 +3209,7 @@ class MLArenaClient:
         rights on this challenge. Every editor of the challenge (its owner,
         an assistant, an admin) may read the list; only the owner (or an
         admin) may change it. The owner is not an entry:
-        `creator_challenge(id)["owner_username"]` names them. A competition's
+        `creator_challenge(id)["owner_username"]` names them. A challenge with no course
         only: a course challenge's staff are its course's (`course_assistants`),
         and this read, like the add, answers 400 on one.
         """
@@ -4567,7 +4567,7 @@ class MLArenaClient:
           Its rows carry ``passed`` (tri-state: None while the row has no
           ranked value, or when the course sets no bar) and the envelope a
           ``course_context`` block (`course_id`, `pass_threshold`,
-          `names_withheld`); a competition's board has neither. Names go to
+          `names_withheld`); a board with no course has neither. Names go to
           the course's members only: unless you are enrolled in the course,
           own it, assist it or are an admin,
           ``course_context["names_withheld"]`` is True and every row comes
@@ -4678,20 +4678,20 @@ class MLArenaClient:
         return rows
 
     def global_ranking(self, search: str | None = None, page: int = 1, per_page: int = 100):
-        """Global user ranking across all competitions (points + medals).
+        """Global user ranking across all challenges (points + medals).
 
         How medals and points are awarded (the /ranking page's text, word for
         word):
 
-        Every hour, each competition that awards points ranks its
+        Every hour, each challenge that awards points ranks its
         participants (a team, or a user on their own) by their best
         submission on its leaderboard. Ranks 1, 2 and 3 earn a gold,
         silver and bronze medal. Every rank earns 100,000 × rank^-0.75 ×
         log10(1 + log10(N)) ÷ √(team size) points, where N is the number
         of ranked participants; each team member gets the team's medal
-        and points. When a competition stops or ends, its last standings
+        and points. When a challenge stops or ends, its last standings
         stay. A course's challenges award no points. Your total is the
-        sum of your points over all competitions.
+        sum of your points over all challenges.
 
         Mirrors `GET /api/ranking/` (`ranking.py`). Returns a DataFrame of the
         requested page (default: top 100) with the server's own column names:
@@ -4747,6 +4747,28 @@ class MLArenaClient:
         self._handle_response(resp)
         if resp.status_code != 200:
             raise _failed(MLArenaError, "user_global_rank", resp)
+        return resp.json()
+
+    def user_profile(self, username: str) -> dict:
+        """A user's public profile, as anyone may read it.
+
+        Mirrors `GET /api/users/{username}` (`users/profile.py`, public: works
+        with or without a key; the lists are what the caller may see). The
+        name is matched whatever its case. Returns `user_id`, `username`,
+        `avatar_key`, `bio`, `personal_website`, `created_at_ts`, `ranking`
+        (`user_global_rank()`'s dict), `organized_challenges` (the started
+        or ended competitions they own, as `challenges()` rows: running
+        first, then the most recently ended) and `taught_courses` (the courses
+        they own that the course catalog lists, as `course_catalog()` cards).
+        Never the email, the student identity or the linked GitHub account.
+
+        A 404 — a name no active account holds — raises `NotFoundError`.
+        """
+        resp = self._request("GET", self._url(f"/users/{quote(username, safe='')}"),
+                             headers=self._headers(), timeout=30)
+        self._handle_response(resp, not_found=NotFoundError)
+        if resp.status_code != 200:
+            raise _failed(MLArenaError, "user_profile", resp)
         return resp.json()
 
     # ---- Chat challenges (`chat_v1`): one shared JSON-call helper -----------
@@ -5749,7 +5771,7 @@ class MLArenaClient:
         largest amount first, keyed by `group_by` (`course_id` +
         `course_name`; `challenge_id`, `challenge_name`, `course_id`,
         `course_name`; or `kind`) with their `amount` and `seconds`. A null
-        id groups what belongs to no course (competitions) or to a deleted
+        id groups what belongs to no course or to a deleted
         challenge or course. Writes nothing.
         """
         params: dict = {"resource": resource, "group_by": group_by}
@@ -7333,7 +7355,7 @@ class MLArenaClient:
         The manifest is declarative for what it lists: a key left out takes
         its default, except in the `course` block. A `challenges` entry
         places a challenge of this course in its module, in the manifest's
-        order (a challenge of another course, or a competition, is refused:
+        order (a challenge of another course, or one with no course, is refused:
         a challenge belongs to one course and is created there, with
         `add_course_challenge`); a challenge no entry names is left where it
         is, and `challenges: []` is the same as leaving the key out. A

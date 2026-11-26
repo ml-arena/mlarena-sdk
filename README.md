@@ -19,7 +19,7 @@ import mlarena
 # starting with `mlk_`. Every call sends it, the public reads included.
 client = mlarena.connect(api_key="mlk_user_…")
 
-client.challenges()                               # the started competitions
+client.challenges()                               # the started challenges (no course)
 ch = client.challenge_by_slug("lunar-lander-v3")  # https://ml-arena.com/challenges/<slug>
 print(ch["agent_template"])                       # the contract your agent.py follows
 
@@ -59,6 +59,24 @@ client.leaderboard(ch["id"])                      # a DataFrame with pandas
   instance), the files against `max_upload_files` and `max_upload_size_bytes`.
   An error once the submission exists (a refused upload, a deploy over your
   daily quota) carries `err.submission_id` and says how to deploy or delete it.
+
+## 4.24.0 — public profiles; who runs a challenge or a course
+
+Requires a platform at or after the backend change of 2026-11-26 (no
+migration). Additive.
+
+- **`user_profile(username)`** reads a user's public profile
+  (`GET /api/users/{username}`, with or without a key): `avatar_key`, `bio`,
+  `personal_website`, `created_at_ts`, `ranking` (as `user_global_rank()`),
+  `organized_challenges` (the challenges with no course they own, as
+  `challenges()` rows) and `taught_courses` (as
+  `course_catalog()` cards). A name no active account holds raises
+  `NotFoundError`.
+- **`challenge(id)` names its owner**: `owner_username` and
+  `owner_avatar_key` beside `user_id`, the organizer of a challenge with no
+  course or the teacher of a course challenge. `user_id` is never None.
+- **`course(slug)` names its teacher**: `owner_username` and
+  `owner_avatar_key`, the course's owner.
 
 ## 4.23.0 — a challenge belongs to its course; one kind of author; terms of use, competitions, examples, credits
 
