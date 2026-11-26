@@ -76,7 +76,7 @@ class Recorder:
         return self.calls[-1]
 
 
-def make_client(router=None, scope="teacher"):
+def make_client(router=None, scope="author"):
     client = mlarena.connect(
         api_key=f"mlk_{scope}_abcd1234_deadbeef0000",
         base_url="https://example.com",
@@ -96,42 +96,44 @@ def _expect(cond, msg):
 # --------------------------------------------------------------------------- #
 
 
-def test_create_module_body_and_auth():
-    c, rec = make_client(lambda *_: (201, {"id": 1}))
-    c.create_module("NLP", summary="intro", visibility="public")
-    _expect(rec.last["method"] == "POST", rec.last["method"])
-    _expect(rec.last["path"] == "/teacher/modules", rec.last["path"])
-    # `is_published` (the student gate) rides in every create body, default
-    # True, so an existing course dir publishes unchanged.
-    _expect(rec.last["json"] == {"title": "NLP", "visibility": "public",
-                                 "is_published": True, "summary": "intro"},
-            rec.last["json"])
+def test_the_module_library_methods_are_gone():
+    """4.23.0: a module is a section of one course. The library routes
+    answer 410, and their methods are removed in the same minor."""
+    c, rec = make_client()
+    for name in ("create_module", "list_modules", "fork_module", "link_module",
+                 "unlink_module", "attach_challenge", "detach_challenge",
+                 "update_challenge_link", "remove_course_challenge",
+                 "add_course_exercise_set", "challenges_for_course",
+                 "copyable_challenges", "challenge_courses",
+                 "use_challenge_with_class"):
+        _expect(not hasattr(c, name), name)
+    _expect(rec.calls == [], rec.calls)
+
+
+def test_create_course_module_is_the_module_create():
+    c, rec = make_client(lambda *_: (201, {"module_id": 4}))
+    c.create_course_module(7, "NLP", summary="intro")
+    _expect((rec.last["method"], rec.last["path"]) ==
+            ("POST", "/teacher/course/7/modules/create"), rec.last)
+    _expect(rec.last["json"] == {"title": "NLP", "summary": "intro"}, rec.last["json"])
     auth = rec.last["headers"]["Authorization"]
-    _expect(auth.startswith("Bearer mlk_teacher_"), auth)
-
-
-def test_list_modules_library_param():
-    c, rec = make_client(lambda *_: (200, []))
-    c.list_modules(library="public")
-    _expect(rec.last["path"] == "/teacher/modules", rec.last["path"])
-    _expect(rec.last["params"] == {"library": "public"}, rec.last["params"])
-
-    c.list_modules()
-    _expect(rec.last["params"] is None, rec.last["params"])
+    _expect(auth.startswith("Bearer mlk_author_"), auth)
 
 
 def test_update_module_partial_and_unknown_field():
     c, rec = make_client(lambda *_: (200, {"id": 2}))
-    c.update_module(2, visibility="unlisted")
+    c.update_module(2, is_published=False)
     _expect(rec.last["method"] == "PUT", rec.last["method"])
     _expect(rec.last["path"] == "/teacher/modules/2", rec.last["path"])
-    _expect(rec.last["json"] == {"visibility": "unlisted"}, rec.last["json"])
+    _expect(rec.last["json"] == {"is_published": False}, rec.last["json"])
 
-    try:
-        c.update_module(2, bogus="x")
-        raise AssertionError("expected MLArenaError on unknown field")
-    except MLArenaError:
-        pass
+    # A module has no visibility of its own any more: refused before any call.
+    for bad in ({"bogus": "x"}, {"visibility": "public"}):
+        try:
+            c.update_module(2, **bad)
+            raise AssertionError(f"expected MLArenaError on {bad}")
+        except MLArenaError:
+            pass
 
     try:
         c.update_module(2)
@@ -140,35 +142,80 @@ def test_update_module_partial_and_unknown_field():
         pass
 
 
-def test_delete_module_force_flag():
+def test_delete_module_takes_no_force():
     c, rec = make_client(lambda *_: (200, {"message": "ok"}))
-    c.delete_module(3, force=True)
+    c.delete_module(3)
     _expect(rec.last["method"] == "DELETE", rec.last["method"])
     _expect(rec.last["path"] == "/teacher/modules/3", rec.last["path"])
-    _expect(rec.last["params"] == {"force": "1"}, rec.last["params"])
-
-    c.delete_module(3)
     _expect(rec.last["params"] is None, rec.last["params"])
+    try:
+        c.delete_module(3, force=True)
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("force= is gone")
 
 
-def test_attach_challenge_body():
-    c, rec = make_client(lambda *_: (201, {"id": 9}))
-    c.attach_challenge(2, 42, label="CartPole")
-    _expect(rec.last["path"] == "/teacher/modules/2/challenges", rec.last["path"])
-    _expect(rec.last["json"] == {"challenge_id": 42, "label": "CartPole"},
-            rec.last["json"])
+def test_a_module_that_holds_a_challenge_is_not_deleted():
+    c, _ = make_client(lambda *_: (409, {
+        "error": "This module holds 1 challenge(s): delete them or move them to "
+                 "another module first", "challenge_count": 1}))
+    try:
+        c.delete_module(3)
+    except MLArenaError as err:
+        _expect(err.status_code == 409 and err.body["challenge_count"] == 1, err.body)
+        _expect("move them to another module" in str(err), str(err))
+    else:
+        raise AssertionError("a 409 must raise")
 
 
-def test_update_and_detach_challenge_link_paths():
-    c, rec = make_client(lambda *_: (200, {"ok": True}))
-    c.update_challenge_link(2, 42, pass_threshold=None)
+def test_update_course_challenge_sets_the_bar_and_moves_it():
+    c, rec = make_client(lambda *_: (200, {"challenge_id": 42}))
+    c.update_course_challenge(2, 42, pass_threshold=None)
     _expect(rec.last["method"] == "PUT", rec.last["method"])
     _expect(rec.last["path"] == "/teacher/modules/2/challenges/42", rec.last["path"])
     _expect(rec.last["json"] == {"pass_threshold": None}, rec.last["json"])
 
-    c.detach_challenge(2, 42)
-    _expect(rec.last["method"] == "DELETE", rec.last["method"])
+    # `module_id` is the body key (the module it moves to); the path's module
+    # is the one it is in now.
+    c.update_course_challenge(2, 42, module_id=5, pass_threshold=70.0)
     _expect(rec.last["path"] == "/teacher/modules/2/challenges/42", rec.last["path"])
+    _expect(rec.last["json"] == {"module_id": 5, "pass_threshold": 70.0}, rec.last["json"])
+
+    for bad in ({}, {"label": "x"}):
+        try:
+            c.update_course_challenge(2, 42, **bad)
+            raise AssertionError(f"expected MLArenaError on {bad}")
+        except MLArenaError:
+            pass
+
+
+def test_the_frozen_competition_aliases():
+    """`update_competition_link` points at the surviving update route;
+    `attach_competition` / `detach_competition` raise the sentence."""
+    c, rec = make_client(lambda *_: (200, {"challenge_id": 42}))
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        c.update_competition_link(2, 42, pass_threshold=50.0)
+    _expect(any(issubclass(w.category, DeprecationWarning) for w in caught), caught)
+    _expect(rec.last["path"] == "/teacher/modules/2/challenges/42", rec.last["path"])
+    _expect(rec.last["json"] == {"pass_threshold": 50.0}, rec.last["json"])
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        c.reorder_module_competitions(2, [3, 1])
+    _expect(rec.last["path"] == "/teacher/modules/2/challenges/reorder", rec.last["path"])
+
+    calls = len(rec.calls)
+    for name in ("attach_competition", "detach_competition"):
+        try:
+            getattr(c, name)(2, 42)
+        except MLArenaError as err:
+            _expect("a challenge now belongs to its course: create it with "
+                    "`add_course_challenge`" in str(err), str(err))
+        else:
+            raise AssertionError(f"{name} must raise")
+    _expect(len(rec.calls) == calls, "no request")
 
 
 def test_reorder_module_challenges():
@@ -357,16 +404,8 @@ def test_update_course_with_nothing_to_send_raises():
     _expect(rec.calls == [], rec.calls)
 
 
-def test_link_and_reorder_modules():
-    # link returns 201 (created), reorder returns 200 — route by verb.
-    def router(method, path, kwargs):
-        return (201, {"id": 1}) if method == "POST" else (200, [])
-
-    c, rec = make_client(router)
-    c.link_module(7, 3, position=1)
-    _expect(rec.last["path"] == "/teacher/course/7/modules", rec.last["path"])
-    _expect(rec.last["json"] == {"module_id": 3, "position": 1}, rec.last["json"])
-
+def test_reorder_modules():
+    c, rec = make_client(lambda *_: (200, []))
     c.reorder_modules(7, [3, 1])
     _expect(rec.last["path"] == "/teacher/course/7/modules/reorder", rec.last["path"])
     _expect(rec.last["json"] == {"ordered_ids": [3, 1]}, rec.last["json"])
@@ -390,6 +429,10 @@ def test_course_catalog_params():
     _expect(rec.last["path"] == "/academic_courses/catalog", rec.last["path"])
     _expect(rec.last["params"] == {"search": "rl", "limit": 10, "offset": 5},
             rec.last["params"])
+    c.course_catalog(example=True)
+    _expect(rec.last["params"] == {"example": "true"}, rec.last["params"])
+    c.course_catalog()
+    _expect(rec.last["params"] is None, rec.last["params"])
 
 
 def test_lesson_path():
@@ -400,14 +443,31 @@ def test_lesson_path():
             rec.last["path"])
 
 
-def test_mark_lesson_complete_course_id():
+def test_lesson_progress_takes_no_course():
+    """A lesson has one course: the progress writes send no body."""
     c, rec = make_client(lambda *_: (200, {"status": "completed"}))
-    c.mark_lesson_complete(9, course_id=4)
-    _expect(rec.last["path"] == "/academic_courses/lessons/9/complete", rec.last["path"])
-    _expect(rec.last["json"] == {"course_id": 4}, rec.last["json"])
+    for method, verb in (("mark_lesson_viewed", "view"),
+                         ("mark_lesson_complete", "complete"),
+                         ("mark_lesson_incomplete", "uncomplete")):
+        getattr(c, method)(9)
+        _expect(rec.last["path"] == f"/academic_courses/lessons/9/{verb}", rec.last["path"])
+        _expect(rec.last["json"] is None, rec.last["json"])
+    try:
+        c.mark_lesson_complete(9, course_id=4)
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("course_id= is gone")
 
-    c.mark_lesson_complete(9)
-    _expect(rec.last["json"] == {}, rec.last["json"])
+
+def test_not_enrolled_in_the_lessons_course_is_a_permission_error():
+    c, _ = make_client(lambda *_: (403, {"error": "Not enrolled in this lesson's course"}))
+    try:
+        c.mark_lesson_viewed(9)
+    except mlarena.PermissionDeniedError as err:
+        _expect("Not enrolled in this lesson's course" in str(err), str(err))
+    else:
+        raise AssertionError("a 403 must raise")
 
 
 def test_gated_lesson_403_maps_to_auth_error():
@@ -434,22 +494,38 @@ def test_create_course_sends_only_what_was_passed():
     _expect(rec.last["json"] == {"name": "X"}, rec.last["json"])
 
     c.create_course("X", code="RL101", start_date="2026-01-01", end_date="2026-02-01",
-                    slug="x", description="d", visibility="public")
+                    slug="x", description="d", visibility="public",
+                    ask_student_identity=True)
     _expect(rec.last["method"] == "POST", rec.last["method"])
     _expect(rec.last["path"] == "/academic_courses/", rec.last["path"])
     body = rec.last["json"]
     for k, v in {"name": "X", "code": "RL101", "start_date": "2026-01-01",
                  "end_date": "2026-02-01", "slug": "x", "description": "d",
-                 "visibility": "public"}.items():
+                 "visibility": "public", "ask_student_identity": True}.items():
         _expect(body.get(k) == v, f"{k}={body.get(k)}")
 
 
-def test_list_courses_challenge_filter():
+def test_a_third_course_visibility_carries_the_servers_sentence():
+    c, _ = make_client(lambda *_: (400, {"error": "a course is public or private"}))
+    try:
+        c.create_course("X", visibility="unlisted")
+    except MLArenaError as err:
+        _expect("a course is public or private" in str(err), str(err))
+    else:
+        raise AssertionError("a 400 must raise")
+
+
+def test_list_courses_takes_no_challenge_filter():
     c, rec = make_client(lambda *_: (200, []))
-    c.list_courses(show_all=True, challenge_id=7)
+    c.list_courses(show_all=True)
     _expect(rec.last["path"] == "/academic_courses/", rec.last["path"])
-    _expect(rec.last["params"] == {"show_all": "true", "challenge_id": 7},
-            rec.last["params"])
+    _expect(rec.last["params"] == {"show_all": "true"}, rec.last["params"])
+    try:
+        c.list_courses(challenge_id=7)
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("challenge_id= is gone")
 
 
 def test_enroll_uses_join_code():
@@ -951,8 +1027,7 @@ if __name__ == "__main__":
 
 
 def test_copy_module_into_course_body_and_status():
-    row = {"module_id": 12, "title": "Week 1", "can_edit": True, "is_owned": True,
-           "dropped_challenges": [{"challenge_id": 4, "name": None}]}
+    row = {"module_id": 12, "title": "Week 1", "challenges": []}
     c, rec = make_client(lambda *_: (201, row))
     out = c.copy_module_into_course(7, 3)
     _expect(out == row, out)
@@ -969,10 +1044,15 @@ def test_create_course_module_sends_only_what_is_given():
             ("POST", "/teacher/course/7/modules/create"), rec.last)
     _expect(rec.last["json"] == {"title": "Week 3"}, rec.last["json"])
     c.create_course_module(7, "Week 3", slug="w3", summary="s", icon="book",
-                           visibility="private", is_published=False)
+                           is_published=False)
     _expect(rec.last["json"] == {"title": "Week 3", "slug": "w3", "summary": "s",
-                                 "icon": "book", "visibility": "private",
-                                 "is_published": False}, rec.last["json"])
+                                 "icon": "book", "is_published": False}, rec.last["json"])
+    try:
+        c.create_course_module(7, "Week 3", visibility="private")
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("visibility= is gone")
 
 
 def test_copy_module_into_course_a_module_the_caller_may_not_read():

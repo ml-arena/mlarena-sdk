@@ -365,7 +365,7 @@ def test_format_attempt_lines():
 def test_exercise_names_are_exported_at_package_level():
     assert mlarena.ExerciseAttemptNotFoundError is ExerciseAttemptNotFoundError
     assert issubclass(mlarena.ExerciseAttemptNotFoundError, mlarena.NotFoundError)
-    assert mlarena.__version__ == "4.22.0"
+    assert mlarena.__version__ == "4.23.0"
 
 
 def test_update_settings_sends_the_exercise_limits_passed(monkeypatch):
@@ -479,17 +479,19 @@ def test_exercise_self_test_reads_the_state(monkeypatch):
     assert (rec.last["method"], rec.last["path"]) == ("GET", "/exercise/challenge/7/self-test")
 
 
-def test_add_course_exercise_set_sends_only_what_was_named(monkeypatch):
-    link = {"challenge_id": 91, "pass_threshold": 70.0}
-    c, rec = make_client(monkeypatch, lambda m, p, k: (201, link))
-    assert c.add_course_exercise_set(3, 12, "Week 1 exercises")["challenge_id"] == 91
-    assert (rec.last["method"], rec.last["path"]) == ("POST", "/teacher/course/3/modules/12/exercise-sets")
+def test_an_exercise_set_is_built_in_its_course(monkeypatch):
+    """4.23.0: "Add exercises" is `add_course_challenge` with the kind
+    `exercise_v1` (the removed `add_course_exercise_set` route answers 410)."""
+    created = {"challenge_id": 91, "pass_threshold": 70.0, "module_id": 12}
+    c, rec = make_client(monkeypatch, lambda m, p, k: (201, created))
+    assert not hasattr(c, "add_course_exercise_set")
+    out = c.add_course_challenge(3, "Week 1 exercises", kernel_version="exercise_v1",
+                                 module_id=12)
+    assert out["challenge_id"] == 91
+    assert (rec.last["method"], rec.last["path"]) == ("POST", "/teacher/course/3/challenges")
     # No pass_threshold key: the server applies the kind's default (70).
-    assert rec.last["json"] == {"name": "Week 1 exercises"}
-    c.add_course_exercise_set(3, 12, "Ungraded", pass_threshold=None, label="Practice")
-    assert rec.last["json"] == {"name": "Ungraded", "label": "Practice", "pass_threshold": None}
-    c.add_course_exercise_set(3, 12, "Half", pass_threshold=50)
-    assert rec.last["json"] == {"name": "Half", "pass_threshold": 50}
+    assert rec.last["json"] == {"name": "Week 1 exercises", "kernel_version": "exercise_v1",
+                                "module_id": 12}
 
 
 def test_self_test_exercises_refusals_carry_the_cap_and_the_blockers(monkeypatch, clock):

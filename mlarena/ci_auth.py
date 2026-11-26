@@ -16,6 +16,7 @@ source.
 """
 
 import os
+import warnings
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote, urlsplit
@@ -40,7 +41,10 @@ ENV_ACTIONS_OIDC_TOKEN = "ACTIONS_ID_TOKEN_REQUEST_TOKEN"
 # The backend route that trades a GitHub OIDC token for an `mlo_` token, and
 # the keys of its body and reply (`backend/app/auth/routes/oidc.py`).
 OIDC_EXCHANGE_PATH = "/api/auth/oidc/github"
-OIDC_SCOPES = ("user", "creator", "teacher")
+OIDC_SCOPES = ("user", "author")
+# The two scopes `author` replaced (4.23.0): a published client's spelling,
+# warned and sent as `author`. The server reads them as `author` too.
+LEGACY_OIDC_SCOPES = ("creator", "teacher")
 
 KIND_API_KEY = "api_key"
 KIND_GITHUB_ACTIONS = "github_actions"
@@ -232,6 +236,14 @@ def resolve_credentials(api_key: str | None = None, *,
         return Credentials(token=key, kind=kind, scope=key_scope)
 
     if in_github_actions_oidc(environ):
+        if scope in LEGACY_OIDC_SCOPES:
+            warnings.warn(
+                f"scope={scope!r} is deprecated: the {scope} scope is now "
+                "'author'; pass scope='author'",
+                DeprecationWarning,
+                stacklevel=3,
+            )
+            scope = "author"
         if scope not in OIDC_SCOPES:
             raise MLArenaError(
                 f"Unknown scope {scope!r}; expected one of {', '.join(OIDC_SCOPES)}"

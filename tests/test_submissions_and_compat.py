@@ -985,13 +985,19 @@ def _has_pandas():
 
 
 def test_leaderboard_sends_the_consoles_query_keys():
-    """The console sends `aggregate`, `course_id`, `limit`, `window`, `me`, `q`;
-    the SDK sent only `limit`. Each is sent only when passed."""
+    """The console sends `aggregate`, `limit`, `window`, `me`, `q`; each is
+    sent only when passed. One board per challenge: no `course_id` (4.23.0)."""
     c, rec = make_client(lambda m, p, k: (200, _ENVELOPE))
-    c.leaderboard(4, top=10, aggregate="user", course_id=3, me=True, q="jo", window=5)
+    c.leaderboard(4, top=10, aggregate="user", me=True, q="jo", window=5)
     assert rec.last["path"] == "/leaderboard/challenge/4"
-    assert rec.last["params"] == {"limit": 10, "aggregate": "user", "course_id": 3,
+    assert rec.last["params"] == {"limit": 10, "aggregate": "user",
                                   "window": 5, "me": "true", "q": "jo"}
+    try:
+        c.leaderboard(4, course_id=3)
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("course_id= is gone")
     c.leaderboard(4)
     assert rec.last["params"] is None
     c.leaderboard(4, aggregate="user")
@@ -1007,7 +1013,7 @@ def test_leaderboard_is_one_shape_whatever_the_parameters():
     which parameters were passed."""
     c, _ = make_client(lambda *_: (200, _ENVELOPE))
     for kwargs in ({}, {"top": 10}, {"top": 10, "aggregate": "user"},
-                   {"top": 10, "course_id": 3}, {"top": 10, "me": True},
+                   {"top": 10, "me": True},
                    {"q": "jo"}, {"window": 5}):
         out = c.leaderboard(4, **kwargs)
         if _has_pandas():
@@ -1030,7 +1036,7 @@ def test_leaderboard_with_names_withheld_keeps_every_column():
     """A course board read from outside the course: the rows as served, their
     identity columns present and empty, and the flag on `course_context`."""
     c, _ = make_client(lambda *_: (200, _WITHHELD_ENVELOPE))
-    out = c.leaderboard(4, course_id=3)
+    out = c.leaderboard(4)
     if _has_pandas():
         (row,) = out.to_dict("records")
         assert out.attrs["course_context"]["names_withheld"] is True
@@ -1050,7 +1056,7 @@ def test_leaderboard_search_on_a_withheld_board_carries_the_refusal():
     c, _ = make_client(lambda *_: (400, {"error": reason}))
     for kwargs in ({"q": "jo"}, {"around": 11}):
         try:
-            c.leaderboard(4, course_id=3, **kwargs)
+            c.leaderboard(4, **kwargs)
         except MLArenaError as exc:
             assert exc.status_code == 400 and reason in str(exc)
         else:
@@ -1449,7 +1455,7 @@ def test_challenge_rename_aliases_still_work():
     c, rec = make_client(lambda m, p, k: (200, {**_ENVELOPE, "leaders": []}
                                           if p.startswith("/leaderboard/")
                                           else {"items": [], "metadata": {}}),
-                         scope="creator")
+                         scope="author")
     _, msgs = _call_warns(c.competitions)
     assert rec.last["path"] == "/challenges/"
     assert any("competitions() is deprecated" in m for m in msgs), msgs
@@ -1458,9 +1464,14 @@ def test_challenge_rename_aliases_still_work():
     _call_warns(c.create_competition, "N", "file_v1", copy_from_competition_id=3)
     assert rec.last["json"] == {"name": "N", "kernel_version": "file_v1",
                                 "copy_from_challenge_id": 3}
-    _call_warns(c.attach_competition, 2, competition_id=42)
-    assert rec.last["path"] == "/teacher/modules/2/challenges"
-    assert rec.last["json"] == {"challenge_id": 42}
+    calls = len(rec.calls)
+    try:
+        c.attach_competition(2, competition_id=42)
+    except MLArenaError as err:
+        assert "create it with `add_course_challenge`" in str(err)
+    else:
+        raise AssertionError("attach_competition is gone")
+    assert len(rec.calls) == calls
     _call_warns(c.reorder_module_competitions, 2, ordered_competition_ids=[3, 1])
     assert rec.last["path"] == "/teacher/modules/2/challenges/reorder"
     assert CompetitionNotFoundError is ChallengeNotFoundError

@@ -41,6 +41,24 @@ class PermissionDeniedError(AuthenticationError):
     pass
 
 
+class EnrollmentRequiredError(PermissionDeniedError):
+    """Raised when taking part in a course challenge needs an enrollment the
+    caller does not have (HTTP 403, `reason: "enrollment_required"`).
+
+    A challenge of a course is taken part in by the course's members: a
+    submission, an upload, a deploy, a team, a chat message or an exercise
+    Check is refused to anyone else, even on a public course whose page they
+    read. `course_id` is the course to enroll in (`enroll_in_course` with its
+    join code, `course(slug)["join_code"]` on a public course that takes
+    enrollment); the message is the server's. A subclass of
+    `PermissionDeniedError`, what the same 403 raised before 4.23.0.
+    """
+
+    @property
+    def course_id(self) -> int:
+        return self.body["course_id"]
+
+
 class MaintenanceError(MLArenaError):
     """Raised when the platform is in maintenance mode (HTTP 503).
 

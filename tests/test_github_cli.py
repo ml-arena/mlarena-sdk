@@ -134,6 +134,18 @@ def test_explicit_api_key_wins_over_everything(monkeypatch):
     assert http.calls == []
 
 
+def test_a_legacy_oidc_scope_is_sent_as_author(monkeypatch):
+    """`creator` / `teacher` (the scopes `author` replaced) are warned and
+    exchanged as `author`."""
+    _actions_env(monkeypatch)
+    http = _oidc_http()
+    monkeypatch.setattr(ci_auth, "_http", http)
+    with pytest.warns(DeprecationWarning, match="scope='author'"):
+        client = mlarena.connect(base_url="https://example.com", scope="teacher")
+    assert http.calls[1]["json"]["scope"] == "author"
+    assert client.credentials.scope == "author"
+
+
 def test_env_api_key_wins_over_the_oidc_exchange(monkeypatch):
     monkeypatch.setenv("MLARENA_API_KEY", "mlk_creator_ffff0000_deadbeef0000")
     _actions_env(monkeypatch)
@@ -152,7 +164,7 @@ def test_github_actions_oidc_exchange(monkeypatch):
     http = _oidc_http()
     monkeypatch.setattr(ci_auth, "_http", http)
 
-    client = mlarena.connect(base_url="https://example.com", scope="creator")
+    client = mlarena.connect(base_url="https://example.com", scope="author")
 
     fetch, exchange = http.calls
     # The runner's URL already has a query string: `&audience=`, URL-encoded.
@@ -162,13 +174,13 @@ def test_github_actions_oidc_exchange(monkeypatch):
     assert fetch["headers"] == {"Authorization": "bearer runner-secret"}
     assert exchange["method"] == "POST"
     assert exchange["url"] == "https://example.com/api/auth/oidc/github"
-    assert exchange["json"] == {"token": "the.github.jwt", "scope": "creator"}
+    assert exchange["json"] == {"token": "the.github.jwt", "scope": "author"}
     # Neither call follows a redirect: both carry a credential.
     assert fetch["allow_redirects"] is False and exchange["allow_redirects"] is False
 
     assert client._token == CI_TOKEN
     creds = client.credentials
-    assert (creds.kind, creds.scope, creds.username) == ("github_actions", "creator", "alice")
+    assert (creds.kind, creds.scope, creds.username) == ("github_actions", "author", "alice")
     assert creds.source_revision == REVISION
     # The mlo_ token is the bearer of every later request, and never printed.
     assert client._headers() == {"Authorization": f"Bearer {CI_TOKEN}"}
@@ -643,15 +655,22 @@ COURSE_PLAN = {
             {"slug": "rag", "id": 301, "action": "updated", "renamed_from": None,
              "changes": ["body_md", "title"]},
         ],
+        "challenges": [
+            {"name": "Bandit arena", "id": 40, "action": "updated",
+             "changes": ["module_id", "pass_threshold"]},
+            {"name": "Grid world", "id": 41, "action": "unchanged", "changes": []},
+        ],
         "orphaned_lessons": ["old-intro"], "pruned_lessons": [],
         "assets": {"written_paths": ["foundations/a.png", "foundations/b.png"],
                    "removed_paths": ["old/1.png", "old/2.png", "old/3.png",
                                      "old/4.png", "old/5.png"]},
     }],
     "unmanaged_modules": ["extra"],
+    "unmanaged_challenges": ["Old maze"],
     "source_revision": REVISION,
     "url": "/courses/intro-to-rl",
     "warnings": [
+        "module 'foundations': the key 'visibility' is no longer used and is ignored",
         "module 'foundations', lesson 'bandits': mlarena:challenge: challenge 9 is not "
         "visible to the students of course 'Intro to RL' (it is private and the course "
         "does not assign it), so they will not see this block",
@@ -997,7 +1016,7 @@ def test_cli_challenge_push(fake, tmp_path, capsys, actions):
     code = cli.main(["challenge", "push", str(tmp_path), "--challenge", "lunar-lander",
                      "--path", "env", "--dry-run"])
     assert code == 0
-    assert client.asked[0]["scope"] == "creator"
+    assert client.asked[0]["scope"] == "author"
     assert client.calls[1] == ("push_challenge", 4, str(tmp_path),
                                {"subpath": "env", "dry_run": True})
     out = capsys.readouterr().out
@@ -1042,7 +1061,7 @@ def test_cli_course_push_prints_the_plan(fake, tmp_path, capsys, actions):
     client = fake(FakeClient())
     assert cli.main(["course", "push", str(tmp_path), "--slug", "intro-to-rl",
                      "--dry-run", "--prune"]) == 0
-    assert client.asked[0]["scope"] == "teacher"
+    assert client.asked[0]["scope"] == "author"
     assert client.calls == [("push_course", str(tmp_path),
                              {"slug": "intro-to-rl", "subpath": None,
                               "dry_run": True, "prune": True})]
@@ -1058,13 +1077,19 @@ def test_cli_course_push_prints_the_plan(fake, tmp_path, capsys, actions):
             "5 removed (old/1.png, old/2.png, old/3.png and 2 more) — files no lesson links"
             in out)
     assert "  module extra: not in the manifest, untouched" in out
+    # The challenges the manifest places, and the ones it names nowhere.
+    assert "    challenge Bandit arena: updated (module_id, pass_threshold)" in out
+    assert "    challenge Grid world: unchanged" in out
+    assert ("  challenge Old maze: in no challenges entry of the manifest, left where it is"
+            in out)
     assert "source: alice/agent@0123456" in out
     assert "https://ml-arena.com/courses/intro-to-rl" in out
     # The push's warnings: a line of the plan, an annotation on the run page
     # and a line of the job summary.
-    warning = COURSE_PLAN["warnings"][0]
-    assert f"warning: {warning}" in out
-    assert f"::warning title=mlarena::{warning}" in out
+    for warning in COURSE_PLAN["warnings"]:
+        assert f"warning: {warning}" in out
+        assert f"::warning title=mlarena::{warning}" in out
+    warning = COURSE_PLAN["warnings"][1]
     summary = actions.read_text()
     assert "### ML Arena course push" in summary
     assert f"warning: {warning}" in summary
@@ -1101,7 +1126,7 @@ def test_cli_course_export_writes_the_folder_and_names_the_next_step(fake, tmp_p
     client = fake(FakeClient())
     target = str(tmp_path / "rl")
     assert cli.main(["course", "export", "intro-to-rl", target]) == 0
-    assert client.asked[0]["scope"] == "teacher"
+    assert client.asked[0]["scope"] == "author"
     assert client.calls == [("export_course_to_dir", "intro-to-rl", target,
                              {"overwrite": False})]
     out = capsys.readouterr().out

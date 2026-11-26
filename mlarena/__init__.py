@@ -7,6 +7,7 @@ from mlarena.exceptions import (
     ChallengeNotFoundError,
     ChatSessionNotFoundError,
     CompetitionNotFoundError,  # deprecated alias of ChallengeNotFoundError
+    EnrollmentRequiredError,
     ExerciseAttemptNotFoundError,
     MaintenanceError,
     MLArenaError,
@@ -18,7 +19,7 @@ from mlarena.exceptions import (
 )
 from mlarena.metrics import format_metric
 
-__version__ = "4.22.0"
+__version__ = "4.23.0"
 
 
 def connect(
@@ -50,7 +51,9 @@ def connect(
             ``False`` because the bearer token is sent on every request and
             cleartext transport would expose it to anyone on the network path.
         scope: GitHub Actions only: the scope asked for the `mlo_` token
-            (``user`` | ``creator`` | ``teacher``). An API key carries its own.
+            (``user`` | ``author``; ``creator`` and ``teacher``, the two
+            scopes ``author`` replaced, are deprecated spellings of it). An
+            API key carries its own.
         audience: GitHub Actions only: the OIDC audience, the platform's
             public URL. Defaults to ``MLARENA_OIDC_AUDIENCE``, else `base_url`.
 

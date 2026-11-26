@@ -385,7 +385,7 @@ def _challenge_report_lines(report: dict) -> list[str]:
 
 
 def cmd_challenge_push(args) -> int:
-    client = _connect(args.base_url, "creator", args.audience)
+    client = _connect(args.base_url, "author", args.audience)
     challenge = _resolve_challenge(client, args.challenge)
     heading = f"ML Arena challenge push to {challenge['name']}"
     try:
@@ -472,11 +472,15 @@ def _course_plan_lines(report: dict) -> list[str]:
                   for slug in module["orphaned_lessons"]]
         lines += [f"    lesson {slug}: pruned (deleted)"
                   for slug in module["pruned_lessons"]]
+        lines += [f"    challenge {challenge['name']}: {_action(challenge)}"
+                  for challenge in module["challenges"]]
         assets = _assets_line(module["assets"])
         if assets is not None:
             lines.append(f"    {assets}")
     for slug in report["unmanaged_modules"]:
         lines.append(f"  module {slug}: not in the manifest, untouched")
+    lines += [f"  challenge {name}: in no challenges entry of the manifest, left where it is"
+              for name in report["unmanaged_challenges"]]
     if report["source_revision"] is not None:
         lines.append(f"source: {_revision_label(report['source_revision'])}")
     lines += [f"warning: {warning}" for warning in report["warnings"]]
@@ -492,7 +496,7 @@ def _annotate_warning(message: str) -> None:
 
 
 def cmd_course_push(args) -> int:
-    client = _connect(args.base_url, "teacher", args.audience)
+    client = _connect(args.base_url, "author", args.audience)
     heading = "ML Arena course push"
     try:
         report = client.push_course(
@@ -524,7 +528,7 @@ def _lesson_count(lessons: list) -> int:
 
 def cmd_course_export(args) -> int:
     directory = args.directory if args.directory is not None else os.path.join(".", args.slug)
-    client = _connect(args.base_url, "teacher", args.audience)
+    client = _connect(args.base_url, "author", args.audience)
     try:
         manifest = client.export_course_to_dir(args.slug, directory,
                                                overwrite=args.overwrite)

@@ -57,7 +57,7 @@ class Recorder:
         return self.calls[-1]
 
 
-def make_client(router=None, scope="creator"):
+def make_client(router=None, scope="author"):
     client = mlarena.connect(
         api_key=f"mlk_{scope}_abcd1234_deadbeef0000",
         base_url="https://example.com",
@@ -114,9 +114,7 @@ READS = [
     ("agent_template", (7,), CREATOR + "/agent-template"),
     ("challenge_overview", (7,), CREATOR + "/overview"),
     ("challenge_deploy_failures", (7,), CREATOR + "/deploy-failures"),
-    ("challenge_courses", (7,), CREATOR + "/courses"),
     ("available_kinds", (), "/creator_challenge/available_kinds"),
-    ("copyable_challenges", (), "/creator_challenge/copyable_challenges"),
 ]
 
 
@@ -131,22 +129,18 @@ def test_creator_runs_pages_with_offset_and_limit():
     _expect(rec.last["params"] == {"offset": 30, "limit": 100}, rec.last["params"])
 
 
-def test_creator_submissions_filters_on_a_course():
-    """`course_id` is sent only when named; a refused course is the route's 400."""
+def test_creator_submissions_takes_no_course_filter():
+    """A course challenge's submissions are its class's: no `course_id`."""
     c, rec = make_client(lambda *_: (200, {"submissions": [], "metrics": [], "window_days": None}))
     c.creator_submissions(7)
-    _expect(rec.last["params"] is None, rec.last["params"])
-    c.creator_submissions(7, course_id=3)
     _expect(rec.last["path"] == CREATOR + "/submissions", rec.last["path"])
-    _expect(rec.last["params"] == {"course_id": 3}, rec.last["params"])
-
-    c, _ = make_client(lambda *_: (400, {"error": "Invalid course_id for this challenge"}))
+    _expect(rec.last["params"] is None, rec.last["params"])
     try:
-        c.creator_submissions(7, course_id=99)
-    except MLArenaError as exc:
-        _expect("Invalid course_id" in str(exc), str(exc))
+        c.creator_submissions(7, course_id=3)
+    except TypeError:
+        pass
     else:
-        raise AssertionError("a refused course_id must raise")
+        raise AssertionError("course_id= is gone")
 
 
 def test_creator_reads_hit_their_routes():
@@ -163,7 +157,7 @@ def test_creator_reads_send_the_token():
         getattr(c, name)(*args)
     for call in rec.calls:
         auth = call["headers"]["Authorization"]
-        _expect(auth.startswith("Bearer mlk_creator_"), auth)
+        _expect(auth.startswith("Bearer mlk_author_"), auth)
 
 
 def test_a_read_of_a_challenge_you_cannot_edit_raises_not_found():
@@ -457,6 +451,47 @@ def test_update_settings_has_no_elo_keyword():
             raise AssertionError(f"update_settings accepted {name}=")
 
 
+def test_create_challenge_makes_a_competition():
+    """A competition: a new one needs a name and a kind, a copy neither."""
+    c, rec = make_client(lambda *_: (201, {"challenge_id": 9, "name": "Maze", "slug": "maze",
+                                           "machine_name": "small", "message": "ok",
+                                           "copied_from_challenge_id": None}))
+    c.create_challenge("Maze", "file_v1")
+    _expect((rec.last["method"], rec.last["path"]) == ("POST", "/creator_challenge/challenge"),
+            rec.last)
+    _expect(rec.last["json"] == {"name": "Maze", "kernel_version": "file_v1"}, rec.last["json"])
+    c.create_challenge(copy_from_challenge_id=4)
+    _expect(rec.last["json"] == {"copy_from_challenge_id": 4}, rec.last["json"])
+    calls = len(rec.calls)
+    for call in (lambda: c.create_challenge("Maze"),
+                 lambda: c.create_challenge(kernel_version="file_v1")):
+        try:
+            call()
+        except TypeError:
+            pass
+        else:
+            raise AssertionError("expected TypeError")
+    _expect(len(rec.calls) == calls, "no request")
+
+
+def test_creating_a_competition_without_the_publishing_right_is_refused():
+    reason = "Creating or publishing a competition is an admin's, for now"
+    c, _ = make_client(lambda *_: (403, {"error": reason}))
+    try:
+        c.create_challenge("Maze", "file_v1")
+    except mlarena.PermissionDeniedError as exc:
+        _expect(reason in str(exc), str(exc))
+    else:
+        raise AssertionError("a 403 must raise")
+
+
+def test_update_challenge_sends_is_award_points():
+    c, rec = make_client(lambda *_: (200, {"ok": True}))
+    c.update_challenge(7, is_public=False, is_award_points=False)
+    _expect(rec.last["json"] == {"is_public": False, "is_award_points": False},
+            rec.last["json"])
+
+
 def test_create_challenge_docstring_names_only_real_kinds():
     """The kinds are the backend's KINDS keys; env-image families are not."""
     doc = mlarena.client.MLArenaClient.create_challenge.__doc__
@@ -651,7 +686,7 @@ def test_no_engine_left_in_the_public_docstrings():
     docstrings name the served keys."""
     cls = mlarena.client.MLArenaClient
     for name in ("challenge", "creator_challenge", "available_kinds",
-                 "create_challenge", "copyable_challenges", "challenges"):
+                 "create_challenge", "challenges"):
         doc = getattr(cls, name).__doc__
         _expect("engine" not in doc.lower(), f"{name}: {doc}")
     _expect("has_machine" in cls.available_kinds.__doc__, "has_machine")

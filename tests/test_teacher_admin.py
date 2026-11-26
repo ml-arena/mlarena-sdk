@@ -60,7 +60,7 @@ class Recorder:
         return self.calls[-1]
 
 
-def make_client(router=None, scope="teacher"):
+def make_client(router=None, scope="author"):
     client = mlarena.connect(
         api_key=f"mlk_{scope}_abcd1234_deadbeef0000",
         base_url="https://example.com",
@@ -115,7 +115,7 @@ def _workspace_challenge(challenge_id, name, role="owner", status="started"):
                      "deploy_failed_submissions": 1,
                      "deploy_failed_submissions_by_owner": {
                          "participant": 1, "challenge": 0, "platform": 0, "unattributed": 0},
-                     "last_submission_created_at_ts": None, "course_count": 1},
+                     "last_submission_created_at_ts": None},
         "created_at_ts": "2026-11-01T10:00:00Z",
         "start_blockers": None, "start_blockers_error": None,
     }
@@ -246,11 +246,9 @@ def test_archive_and_unarchive_are_one_post_each():
 
 
 def test_duplicate_course_sends_the_name_only_when_given():
-    c, rec = make_client(lambda *_: (201, {
-        "id": 8, "name": "RL (copy)", "left_out_modules": [{"id": 3, "title": "TA notes"}]}))
+    c, rec = make_client(lambda *_: (201, {"id": 8, "name": "RL (copy)"}))
     out = c.duplicate_course(7)
     _expect(out["id"] == 8, out)
-    _expect(out["left_out_modules"] == [{"id": 3, "title": "TA notes"}], out)
     _expect((rec.last["method"], rec.last["path"]) == ("POST", "/teacher/course/7/duplicate"),
             rec.last)
     _expect(rec.last["json"] == {}, rec.last["json"])
@@ -272,9 +270,10 @@ def test_the_course_limit_refusal_raises_with_the_platform_reason():
 
 
 def test_delete_course_is_one_delete_and_a_409_says_why():
-    plan = {"can_delete": True, "enrollment_count": 0,
+    plan = {"can_delete": True, "enrollment_count": 0, "example_listed_at_ts": None,
             "deleted_modules": [{"id": 4, "title": "Week 2"}],
-            "kept_modules": [{"id": 9, "title": "Lessons"}]}
+            "deleted_challenges": [{"id": 9, "name": "Maze"}],
+            "blocking_challenges": [], "storage_left": []}
     c, rec = make_client(lambda *_: (200, plan))
     _expect(c.course_deletion(7) == plan, "course_deletion")
     _expect((rec.last["method"], rec.last["path"]) == ("GET", "/teacher/course/7/deletion"),
@@ -321,19 +320,39 @@ def test_export_course_grades_csv_writes_the_file():
     _expect(not rec.last["params"], rec.last["params"])
 
 
-def test_challenges_for_course_lists_the_picker():
-    metric = {"key": "reward", "label": "Reward", "source": "score",
-              "agg": "mean", "order": "desc", "format": "number",
-              "unit": None, "precision": 2, "is_ranking": True,
-              "visible": True}
-    rows = [{"id": 42, "name": "CartPole-v1", "metric": metric}]
-    c, rec = make_client(lambda *_: (200, rows))
-    out = c.challenges_for_course()
-    _expect(rec.last["path"] == "/teacher/challenges-for-course", rec.last["path"])
-    ids = list(out["id"]) if hasattr(out, "columns") else [r["id"] for r in out]
-    _expect(ids == [42], ids)
-    got = list(out["metric"]) if hasattr(out, "columns") else [r["metric"] for r in out]
-    _expect(got == [metric], got)
+def test_list_and_unlist_an_example_course():
+    listed = {"id": 7, "example_listed_at_ts": "2026-11-26T10:00:00Z"}
+    c, rec = make_client(lambda method, *_: (200, listed if method == "POST"
+                                                  else {**listed, "example_listed_at_ts": None}))
+    _expect(c.list_course_as_example(7) == listed, "list")
+    _expect((rec.last["method"], rec.last["path"]) == ("POST", "/teacher/course/7/example"),
+            rec.last)
+    _expect(rec.last["json"] is None, rec.last["json"])
+    _expect(c.unlist_course_example(7)["example_listed_at_ts"] is None, "unlist")
+    _expect((rec.last["method"], rec.last["path"]) == ("DELETE", "/teacher/course/7/example"),
+            rec.last)
+
+
+def test_listing_an_example_without_the_publishing_right_is_refused():
+    reason = "Listing a course as an example is an admin's"
+    c, _ = make_client(lambda *_: (403, {"error": reason}))
+    try:
+        c.list_course_as_example(7)
+    except mlarena.PermissionDeniedError as exc:
+        _expect(reason in str(exc), str(exc))
+    else:
+        raise AssertionError("a 403 must raise")
+
+
+def test_the_example_docstrings_say_what_a_copy_takes():
+    """§6.7: the sentence about the seed and the data is in the docstrings
+    of the methods that list or copy an example."""
+    for name in ("list_course_as_example", "unlist_course_example", "duplicate_course",
+                 "start_from_example_course", "use_example_challenge",
+                 "add_course_challenge", "course_catalog"):
+        doc = " ".join(getattr(mlarena.MLArenaClient, name).__doc__.split())
+        _expect("same data and the same scoring files" in doc, name)
+        _expect("change the seed or the data before" in doc.lower(), name)
 
 
 # --------------------------------------------------------------------------- #
@@ -555,47 +574,99 @@ def test_export_course_csv_requires_the_challenge():
 # --------------------------------------------------------------------------- #
 
 
-def test_add_course_challenge_is_one_call():
-    row = {"module_id": 4, "title": "Week 2", "challenges": []}
-    c, rec = make_client(lambda *_: (201, row))
-    out = c.add_course_challenge(7, 42, title="Week 2", summary="Read me.",
-                                 pass_threshold=0.5)
-    _expect(out == row, out)
+COURSE_CHALLENGE = {
+    "message": "Challenge created", "challenge_id": 42, "name": "Maze", "slug": "maze",
+    "course_id": 7, "module_id": 4, "module_created": True, "position": 0,
+    "pass_threshold": None, "copied_from_challenge_id": None, "machine_name": "small",
+}
+
+
+def test_add_course_challenge_builds_one_in_one_call():
+    c, rec = make_client(lambda *_: (201, COURSE_CHALLENGE))
+    out = c.add_course_challenge(7, "Maze", kernel_version="file_v1")
+    _expect(out == COURSE_CHALLENGE, out)
     _expect(len(rec.calls) == 1, rec.calls)
-    _expect(rec.last["method"] == "POST", rec.last["method"])
-    _expect(rec.last["path"] == "/teacher/course/7/challenges", rec.last["path"])
-    _expect(rec.last["json"] == {
-        "challenge_id": 42, "is_published": True, "title": "Week 2",
-        "summary": "Read me.", "pass_threshold": 0.5,
-    }, rec.last["json"])
-
-
-def test_remove_course_challenge_is_one_call():
-    body = {"message": "Challenge removed", "module_deleted": True}
-    c, rec = make_client(lambda *_: (200, body))
-    out = c.remove_course_challenge(7, 4)
-    _expect(out == body, out)
-    _expect(len(rec.calls) == 1, rec.calls)
-    _expect(rec.last["method"] == "DELETE", rec.last["method"])
-    _expect(rec.last["path"] == "/teacher/course/7/challenges/4", rec.last["path"])
-
-
-def test_add_course_challenge_sends_only_what_was_given():
-    c, rec = make_client(lambda *_: (201, {"id": 1}))
-    c.add_course_challenge(7, 42, is_published=False)
-    _expect(rec.last["json"] == {"challenge_id": 42, "is_published": False},
+    _expect((rec.last["method"], rec.last["path"]) == ("POST", "/teacher/course/7/challenges"),
+            rec.last)
+    _expect(rec.last["json"] == {"name": "Maze", "kernel_version": "file_v1"},
             rec.last["json"])
 
 
+def test_add_course_challenge_copies_into_a_module_with_a_bar():
+    c, rec = make_client(lambda *_: (201, COURSE_CHALLENGE))
+    c.add_course_challenge(7, copy_from_challenge_id=12, module_id=4, pass_threshold=0.5)
+    _expect(rec.last["json"] == {"copy_from_challenge_id": 12, "module_id": 4,
+                                 "pass_threshold": 0.5}, rec.last["json"])
+    # `None` is a value: no bar, sent as null; leaving it out lets the kind decide.
+    c.add_course_challenge(7, "Set", kernel_version="exercise_v1", pass_threshold=None)
+    _expect(rec.last["json"] == {"name": "Set", "kernel_version": "exercise_v1",
+                                 "pass_threshold": None}, rec.last["json"])
+
+
+def test_add_course_challenge_refuses_the_old_linking_call_before_any_request():
+    c, rec = make_client()
+    for call in (lambda: c.add_course_challenge(7, 42),
+                 lambda: c.add_course_challenge(7, "Maze"),
+                 lambda: c.add_course_challenge(7, kernel_version="file_v1"),
+                 lambda: c.add_course_challenge(7, "Maze", kernel_version="file_v1",
+                                                copy_from_challenge_id=3),
+                 lambda: c.add_course_challenge(7, 42, title="Week 2")):
+        try:
+            call()
+        except TypeError:
+            pass
+        else:
+            raise AssertionError("expected TypeError")
+    _expect(rec.calls == [], rec.calls)
+
+
+def test_credits_reads_the_two_balances():
+    body = {"balances": [{"resource": "cpu", "balance": "5000.0000"},
+                         {"resource": "gpu", "balance": "0.0000"}]}
+    c, rec = make_client(lambda *_: (200, body))
+    _expect(c.credits() == body, "credits")
+    _expect((rec.last["method"], rec.last["path"]) == ("GET", "/credits"), rec.last)
+
+
+def test_credit_usage_sends_only_what_was_given():
+    c, rec = make_client(lambda *_: (200, {"rows": []}))
+    c.credit_usage("cpu", "kind")
+    _expect((rec.last["method"], rec.last["path"]) == ("GET", "/credits/usage"), rec.last)
+    _expect(rec.last["params"] == {"resource": "cpu", "group_by": "kind"}, rec.last["params"])
+    c.credit_usage("gpu", "challenge", "2026-11-01", course_id=7)
+    _expect(rec.last["params"] == {"resource": "gpu", "group_by": "challenge",
+                                   "since": "2026-11-01", "course_id": 7}, rec.last["params"])
+    c.credit_usage("cpu", "kind", challenge_id=42)
+    _expect(rec.last["params"] == {"resource": "cpu", "group_by": "kind",
+                                   "challenge_id": 42}, rec.last["params"])
+
+
 def test_add_course_challenge_refusal_raises_with_the_reason():
-    c, _rec = make_client(lambda *_: (400, {"error": "challenge_id 42 has no evaluation"}))
+    reason = ("Building a file, code or chat challenge needs creator access for now. You"
+              " can build an exercise set, or start from an example: copy a challenge of an example course into yours.")
+    c, _rec = make_client(lambda *_: (403, {"error": reason}))
     try:
-        c.add_course_challenge(7, 42)
-    except MLArenaError as e:
-        _expect("has no evaluation" in str(e), str(e))
-        _expect(e.status_code == 400, e.status_code)
+        c.add_course_challenge(7, "Maze", kernel_version="flex_v1")
+    except mlarena.PermissionDeniedError as e:
+        _expect(reason in str(e), str(e))
+        _expect(e.status_code == 403, e.status_code)
     else:
-        raise AssertionError("expected MLArenaError")
+        raise AssertionError("expected PermissionDeniedError")
+
+
+def test_a_removed_route_reads_its_410_sentence():
+    """An old body (or an old client) reaches a removed route: the 410's
+    sentence is the exception's message."""
+    sentence = ("This route is gone: a module is a section of one course. Create it in "
+                "its course with POST /api/teacher/course/{course_id}/modules/create.")
+    c, _ = make_client(lambda *_: (410, {"error": sentence}))
+    try:
+        c.create_course_module(7, "Week 1", slug="w1")
+    except MLArenaError as e:
+        _expect(sentence in str(e), str(e))
+        _expect(e.status_code == 410 and e.body == {"error": sentence}, e.body)
+    else:
+        raise AssertionError("a 410 must raise")
 
 
 # --------------------------------------------------------------------------- #
@@ -687,11 +758,11 @@ def test_course_cover_404_raises():
 
 def test_all_teacher_admin_methods_send_the_token():
     c, rec = make_client(lambda *_: (200, []))
-    c.challenges_for_course()
     c.course_assistants(1)
+    c.credits()
     for call in rec.calls:
         auth = call["headers"]["Authorization"]
-        _expect(auth.startswith("Bearer mlk_teacher_"), auth)
+        _expect(auth.startswith("Bearer mlk_author_"), auth)
 
 
 def _run_all():
@@ -711,3 +782,23 @@ def _run_all():
 
 if __name__ == "__main__":
     sys.exit(1 if _run_all() else 0)
+
+
+def test_taking_part_without_the_enrollment_is_an_enrollment_required_error():
+    body = {"error": "Enroll in this challenge's course to take part in it",
+            "reason": "enrollment_required", "course_id": 12}
+    c, _ = make_client(lambda *_: (403, body), scope="user")
+    try:
+        c.create_submission(7, "first try")
+    except mlarena.EnrollmentRequiredError as err:
+        _expect(isinstance(err, mlarena.PermissionDeniedError), type(err))
+        _expect(err.course_id == 12, err.body)
+        _expect("Enroll in this challenge's course" in str(err), str(err))
+    else:
+        raise AssertionError("expected EnrollmentRequiredError")
+    # Any other 403 stays a plain PermissionDeniedError.
+    c, _ = make_client(lambda *_: (403, {"error": "Access denied"}), scope="user")
+    try:
+        c.create_submission(7, "first try")
+    except mlarena.PermissionDeniedError as err:
+        _expect(not isinstance(err, mlarena.EnrollmentRequiredError), type(err))
