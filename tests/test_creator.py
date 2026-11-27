@@ -398,17 +398,6 @@ def test_update_settings_sends_the_column_names():
     }, rec.last["json"])
 
 
-def test_update_settings_sends_datagouv_topic_id_only_when_passed():
-    c, rec = make_client(lambda *_: (200, {"configuration": {}, "evaluation": {}}))
-    c.update_settings(7, datagouv_topic_id="5f1e2d3c4b5a69788796a5b4")
-    _expect(rec.last["json"] == {"datagouv_topic_id": "5f1e2d3c4b5a69788796a5b4"},
-            rec.last["json"])
-    c.update_settings(7, datagouv_topic_id=None)
-    _expect(rec.last["json"] == {"datagouv_topic_id": None}, rec.last["json"])
-    c.update_settings(7, max_upload_files=4)
-    _expect("datagouv_topic_id" not in rec.last["json"], rec.last["json"])
-
-
 def test_update_settings_removed_score_kwargs_raise_naming_metrics():
     """SDK 4.0.0 (D5): the six legacy score keywords are gone, no alias. Each
     raises a TypeError that points at `metrics`, before any request."""
@@ -451,52 +440,11 @@ def test_update_settings_has_no_elo_keyword():
             raise AssertionError(f"update_settings accepted {name}=")
 
 
-def test_create_challenge_makes_a_competition():
-    """A competition: a new one needs a name and a kind, a copy neither."""
-    c, rec = make_client(lambda *_: (201, {"challenge_id": 9, "name": "Maze", "slug": "maze",
-                                           "machine_name": "small", "message": "ok",
-                                           "copied_from_challenge_id": None}))
-    c.create_challenge("Maze", "file_v1")
-    _expect((rec.last["method"], rec.last["path"]) == ("POST", "/creator_challenge/challenge"),
-            rec.last)
-    _expect(rec.last["json"] == {"name": "Maze", "kernel_version": "file_v1"}, rec.last["json"])
-    c.create_challenge(copy_from_challenge_id=4)
-    _expect(rec.last["json"] == {"copy_from_challenge_id": 4}, rec.last["json"])
-    calls = len(rec.calls)
-    for call in (lambda: c.create_challenge("Maze"),
-                 lambda: c.create_challenge(kernel_version="file_v1")):
-        try:
-            call()
-        except TypeError:
-            pass
-        else:
-            raise AssertionError("expected TypeError")
-    _expect(len(rec.calls) == calls, "no request")
-
-
-def test_creating_a_competition_without_the_publishing_right_is_refused():
-    reason = "Creating or publishing a competition is an admin's, for now"
-    c, _ = make_client(lambda *_: (403, {"error": reason}))
-    try:
-        c.create_challenge("Maze", "file_v1")
-    except mlarena.PermissionDeniedError as exc:
-        _expect(reason in str(exc), str(exc))
-    else:
-        raise AssertionError("a 403 must raise")
-
-
 def test_update_challenge_sends_is_award_points():
     c, rec = make_client(lambda *_: (200, {"ok": True}))
     c.update_challenge(7, is_public=False, is_award_points=False)
     _expect(rec.last["json"] == {"is_public": False, "is_award_points": False},
             rec.last["json"])
-
-
-def test_create_challenge_docstring_names_only_real_kinds():
-    """The kinds are the backend's KINDS keys; env-image families are not."""
-    doc = mlarena.client.MLArenaClient.create_challenge.__doc__
-    _expect('"gymnasium"' not in doc and '"pettingzoo"' not in doc, doc)
-    _expect("available_kinds()" in doc, doc)
 
 
 def test_update_settings_without_a_field_raises_before_any_request():
@@ -520,30 +468,43 @@ def test_update_settings_refuses_the_old_evaluation_prefix():
         raise AssertionError("update_settings still accepts evaluation_metric")
 
 
-def test_update_settings_sends_the_data_feed_fields():
-    """Admin-only feed keys go through the same PUT /settings, under their
-    column names; None is an explicit null (clears the filter)."""
-    c, rec = make_client(lambda *_: (200, {"configuration": {}, "evaluation": {}}))
-    c.update_settings(
-        7,
-        data_source_enabled=True,
-        data_source_url="http://dc.test/api-dc",
-        data_source_asset="weather",
-        data_source_filter={"cities": "Paris:FR"},
-        data_source_history_hours=72,
-        batch_cron="0 */6 * * *",
-    )
-    _expect(rec.last["json"] == {
-        "data_source_enabled": True,
-        "data_source_url": "http://dc.test/api-dc",
-        "data_source_asset": "weather",
-        "data_source_filter": {"cities": "Paris:FR"},
-        "data_source_history_hours": 72,
-        "batch_cron": "0 */6 * * *",
-    }, rec.last["json"])
+# The keys only an admin may write (`ADMIN_ONLY_KEYS`): 4.27.0 took them out
+# of the published SDK (CLAUDE.md, the parity rule).
+ADMIN_ONLY_KEYS = (
+    "data_source_enabled", "data_source_url", "data_source_asset",
+    "data_source_filter", "data_source_history_hours", "batch_cron",
+    "datagouv_topic_id", "env_gpu_count", "agent_gpu_count",
+    "gpu_memory_limit", "docker_image_env_runtime_id",
+)
 
-    c.update_settings(7, data_source_filter=None)
-    _expect(rec.last["json"] == {"data_source_filter": None}, rec.last["json"])
+
+def test_update_settings_holds_no_admin_only_key():
+    c, rec = make_client(lambda *_: (200, {"configuration": {}, "evaluation": {}}))
+    for name in ADMIN_ONLY_KEYS:
+        try:
+            c.update_settings(7, **{name: None})
+        except TypeError:
+            pass
+        else:
+            raise AssertionError(f"update_settings accepts the admin key {name}=")
+    _expect(rec.calls == [], "no request was sent")
+
+
+def test_the_admin_methods_are_gone():
+    """Creating an open challenge and listing an example are an admin's:
+    the console does them, and the published SDK says so before any request."""
+    c, rec = make_client()
+    for call in (lambda: c.create_challenge("Maze", "file_v1"),
+                 lambda: c.create_competition("Maze", "file_v1"),
+                 lambda: c.list_course_as_example(7)):
+        try:
+            call()
+        except MLArenaError as exc:
+            _expect("an admin operation, done in the console" in str(exc), str(exc))
+            _expect("add_course_challenge" in str(exc), str(exc))
+        else:
+            raise AssertionError("expected MLArenaError")
+    _expect(rec.calls == [], "no request was sent")
 
 
 def test_update_settings_sends_the_run_limit_fields():
@@ -569,29 +530,18 @@ RUNTIME_KWARGS = {
     "agent_cpu_request": "250m", "agent_cpu_limit": "500m",
     "agent_memory_request": "256Mi", "agent_memory_limit": "512Mi",
     "agent_ephemeral_storage_limit": "1Gi",
-    "env_gpu_count": 0, "agent_gpu_count": 1, "gpu_memory_limit": "8Gi",
-    "number_of_agents": 2,
-    "docker_image_env_runtime_id": 2, "render_delay_second": 0.05,
+    "number_of_agents": 2, "render_delay_second": 0.05,
 }
 
 
 def test_update_settings_sends_the_runtime_fields():
-    """The machine, the sizing columns, the seat count and the infrastructure
-    keys of the removed configuration route go through PUT /settings under
-    their column names (machine_model D7)."""
+    """The machine, the sizing columns and the seat count go through PUT
+    /settings under their column names (machine_model D7)."""
     c, rec = make_client(lambda *_: (200, {"configuration": {}, "evaluation": {}}))
     c.update_settings(7, **RUNTIME_KWARGS)
     _expect(rec.last["method"] == "PUT", rec.last["method"])
     _expect(rec.last["path"] == CREATOR + "/settings", rec.last["path"])
     _expect(rec.last["json"] == RUNTIME_KWARGS, rec.last["json"])
-
-
-def test_update_settings_gpu_memory_limit_none_clears_it():
-    """`gpu_memory_limit=None` is an explicit null (the backend clears the
-    cap); the other runtime keywords' None means "not sent"."""
-    c, rec = make_client(lambda *_: (200, {"configuration": {}, "evaluation": {}}))
-    c.update_settings(7, gpu_memory_limit=None, machine_id=None)
-    _expect(rec.last["json"] == {"gpu_memory_limit": None}, rec.last["json"])
 
 
 def test_update_settings_window_days_none_removes_the_window():
@@ -686,7 +636,7 @@ def test_no_engine_left_in_the_public_docstrings():
     docstrings name the served keys."""
     cls = mlarena.client.MLArenaClient
     for name in ("challenge", "creator_challenge", "available_kinds",
-                 "create_challenge", "challenges"):
+                 "challenges"):
         doc = getattr(cls, name).__doc__
         _expect("engine" not in doc.lower(), f"{name}: {doc}")
     _expect("has_machine" in cls.available_kinds.__doc__, "has_machine")
@@ -847,7 +797,6 @@ def test_download_replay_refusals():
         else:
             raise AssertionError("expected MLArenaError")
         _expect(os.listdir(tmp) == [], "nothing written")
-
 
 
 def test_agent_template_returns_the_served_template():

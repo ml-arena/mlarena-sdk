@@ -75,12 +75,11 @@ def make_ci_client(status, data):
     return client, client._request
 
 
-# The four routes that create a challenge, each through its SDK method.
+# The routes that create a challenge, each through its SDK method (the open
+# challenge's, an admin's, is the in-repo admin client's: mlarena-admin/).
 CREATING_CALLS = {
     "build in a course": lambda c: c.add_course_challenge(7, "Maze", kernel_version="flex_v1"),
     "copy into a course": lambda c: c.add_course_challenge(7, copy_from_challenge_id=12),
-    "competition": lambda c: c.create_challenge("Open maze", "flex_v1"),
-    "competition copied": lambda c: c.create_challenge(copy_from_challenge_id=12),
     "module copied": lambda c: c.copy_module_into_course(7, 3),
     "course duplicated": lambda c: c.duplicate_course(7),
 }

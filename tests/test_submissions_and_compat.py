@@ -1105,11 +1105,6 @@ def test_challenge_admin_and_creator_routes():
     c.list_tags()
     assert rec.last["path"] == "/challenge_tags/tags"
 
-    c.create_challenge("New", "flex_v1", copy_from_challenge_id=3, tag_names=["RL"])
-    assert (rec.last["method"], rec.last["path"]) == ("POST", "/creator_challenge/challenge")
-    assert rec.last["json"] == {"name": "New", "kernel_version": "flex_v1",
-                                "copy_from_challenge_id": 3, "tag_ids": [1]}
-
     c.set_challenge_tags(4, tag_ids=[1])
     assert rec.last["path"] == "/creator_challenge/challenge/4/tags"
     c.update_agent_template(4, "class Agent: ...")
@@ -1453,6 +1448,15 @@ def test_old_settings_kwarg_sends_new_key():
     assert any("max_active_agents_per_participant= is deprecated" in m for m in msgs)
 
 
+def test_old_copy_kwarg_sends_new_key():
+    """`create_competition` (gone in 4.27.0: an admin's) was the alias that
+    passed it; `add_course_challenge` still takes the old spelling."""
+    c, rec = make_client(lambda *_: (201, {"challenge_id": 9}), scope="author")
+    _, msgs = _call_warns(c.add_course_challenge, 7, copy_from_competition_id=3)
+    assert rec.last["json"]["copy_from_challenge_id"] == 3
+    assert any("copy_from_competition_id= is deprecated" in m for m in msgs)
+
+
 def test_challenge_rename_aliases_still_work():
     c, rec = make_client(lambda m, p, k: (200, {**_ENVELOPE, "leaders": []}
                                           if p.startswith("/leaderboard/")
@@ -1463,9 +1467,6 @@ def test_challenge_rename_aliases_still_work():
     assert any("competitions() is deprecated" in m for m in msgs), msgs
     _call_warns(c.leaderboard, competition_id=43)
     assert rec.last["path"] == "/leaderboard/challenge/43"
-    _call_warns(c.create_competition, "N", "file_v1", copy_from_competition_id=3)
-    assert rec.last["json"] == {"name": "N", "kernel_version": "file_v1",
-                                "copy_from_challenge_id": 3}
     calls = len(rec.calls)
     try:
         c.attach_competition(2, competition_id=42)
@@ -1497,11 +1498,6 @@ _OLD_KEYWORD_CALLS = {
     "creator_competitions": (
         {},
         lambda c, f: c.creator_challenges(),
-    ),
-    "create_competition": (
-        {"name": "N", "kernel_version": "file_v1", "description": "d",
-         "copy_from_competition_id": 3, "tag_names": ["rl"], "is_public": False},
-        lambda c, f: c.create_challenge("N", "file_v1", "d", 3, ["rl"], False),
     ),
     "set_competition_tags": (
         {"competition_id": 4, "tag_names": ["rl"]},
@@ -1640,6 +1636,7 @@ def test_the_old_keyword_call_of_every_alias_is_listed():
     assert set(client_module._LEGACY_KWARGS) - passed == {
         "agent_id",                           # status(agent_id=)
         "max_active_agents_per_participant",  # update_settings(...)
+        "copy_from_competition_id",           # add_course_challenge(...)
     }
 
 

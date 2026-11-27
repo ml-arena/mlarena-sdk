@@ -320,34 +320,18 @@ def test_export_course_grades_csv_writes_the_file():
     _expect(not rec.last["params"], rec.last["params"])
 
 
-def test_list_and_unlist_an_example_course():
-    listed = {"id": 7, "example_listed_at_ts": "2026-11-26T10:00:00Z"}
-    c, rec = make_client(lambda method, *_: (200, listed if method == "POST"
-                                                  else {**listed, "example_listed_at_ts": None}))
-    _expect(c.list_course_as_example(7) == listed, "list")
-    _expect((rec.last["method"], rec.last["path"]) == ("POST", "/teacher/course/7/example"),
-            rec.last)
-    _expect(rec.last["json"] is None, rec.last["json"])
+def test_unlist_an_example_course():
+    """Listing is an admin's (the console); unlisting is the owner's."""
+    c, rec = make_client(lambda *_: (200, {"id": 7, "example_listed_at_ts": None}))
     _expect(c.unlist_course_example(7)["example_listed_at_ts"] is None, "unlist")
     _expect((rec.last["method"], rec.last["path"]) == ("DELETE", "/teacher/course/7/example"),
             rec.last)
 
 
-def test_listing_an_example_without_the_publishing_right_is_refused():
-    reason = "Listing a course as an example is an admin's"
-    c, _ = make_client(lambda *_: (403, {"error": reason}))
-    try:
-        c.list_course_as_example(7)
-    except mlarena.PermissionDeniedError as exc:
-        _expect(reason in str(exc), str(exc))
-    else:
-        raise AssertionError("a 403 must raise")
-
-
 def test_the_example_docstrings_say_what_a_copy_takes():
     """§6.7: the sentence about the seed and the data is in the docstrings
     of the methods that list or copy an example."""
-    for name in ("list_course_as_example", "unlist_course_example", "duplicate_course",
+    for name in ("unlist_course_example", "duplicate_course",
                  "start_from_example_course", "use_example_challenge",
                  "add_course_challenge", "course_catalog"):
         doc = " ".join(getattr(mlarena.MLArenaClient, name).__doc__.split())

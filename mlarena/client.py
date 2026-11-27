@@ -337,8 +337,7 @@ class MLArenaClient:
         account has accepted them, every method that creates a challenge is
         refused with a `PermissionDeniedError` (403) whose
         ``.body["reason"]`` is ``"terms_required"``: `add_course_challenge`
-        (a build and a copy), `create_challenge` (a challenge with no course),
-        `copy_module_into_course` and `duplicate_course` when a challenge
+        (a build and a copy), `copy_module_into_course` and `duplicate_course` when a challenge
         would be copied, and the compositions over them
         (`create_challenge_for_class`, `use_example_challenge`,
         `start_from_example_course`). Nothing is created then. Creating a
@@ -1129,10 +1128,10 @@ class MLArenaClient:
         return text
 
     def available_kinds(self) -> list:
-        """The challenge kinds `create_challenge` accepts (author scope).
+        """The challenge kinds `add_course_challenge` accepts (author scope).
 
         Mirrors `GET /api/creator_challenge/available_kinds` (`kinds.py`).
-        Each entry carries `kernel_version` (what `create_challenge` takes),
+        Each entry carries `kernel_version` (what `add_course_challenge` takes),
         `label`, `description`, `protocol`, `isolation`, `has_machine`,
         `capabilities` (`agent_template`, `benchmark`,
         `env_structural_check`, `runs`, `chat`, `submission_upload`,
@@ -1232,91 +1231,6 @@ class MLArenaClient:
                             fh.write(chunk)
                 written.append(out_path)
         return written
-
-    def create_challenge(self, name: str | None = None,
-                         kernel_version: str | None = None,
-                         description: str | None = None,
-                         copy_from_challenge_id: int | None = None,
-                         tag_names: list[str] | None = None,
-                         is_public: bool | None = None) -> dict:
-        """Create a challenge with no course, for everyone (author scope,
-        and the publishing right: an admin, for now).
-
-        It is open to every signed-in user and awards medals and
-        ranking points by default (`is_award_points`, `update_challenge`).
-        It is the platform's: a sponsored challenge or a hard benchmark. A
-        challenge for a class is created in its course instead
-        (`add_course_challenge`, or `create_challenge_for_class` for a new
-        course around it); anyone else is refused here with
-        `PermissionDeniedError` (403). Whoever may publish has accepted the
-        terms of use first, an admin included (`accept_terms`, once per
-        account): 403 with `.body["reason"] == "terms_required"` otherwise,
-        and nothing is created.
-
-        Mirrors `POST /api/creator_challenge/challenge`. `kernel_version` is
-        a kind: the keys `available_kinds()` serves (call it for the live
-        list and whether each has a machine, `has_machine`). Gymnasium,
-        PettingZoo and the other env-image families are not kinds: they are
-        flex_v1 challenges whose env runtime an admin picks. `name` is
-        required for a new challenge.
-
-        A copy (`copy_from_challenge_id`, a challenge you may copy: one of
-        an example course, one you are staff of, any for an admin) has its
-        source's kind (`kernel_version` is not needed), takes its env
-        folder, `challenge.toml`, every config key, its description and its
-        tags unless you send your own, and is named after its source unless
-        you send `name` (` (2)`, ` (3)`… when taken). Every copy starts
-        with the same data and the same scoring files as its source: change
-        the seed or the data before you start it.
-
-        The challenge runs on its kind's default machine, for a copy too;
-        the reply carries `message`, `challenge_id`, `name`, `slug`,
-        `machine_name` and `copied_from_challenge_id`. To move it, call
-        `update_settings(challenge_id, machine_id=…)` with an id from
-        `machines(kernel_version)`. A new challenge is born with its kind's
-        sample `env.py` and no benchmark file (`run_benchmark`); an exercise
-        set (`exercise_v1`) is born data-only (a two-line `env.py` and an
-        empty `exercises.json`, written with `update_exercise_definition`).
-
-        If `tag_names` is given, each name is resolved against the public
-        tag catalog (`GET /api/challenge_tags/tags`) before the create
-        call; on a copy they replace the source's tags. Unknown names raise
-        `MLArenaError` (fail fast — the catalog is admin-curated; new tags
-        are not auto-created).
-
-        A new challenge with no course is private unless `is_public=True` is passed:
-        hidden from listings and direct URLs, seen by its owner, its
-        assistants and admins only. `update_challenge(is_public=...)`
-        changes it later.
-        """
-        if copy_from_challenge_id is None and (name is None or kernel_version is None):
-            raise TypeError(
-                "create_challenge needs name and kernel_version for a new "
-                "challenge with no course (or copy_from_challenge_id for a copy)"
-            )
-        body: dict = {}
-        if name is not None:
-            body["name"] = name
-        if kernel_version is not None:
-            body["kernel_version"] = kernel_version
-        if description is not None:
-            body["description"] = description
-        if copy_from_challenge_id is not None:
-            body["copy_from_challenge_id"] = copy_from_challenge_id
-        if tag_names:
-            body["tag_ids"] = self._resolve_tag_names(tag_names)
-        if is_public is not None:
-            body["is_public"] = is_public
-        resp = self._request("POST",
-            self._url("/creator_challenge/challenge"),
-            headers=self._headers(json_body=True),
-            json=body,
-            timeout=60,
-        )
-        self._handle_response(resp)
-        if resp.status_code not in (200, 201):
-            raise _failed(MLArenaError, "create_challenge", resp)
-        return resp.json()
 
     def list_tags(self):
         """Return the tag catalog (`GET /api/challenge_tags/tags`).
@@ -1508,13 +1422,6 @@ class MLArenaClient:
                         deployment_nb_constraint_run: int | None = None,
                         deployment_nb_initial_score_run: int | None = None,
                         episode_budget_brackets: list | None = None,
-                        data_source_enabled: bool | _Unset = _UNSET,
-                        data_source_url: str | None | _Unset = _UNSET,
-                        data_source_asset: str | None | _Unset = _UNSET,
-                        data_source_filter: dict[str, str] | None | _Unset = _UNSET,
-                        data_source_history_hours: int | _Unset = _UNSET,
-                        batch_cron: str | _Unset = _UNSET,
-                        datagouv_topic_id: str | None | _Unset = _UNSET,
                         machine_id: int | None = None,
                         env_cpu_request: str | None = None,
                         env_cpu_limit: str | None = None,
@@ -1525,11 +1432,7 @@ class MLArenaClient:
                         agent_memory_request: str | None = None,
                         agent_memory_limit: str | None = None,
                         agent_ephemeral_storage_limit: str | None = None,
-                        env_gpu_count: int | None = None,
-                        agent_gpu_count: int | None = None,
-                        gpu_memory_limit: str | None | _Unset = _UNSET,
                         number_of_agents: int | None = None,
-                        docker_image_env_runtime_id: int | None = None,
                         agent_runtime_ids: list[int] | None = None,
                         default_agent_runtime_id: int | None = None,
                         render_delay_second: float | None = None,
@@ -1564,13 +1467,15 @@ class MLArenaClient:
         the challenge has started only the fields that cannot rescore an
         existing run still apply — the presentation fields of `metrics`
         (`label`, `unit`, `precision`, `format`, `visible`) and
-        `is_stop_after_deployment` (and `machine_id` and `datagouv_topic_id`
-        for an admin); everything
+        `is_stop_after_deployment`; everything
         else is rejected with 400 until the challenge is stopped.
 
         SDK 4.0.0 removed the keywords `metric`, `metric2`, `is_elo_score`,
         `metric_order`, `frontend_precision` and `metrics_schema`: passing
-        one raises `TypeError` pointing at `metrics`.
+        one raises `TypeError` pointing at `metrics`. SDK 4.27.0 removed the
+        keys only an admin may write (the data feed, `datagouv_topic_id`,
+        the GPU keys, `docker_image_env_runtime_id`): the published SDK
+        holds no admin operation, and the console's Config tab sets them.
 
         A kind accepts only the settings it has: the keywords of a
         capability flag that is false on the challenge's kind
@@ -1585,8 +1490,7 @@ class MLArenaClient:
         render_delay_second: a file challenge has neither), `multi_agent`
         (number_of_agents) and `exercises` (time_limit_sec, memory_limit_mb,
         max_concurrent_attempts, max_attempts_per_minute). The others apply to every kind, the runtime
-        included (machine_id, the env_* sizing, env_gpu_count,
-        gpu_memory_limit).
+        included (machine_id, the env_* sizing).
 
         Returns `{"configuration": {...}, "evaluation": {...}, "config":
         {...}}` — the two rows as the update left them, each under its own
@@ -1675,30 +1579,8 @@ class MLArenaClient:
         SDK 4.3.0 removed `env_max_time_per_step_second` (the platform
         dropped it: it was measured and never enforced).
 
-        Data feed (admin only — anyone else gets `PermissionDeniedError`,
-        403; frozen while the challenge runs). Each is sent only when passed,
-        and `None` is sent as null where the column allows it:
-            data_source_enabled: stage `{data_source_url}/{data_source_asset}`
-                for env.py on every `batch_cron` tick (a continuous
-                challenge). Enabling needs a URL and an asset.
-            data_source_url / data_source_asset: the DC API base URL and
-                the asset path under it (e.g. ".../api-dc", "weather");
-                None clears one on a disabled feed.
-            data_source_filter: extra query parameters, string values only,
-                e.g. `{"cities": "Paris:FR,Berlin:DE"}`; None clears it.
-            data_source_history_hours: hours of history per batch (1..9600).
-            batch_cron: the UTC cron schedule of fetches and runs.
-
-        data.gouv.fr partnership (admin only — anyone else gets
-        `PermissionDeniedError`, 403; editable while the challenge runs,
-        sent only when passed):
-            datagouv_topic_id: the 24-hex id of the data.gouv.fr topic of
-                the challenge's défi; teams may then link a reuse
-                (`link_datagouv_reuse`). None clears it.
-
         Runtime (the Runtime section of the console; frozen while the
-        challenge runs, except `machine_id` for an admin — pending jobs move
-        with it, running ones finish where they are). Quantities are K8s
+        challenge runs). Quantities are K8s
         strings (`"500m"`, `"2"`, `"1024Mi"`, `"4Gi"`); a kind's defaults
         and its `small` / `medium` / `large` presets are
         `available_kinds()[i]["runtime_defaults"]` / `["runtime_presets"]`.
@@ -1719,14 +1601,6 @@ class MLArenaClient:
                 container's size (kinds with `agent_containers`).
             number_of_agents: agents seated per match, >= 1 (kinds with
                 `multi_agent`; an ELO board needs >= 2).
-            env_gpu_count / agent_gpu_count / gpu_memory_limit: admin only —
-                GPU devices from the machine's inventory, and the GPU memory
-                cap (`None` sends null and clears it).
-
-        Infrastructure (admin only — anyone else gets
-        `PermissionDeniedError`, 403):
-            docker_image_env_runtime_id: the env runtime image, of the
-                challenge's own kernel.
 
         Agent runtimes (author keys, kinds with `agent_containers`;
         editable while the challenge runs — an offer changes no score):
@@ -1789,10 +1663,7 @@ class MLArenaClient:
             "agent_memory_request": agent_memory_request,
             "agent_memory_limit": agent_memory_limit,
             "agent_ephemeral_storage_limit": agent_ephemeral_storage_limit,
-            "env_gpu_count": env_gpu_count,
-            "agent_gpu_count": agent_gpu_count,
             "number_of_agents": number_of_agents,
-            "docker_image_env_runtime_id": docker_image_env_runtime_id,
             "agent_runtime_ids": agent_runtime_ids,
             "default_agent_runtime_id": default_agent_runtime_id,
             "render_delay_second": render_delay_second,
@@ -1802,22 +1673,18 @@ class MLArenaClient:
             "max_attempts_per_minute": max_attempts_per_minute,
         }
         body = {key: value for key, value in sent.items() if value is not None}
-        # Keys whose None is an explicit null (the backend clears the
-        # column): sent only when passed.
-        nullable = {
-            "window_days": window_days,
-            "data_source_enabled": data_source_enabled,
-            "data_source_url": data_source_url,
-            "data_source_asset": data_source_asset,
-            "data_source_filter": data_source_filter,
-            "data_source_history_hours": data_source_history_hours,
-            "batch_cron": batch_cron,
-            "datagouv_topic_id": datagouv_topic_id,
-            "gpu_memory_limit": gpu_memory_limit,
-        }
-        body.update({key: value for key, value in nullable.items() if value is not _UNSET})
+        # window_days: None is an explicit null (the backend clears the
+        # column), sent only when passed.
+        if window_days is not _UNSET:
+            body["window_days"] = window_days
+        return self._put_settings(challenge_id, body, "update_settings")
+
+    def _put_settings(self, challenge_id: int, body: dict, label: str) -> dict:
+        """`PUT /api/creator_challenge/challenge/{id}/settings` with `body`:
+        the one write of `update_settings`, shared with a subclass that
+        sends other keys of the same route."""
         if not body:
-            raise MLArenaError("update_settings requires at least one field")
+            raise MLArenaError(f"{label} requires at least one field")
         resp = self._request("PUT",
             self._url(f"/creator_challenge/challenge/{challenge_id}/settings"),
             headers=self._headers(json_body=True),
@@ -1826,7 +1693,7 @@ class MLArenaClient:
         )
         self._handle_response(resp)
         if resp.status_code != 200:
-            raise _failed(MLArenaError, "update_settings", resp)
+            raise _failed(MLArenaError, label, resp)
         return resp.json()
 
     def list_env_files(self, challenge_id: int) -> dict:
@@ -6924,9 +6791,9 @@ class MLArenaClient:
         `has_owner_rights` (whether you may do what only its owner may: the
         assistant roster, archive, delete, unlist from the examples — the
         owner and an admin), `may_list_as_example` (whether you may list it
-        as an example, `list_course_as_example`: the publishing right with
-        the owner's rights; that the course must be public and not archived
-        is the route's 409, not this flag), `owner_username`,
+        as an example: the publishing right with the owner's rights, an
+        admin's operation done in the console; that the course must be
+        public and not archived is the route's 409, not this flag), `owner_username`,
         `created_at_ts`, the settings
         (`ask_student_identity`, `report_recipients`, `report_to_assistants`,
         `report_last_sent_at_ts`) and the counts `enrollment_count`,
@@ -7008,34 +6875,6 @@ class MLArenaClient:
         return self._json_call(
             "POST", f"/teacher/course/{course_id}/duplicate", json_body=body,
             ok=(201,), error_label="duplicate_course", timeout=300,
-        )
-
-    def list_course_as_example(self, course_id: int) -> dict:
-        """List a course as an example: a starting point offered to teachers,
-        who copy it whole (`start_from_example_course`) or take one of its
-        challenges into a course of theirs (`use_example_challenge`).
-
-        Mirrors `POST /api/teacher/course/{id}/example`. It needs the
-        publishing right (an admin, for now; 403 otherwise) and the owner's
-        rights on the course; 409 when the course is not public, is archived
-        or is listed already. Returns the course (`teacher_course` shape)
-        with `example_listed_at_ts` set.
-
-        What listing gives away: every copy takes the challenges' scoring
-        files, their data, the exercise solutions and the data-feed keys,
-        and every copy starts with the same data and the same scoring files
-        (a teacher should change the seed or the data before starting a
-        challenge). List a course whose challenges a full copy does not
-        spoil: scored on data that does not exist yet (a live feed),
-        played against other participants (multiplayer), or generated from
-        a configuration the teacher changes (a seed, a base to extend); not
-        a challenge scored against a fixed file of answers. Whoever lists is
-        responsible for the choice. While listed, making the course
-        private, archiving it and deleting it are refused (409).
-        """
-        return self._json_call(
-            "POST", f"/teacher/course/{course_id}/example",
-            error_label="list_course_as_example",
         )
 
     def unlist_course_example(self, course_id: int) -> dict:
@@ -8071,7 +7910,6 @@ _RENAMED_METHODS = {
     "competitions": "challenges",
     "competition": "challenge",
     "creator_competitions": "creator_challenges",
-    "create_competition": "create_challenge",
     "set_competition_tags": "set_challenge_tags",
     "update_competition": "update_challenge",
     "set_competition_image": "set_challenge_image",
@@ -8100,6 +7938,16 @@ _RENAMED_METHODS = {
 _GONE_COMPETITION_METHODS = ("attach_competition", "detach_competition")
 COURSE_CHALLENGE_SENTENCE = (
     "a challenge now belongs to its course: create it with `add_course_challenge`"
+)
+
+# 4.27.0: the published SDK holds no admin operation. Creating an open
+# challenge and listing a course as an example need the publishing right (an
+# admin's); the console does both. `create_competition` was the old name of
+# `create_challenge`.
+_ADMIN_METHODS = ("create_challenge", "create_competition", "list_course_as_example")
+ADMIN_SENTENCE = (
+    "an admin operation, done in the console (the published SDK holds none); "
+    "a challenge for a class is created with `add_course_challenge`"
 )
 
 # Old methods that took `(challenge_id, submission_id)` where their
@@ -8200,19 +8048,20 @@ for _old, _new in _RENAMED_METHODS.items():
     setattr(MLArenaClient, _old, _accepts_legacy_kwargs(
         _deprecated_alias(_old, _new)))
 
-def _gone_alias(old_name):
+def _gone_alias(old_name, sentence):
     def gone(self, *args, **kwargs):
-        raise MLArenaError(
-            f"MLArenaClient.{old_name}() is gone: {COURSE_CHALLENGE_SENTENCE}"
-        )
+        raise MLArenaError(f"MLArenaClient.{old_name}() is gone: {sentence}")
     gone.__name__ = old_name
     gone.__qualname__ = f"MLArenaClient.{old_name}"
-    gone.__doc__ = f"Removed: {COURSE_CHALLENGE_SENTENCE}."
+    gone.__doc__ = f"Removed: {sentence}."
     return gone
 
 
 for _old in _GONE_COMPETITION_METHODS:
-    setattr(MLArenaClient, _old, _gone_alias(_old))
+    setattr(MLArenaClient, _old, _gone_alias(_old, COURSE_CHALLENGE_SENTENCE))
+
+for _old in _ADMIN_METHODS:
+    setattr(MLArenaClient, _old, _gone_alias(_old, ADMIN_SENTENCE))
 
 for _old, _new in _KEYED_BY_SUBMISSION_METHODS.items():
     if not hasattr(MLArenaClient, _new):
