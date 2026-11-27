@@ -2009,6 +2009,7 @@ mlarena whoami
 mlarena submit --challenge lunar-lander-v3 --files agent.py model.pt --runtime torch --wait
 mlarena challenge push ./my-challenge --challenge my-challenge --dry-run
 mlarena course push ./my-course --dry-run
+mlarena course status --course my-course
 mlarena course export my-course ./my-course
 ```
 
@@ -2026,7 +2027,6 @@ mlarena course export my-course ./my-course
   `gh-<sha7>`, and a commit already submitted is reported, not submitted
   again.
 - `mlarena challenge push [DIR] --challenge <slug-or-id> [--path SUBPATH] [--dry-run]`
-mlarena course status --course my-course
   replaces the challenge's files with the directory (`push_challenge`) and
   prints what changed, the config result and the `env.py` check.
 - `mlarena course push [DIR] [--slug SLUG] [--path SUBPATH] [--dry-run] [--prune]`
@@ -2143,6 +2143,8 @@ permissions:
 jobs:
   push:
     runs-on: ubuntu-latest
+    env:
+      MLARENA_COURSE_KEY: ${{ secrets.MLARENA_COURSE_KEY }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -2152,6 +2154,9 @@ jobs:
       - run: mlarena course push .
 ```
 
+The template [`ml-arena/template-course`](https://github.com/ml-arena/template-course)
+is that workflow through `ml-arena/mlarena-action@v2`.
+
 Add `--dry-run` in a workflow that runs on other branches to check a change
 without applying it.
 
@@ -2160,8 +2165,6 @@ without applying it.
 ### `mlarena.connect(api_key=None, base_url="https://ml-arena.com", *, course_key=None, scope="user", audience=None)`
 
 Create a client. `api_key` is the full `mlk_<scope>_<lookup>_<secret>` token, `course_key` a course's `mlc_<lookup>_<secret>` key (one of the two); left out, the credential is `MLARENA_API_KEY` or `MLARENA_COURSE_KEY` (not both), else the GitHub Actions OIDC exchange (`scope` is the scope asked for there). `client.credentials` (`kind`: `api_key`, `course_key` or `github_actions`; `scope`, `username`, `source_revision`) says which was used.
-    env:
-      MLARENA_COURSE_KEY: ${{ secrets.MLARENA_COURSE_KEY }}
 
 ### Account
 
@@ -2171,9 +2174,6 @@ Create a client. `api_key` is the full `mlk_<scope>_<lookup>_<secret>` token, `c
 - `client.trusted_repositories()`, `client.add_trusted_repository("owner/name")`, `client.remove_trusted_repository(id)` — the repositories you do not own whose GitHub Actions runs may act as you.
 
 ### Submissions (user scope)
-The template [`ml-arena/template-course`](https://github.com/ml-arena/template-course)
-is that workflow through `ml-arena/mlarena-action@v2`.
-
 
 - `client.submit(challenge_id, agent=None, files=None, submission_name=None, runtime_id=None, runtime=None, wait=False, timeout_sec=None, poll_sec=5.0, *, deploy=True, allow_same_commit=False)` — one-shot check + create + (pick runner) + upload + deploy. `agent=` is a class (its source only, as `agent.py`) or a module; `files=` a list of paths. Before the create it refuses an unknown runtime, a path or an instance as `agent=`, `agent=` on a challenge whose entry file is not `agent.py`, a missing file, two files with one base name, and files over `max_upload_files` / `max_upload_size_bytes`. Every error raised after the create carries `err.submission_id` (nothing is deleted). Returns `{"submission_id", "deploy"}`, plus `"status"` with `wait=True`; `deploy=False` stops after the upload check. From a GitHub Actions run, a commit that already made a submission returns `{"submission_id", "deploy": None, "already_submitted": True, "status"}` unless `allow_same_commit=True`.
 - `client.create_submission(challenge_id, submission_name, copy_from_submission_id=None, *, allow_same_commit=False)` — from a GitHub Actions run, a second create for the same commit is a 409 whose `err.body["submission_id"]` is the existing submission.
@@ -2524,6 +2524,7 @@ print(student.my_progress(landing["id"]))                # content % + next less
 - `client.upload_module_asset(module_id, file_path, path=None)` (returns `{path, url}`; link it from a lesson body by its `path`: `![fig](media/fig.png)`), `list_module_assets(module_id)`, `delete_module_asset(module_id, path)`.
 - `client.preview_lesson(lesson_id, body_md=None)` — validates `mlarena:` directives as you (fails loud on unknown, and on a challenge you may not see as on one that does not exist); `warnings` names the courses whose students would not see a block's challenge.
 - `client.push_course(path, slug=None, subpath=None, dry_run=False, prune=False)`, `client.import_course_from_github(slug, repository, ref=None, path=None, dry_run=False, prune=False)`, `client.export_course_to_dir(slug, path, overwrite=False)` — a course as a directory (above).
+- `client.course_github(course_id)`, `set_course_repository(course_id, repository, branch="main", path="")`, `switch_course_edited_in(course_id, to)`, `create_course_key(course_id, label, expires_in_days=365)`, `revoke_course_key(course_id, key_id)`, `course_repository_runs(course_id, before_id=None)` — Settings › GitHub: where the course is edited, its repository, keys and runs. `course_key_whoami()` — with a course key: its course.
 - `client.add_course_challenge(course_id, name=None, *, kernel_version=None, copy_from_challenge_id=None, module_id=None, pass_threshold=…)` — the console's Add › Challenge: builds a challenge in the course (`name` + `kernel_version`; `"exercise_v1"` for an exercise set) or copies one (`copy_from_challenge_id`: a challenge of an example course, or one you are staff of), owned by the course's owner, a draft, at the end of `module_id` or in a new module titled with its name. `pass_threshold` left out: 70 for an exercise set, no bar otherwise; `None`: no bar. Every member of the course's staff builds every kind (`file_v1`, `flex_v1`, `chat_v1`, `exercise_v1`); a build and a copy both need the terms of use accepted (`accept_terms`; `PermissionDeniedError` with `err.body["reason"] == "terms_required"` otherwise), and a copy needs the source's `can_copy` (404 otherwise). Every copy starts with the same data and the same scoring files as its source: change the seed or the data before you start a challenge.
 - Helpers (compositions, no endpoint): `client.create_challenge_for_class(name, kernel_version=None, *, copy_from_challenge_id=None, end_date=None, pass_threshold=…)` — the New dialog's "Challenge for my class": a private course named after the challenge, then the challenge in it; returns `{course, challenge}`. The terms of use are checked first (`me()["terms_accepted_at_ts"]`): an account that has not accepted them is refused before the course is created, with the challenge route's own error (`err.body["reason"] == "terms_required"`); a challenge refused for another cause leaves the empty course, and the error names it. `client.use_example_challenge(challenge_id, course_id=None, *, name=None, module_id=None)` — "Use in my course": a copy of an example's challenge (any challenge whose `can_copy` is true) in a course of yours, or in a new one (the terms checked first, as above). `client.start_from_example_course(course, name=None)` — "Start from this course": your private copy of an example course (id or slug); one route, which copies everything or, without the terms, nothing.
 - `client.copy_module_into_course(course_id, module_id)` — the console's "Copy a module from another course": a module of a course you are staff of, with its lessons, assets and challenges (as draft copies; a module that holds a challenge needs the terms of use accepted, 403 `terms_required` otherwise and nothing is copied); `client.list_copyable_modules(course_id)` lists the modules of your other courses.
@@ -2541,7 +2542,6 @@ print(student.my_progress(landing["id"]))                # content % + next less
 
 #### Lesson directives
 
-- `client.course_github(course_id)`, `set_course_repository(course_id, repository, branch="main", path="")`, `switch_course_edited_in(course_id, to)`, `create_course_key(course_id, label, expires_in_days=365)`, `revoke_course_key(course_id, key_id)`, `course_repository_runs(course_id, before_id=None)` — Settings › GitHub: where the course is edited, its repository, keys and runs. `course_key_whoami()` — with a course key: its course.
 A lesson body is Markdown plus `mlarena:` blocks: a fenced code block whose
 info string is `mlarena:<type>` followed by `key=value` arguments (values
 with spaces in quotes), closed by a ```` ``` ```` line; the block's body is
