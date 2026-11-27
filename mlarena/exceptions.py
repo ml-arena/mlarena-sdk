@@ -10,11 +10,14 @@ class MLArenaError(Exception):
     `error` (the sentence, which is the message here):
 
     - `"out_of_credits"` (409): the owner of the challenge has no compute
-      credits left on the balance its machine draws from. A deploy, a chat
-      conversation or message, an exercise Check, a benchmark run, a re-score
-      and an update of a started challenge's files are refused with it;
-      nothing is written, and the call succeeds again once the owner has
-      credits (`credits()`). A participant's sentence names no figure.
+      credits left on the balance its machine draws from. A benchmark run, a
+      re-score, an update of a started challenge's files, a self-test and
+      Start are refused with it; nothing is written, and the call succeeds
+      again once the owner has credits (`credits()`).
+    - `"on_hold"` (409): the challenge is paused (its owner's credits are
+      used up). A chat conversation or message and an exercise Check are
+      refused with it; the sentence names no credit. A deploy is not
+      refused: its runs wait.
     - `"test_runs_cap"` (409): the owner of the challenge already has 3
       test runs queued or running (benchmark runs and exercise self-tests,
       all their challenges together): `run_benchmark` and

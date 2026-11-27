@@ -561,7 +561,6 @@ def _submit_router(is_deployable=True):
 # `DeployRefusedResponse`: `reason` is always served, null on a quota refusal.
 _DEPLOY_409 = {
     "error": "Daily deployment limit (5) reached",
-    "reason": None,
     "deployment_limits": {
         "daily_deploy_limit": 5, "daily_deploys_used": 5,
         "daily_deploys_remaining": 0,
@@ -1806,10 +1805,9 @@ def test_a_failed_deploy_status_keeps_the_servers_reason():
 
 
 def test_a_refused_deploy_carries_the_servers_limits():
-    """A deploy 409 body is `{"error", "reason", "deployment_limits",
+    """A deploy 409 body is `{"error", "deployment_limits",
     "active_submission_limits"}` — the blocks `submission_deploy_status()`
-    returns, and a `reason` that is null on a quota refusal. The message is
-    unchanged; the body is on the exception."""
+    returns. The message is unchanged; the body is on the exception."""
     c, _ = make_client(lambda *_: (409, _DEPLOY_409))
     try:
         c.deploy_submission(4, 11)
@@ -1820,26 +1818,7 @@ def test_a_refused_deploy_carries_the_servers_limits():
         assert exc.status_code == 409
         assert exc.body["deployment_limits"]["next_deploy_available_at"] == "2026-09-23T00:00:00+00:00"
         assert exc.body["active_submission_limits"]["max_active_submissions"] == 3
-        assert exc.body["reason"] is None
         assert isinstance(exc, mlarena.MLArenaError)
-
-
-def test_a_deploy_refused_for_credits_carries_its_reason_beside_the_limits():
-    """The challenge's owner has no compute credits left: the same 409 and
-    the same two blocks, plus `reason: "out_of_credits"`; `error` is the
-    participant's sentence (no figure)."""
-    sentence = ("This course has used its compute credits for now, so your submission "
-                "cannot be scored yet. It is saved; deploy it again later. Your teacher "
-                "has been told.")
-    body = {**_DEPLOY_409, "error": sentence, "reason": "out_of_credits"}
-    c, _ = make_client(lambda *_: (409, body))
-    with pytest.raises(SubmissionError) as raised:
-        c.deploy_submission(4, 11)
-    assert raised.value.status_code == 409
-    assert raised.value.body["reason"] == "out_of_credits"
-    assert set(raised.value.body) == {
-        "error", "reason", "deployment_limits", "active_submission_limits"}
-    assert str(raised.value) == f"deploy_submission failed: {sentence}"
 
 
 def test_every_http_refusal_carries_status_code_and_body():

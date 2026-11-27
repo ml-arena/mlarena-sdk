@@ -3307,21 +3307,15 @@ class MLArenaClient:
 
         A refusal is a 409 raised as `SubmissionError`: the submission is not
         in a deployable state (`.body` is `{"error"}`), the daily deploy
-        quota is used up, the participant already holds
-        `max_active_submissions` slots, or the challenge's owner has no
-        compute credits left. For a quota or a credits refusal the body, on
-        the error's `.body`, is `{"error", "reason", "deployment_limits",
+        quota is used up or the participant already holds
+        `max_active_submissions` slots. For a quota refusal the body, on
+        the error's `.body`, is `{"error", "deployment_limits",
         "active_submission_limits"}` — the same two blocks
         `submission_deploy_status()` returns, so the caller can read
         `next_deploy_available_at` or `active_submissions_remaining` off the
-        exception without another call. `reason` is always there: None on a
-        quota refusal, which the two blocks describe, and
-        `"out_of_credits"` on a credits refusal: the owner of the challenge
-        pays for the runs a deploy queues, so the deploy waits for their
-        credits. That refusal uses none of your daily deploys, leaves the
-        submission and its files as they are and names no figure (`error`
-        is the sentence: "… your submission cannot be scored yet. It is
-        saved; deploy it again later."). `EnrollmentRequiredError` on a
+        exception without another call. A challenge that is paused (on
+        hold) takes the deploy: its runs wait and are scored once it
+        resumes. `EnrollmentRequiredError` on a
         course challenge whose course you are not enrolled in.
         """
         resp = self._request("PUT",
@@ -4845,8 +4839,8 @@ class MLArenaClient:
         `session_closed` | `turn_in_flight` | `challenge_not_started` |
         `challenge_stopped` | `challenge_ended` | `enrollment_required` —
         the session's owner is no longer enrolled in the challenge's course
-        — | `out_of_credits` — the challenge's owner has no compute credits
-        left: nothing more is sent until they have some — | `agent_offline`
+        — | `on_hold` — the challenge is paused: nothing more is sent until
+        it resumes — | `agent_offline`
         | `turn_limit_reached`, None exactly when `can_send` is true). Readable
         by the session's user, their teammates, the challenge's owner,
         assistants and admins.
@@ -4894,9 +4888,9 @@ class MLArenaClient:
         `MLArenaError` with the server's reason when it refuses (409: the
         challenge is not started, a turn is already in flight on this
         session, the session is not `open`, `max_turns_per_session` is
-        reached, or the challenge's owner has no compute credits left: that
-        409 carries `.body["reason"] == "out_of_credits"` beside `error`,
-        the `can_send_reason` of the session). `EnrollmentRequiredError`
+        reached, or the challenge is paused: that 409 carries
+        `.body["reason"] == "on_hold"` beside `error`, the `can_send_reason`
+        of the session). `EnrollmentRequiredError`
         when you are no longer enrolled in the challenge's course.
         """
         accepted = self._chat_call(
@@ -5254,9 +5248,8 @@ class MLArenaClient:
         reason on a refusal — 409 while an attempt of this exercise is still
         in flight for your group (`.body["attempt_id"]` names it), when the
         challenge is a draft (not started) or closed (stopped or ended), or
-        when the set's owner has no compute credits left (`.body["reason"]
-        == "out_of_credits"` beside `error`: the Check is paused, nothing is
-        written; an attempt already queued is still checked); 429
+        when the set is paused (`.body["reason"] == "on_hold"` beside
+        `error`: nothing is written); 429
         over the challenge's per-minute attempt cap (`.body
         ["max_attempts_per_minute"]`, per group, last 60 s); 400 for `code`
         on a text / choice exercise, `answer` on a code one, or a `choice`
@@ -5651,13 +5644,17 @@ class MLArenaClient:
         participant pays nothing. A machine draws from one balance: the GPU
         machine from `gpu`, every other from `cpu`.
 
-        Returns `{"balances": [cpu, gpu]}`, each `{resource, balance, debt,
+        Returns `{"balances": [cpu, gpu]}`, each `{resource, balance, overrun,
         full_grant, pct_used, alert_pct, grants}`: `balance` is negative
-        while it owes (`debt`), `pct_used` the share of `full_grant` used
-        (0 to 100), `alert_pct` the alert level reached (80, 100 or None),
-        and `grants` (oldest first) each `{id, kind, amount, consumed,
-        expires_at_ts, note, created_at_ts, is_active}`, `kind` being
-        `entry` (the grant a new account starts with), `admin` or `refill`.
+        while there is an `overrun` (what work already running cost after
+        the balance reached 0; the next grant covers it first), `pct_used`
+        the share of `full_grant` used (0 to 100), `alert_pct` the alert
+        level reached (80, 100 or None), and `grants` (oldest first) each
+        `{id, kind, amount, consumed, expires_at_ts, note, created_at_ts,
+        is_active}`, `kind` being `entry` (the grant a new account starts
+        with) or `admin`. At 0 or below, the owner's challenges on a machine
+        of that balance are on hold: their queued runs wait, their chat and
+        exercise pods stop, and new work is refused until a grant.
         Amounts are four-decimal strings (`"5000.0000"`): parse them with
         `decimal.Decimal`. The first read creates the two balances (the CPU
         one with its entry grant). More credits come from an admin.
