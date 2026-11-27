@@ -3,16 +3,26 @@
 One resolution order, used by `mlarena.connect()` and by the CLI
 (`resolve_credentials`):
 
-1. the `api_key` argument;
-2. the `MLARENA_API_KEY` environment variable;
+1. the `api_key` argument (an `mlk_…` key; an `mlc_…` course key is
+   accepted there too) or the `course_key` argument (an `mlc_…` key), never
+   both;
+2. the `MLARENA_API_KEY` or the `MLARENA_COURSE_KEY` environment variable,
+   never both;
 3. inside a GitHub Actions job that has `permissions: id-token: write`
    (`ACTIONS_ID_TOKEN_REQUEST_URL` and `ACTIONS_ID_TOKEN_REQUEST_TOKEN` are
    set): the job's OIDC token, exchanged at `POST /api/auth/oidc/github` for a
-   short-lived `mlo_…` token. No secret is stored in the repository.
+   short-lived `mlo_…` token. No secret is stored in the repository. Skipped
+   with `oidc=False` (the course commands: a course is pushed with its key).
 
-With none of the three the call raises, naming them. Nothing is guessed: a
+With none of them the call raises, naming them. Nothing is guessed: a
 key that is set but malformed is an error, never a reason to try the next
 source.
+
+A **course key** (`mlc_<lookup>_<secret>`) belongs to one course: it is
+minted in the course's Settings › GitHub (`create_course_key`) and stored as
+the repository secret `MLARENA_COURSE_KEY`. It reaches two routes only:
+`GET /api/auth/course_key` (which course it is) and that course's bundle push.
+`ci_context_headers` is what a push sends about the GitHub run it comes from.
 """
 
 import os
@@ -32,6 +42,7 @@ from mlarena.exceptions import (
 PROD_BASE_URL = "https://ml-arena.com"
 
 ENV_API_KEY = "MLARENA_API_KEY"
+ENV_COURSE_KEY = "MLARENA_COURSE_KEY"
 ENV_BASE_URL = "MLARENA_BASE_URL"
 ENV_OIDC_AUDIENCE = "MLARENA_OIDC_AUDIENCE"
 # Set by the Actions runner for a job with `permissions: id-token: write`.
@@ -46,8 +57,26 @@ OIDC_SCOPES = ("user", "author")
 # warned and sent as `author`. The server reads them as `author` too.
 LEGACY_OIDC_SCOPES = ("creator", "teacher")
 
+# Which course a course key belongs to (`backend/app/auth/routes/course_key.py`):
+# `CourseKeyWhoamiOut{course_id, slug, edited_in, expires_at_ts}`.
+COURSE_KEY_WHOAMI_PATH = "/api/auth/course_key"
+# The `scope` of a course key's `Credentials`: it has no API-key scope, it
+# pushes its course.
+COURSE_KEY_SCOPE = "course"
+
 KIND_API_KEY = "api_key"
+KIND_COURSE_KEY = "course_key"
 KIND_GITHUB_ACTIONS = "github_actions"
+
+# The GitHub run a course push comes from, sent as request headers of the
+# bundle push and recorded on the course's run row as reported (never
+# trusted). Header -> the Actions variable it is read from; the run URL is
+# built from four of them (`ci_context_headers`).
+CI_HEADER_REPOSITORY = "X-MLArena-CI-Repository"
+CI_HEADER_COMMIT = "X-MLArena-CI-Commit"
+CI_HEADER_REF = "X-MLArena-CI-Ref"
+CI_HEADER_RUN_URL = "X-MLArena-CI-Run-Url"
+CI_HEADER_ACTOR = "X-MLArena-CI-Actor"
 
 _LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 
@@ -57,7 +86,8 @@ class Credentials:
     """The bearer token a client sends, and where it came from.
 
     `kind` is `"api_key"` (an `mlk_…` key; `scope` is the key's own scope
-    segment) or `"github_actions"` (an `mlo_…` token from the OIDC exchange;
+    segment), `"course_key"` (an `mlc_…` key of one course; `scope` is
+    `"course"`) or `"github_actions"` (an `mlo_…` token from the OIDC exchange;
     `scope` is the scope that was asked for, and `username`, `expires_at_ts`
     and `source_revision` are the exchange's reply: the account the
     repository is linked to and the commit the run is building).
@@ -73,7 +103,8 @@ class Credentials:
 
     def expires_within(self, seconds: float) -> bool:
         """True when the token has an expiry that is less than `seconds`
-        away. An API key has none."""
+        away. An API key has none, and a course key is not renewed (its
+        expiry is the one `GET /api/auth/course_key` serves)."""
         if self.expires_at_ts is None:
             return False
         expires_at = datetime.fromisoformat(self.expires_at_ts.replace("Z", "+00:00"))
@@ -98,9 +129,18 @@ def check_transport(base_url: str, allow_insecure: bool) -> None:
 def check_token_shape(token: str) -> str:
     """Validate a bearer token's shape and return its kind.
 
-    `mlk_<scope>_<lookup>_<secret>` is an API key, `mlo_<lookup>_<secret>` a
-    CI token. The backend decides authenticity on the first request.
+    `mlk_<scope>_<lookup>_<secret>` is an API key, `mlc_<lookup>_<secret>` a
+    course key, `mlo_<lookup>_<secret>` a CI token. The backend decides
+    authenticity on the first request.
     """
+    if token and token.startswith("mlc_"):
+        parts = token.split("_")
+        if len(parts) != 3 or any(not part for part in parts):
+            raise AuthenticationError(
+                "Invalid course key shape. Expected 'mlc_<lookup>_<secret>' "
+                "(copy it from the course's Settings › GitHub)."
+            )
+        return KIND_COURSE_KEY
     if token and token.startswith("mlo_"):
         parts = token.split("_")
         if len(parts) != 3 or any(not part for part in parts):
@@ -215,27 +255,98 @@ def exchange_github_oidc_token(base_url: str, token: str, scope: str) -> dict:
     raise cls(reason, status_code=resp.status_code, body=_body(resp))
 
 
+def ci_context_headers(environ=None) -> dict:
+    """The `X-MLArena-CI-*` headers of a course push, read from the GitHub
+    Actions variables of the job (empty outside a GitHub Actions job).
+
+    The course's run row records them as the run reports them: repository
+    (`GITHUB_REPOSITORY`), commit (`GITHUB_SHA`), ref (`GITHUB_REF`), actor
+    (`GITHUB_ACTOR`) and the run's URL,
+    `$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT`.
+    A variable that is not set sends no header (the run URL needs all four).
+    """
+    environ = os.environ if environ is None else environ
+    if environ.get("GITHUB_ACTIONS") != "true":
+        return {}
+    headers = {}
+    for header, name in ((CI_HEADER_REPOSITORY, "GITHUB_REPOSITORY"),
+                         (CI_HEADER_COMMIT, "GITHUB_SHA"),
+                         (CI_HEADER_REF, "GITHUB_REF"),
+                         (CI_HEADER_ACTOR, "GITHUB_ACTOR")):
+        if environ.get(name):
+            headers[header] = environ[name]
+    parts = [environ.get(name) for name in (
+        "GITHUB_SERVER_URL", "GITHUB_REPOSITORY", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT")]
+    if all(parts):
+        server, repository, run_id, attempt = parts
+        headers[CI_HEADER_RUN_URL] = (
+            f"{server.rstrip('/')}/{repository}/actions/runs/{run_id}/attempts/{attempt}")
+    return headers
+
+
+def _key_credentials(token: str, source: str, scope: str) -> Credentials:
+    """The `Credentials` of an `mlk_` or `mlc_` key named by `source` (the
+    argument or the variable it came from, for the error)."""
+    if source in ("course_key", ENV_COURSE_KEY):
+        if token == "":
+            raise AuthenticationError(
+                f"{source} is set but empty. In a GitHub Actions workflow, add the "
+                "repository secret MLARENA_COURSE_KEY (the course's Settings › GitHub "
+                "creates the key) and pass it to the step as "
+                "`env: MLARENA_COURSE_KEY: ${{ secrets.MLARENA_COURSE_KEY }}`."
+            )
+        if check_token_shape(token) != KIND_COURSE_KEY:
+            raise AuthenticationError(
+                f"{source} holds a key that is not a course key: expected "
+                "'mlc_<lookup>_<secret>' (the course's Settings › GitHub). A personal "
+                "key goes in MLARENA_API_KEY."
+            )
+        return Credentials(token=token, kind=KIND_COURSE_KEY, scope=COURSE_KEY_SCOPE)
+    kind = check_token_shape(token)
+    if kind == KIND_API_KEY:
+        return Credentials(token=token, kind=kind, scope=token.split("_", 3)[1])
+    if kind == KIND_COURSE_KEY:
+        return Credentials(token=token, kind=kind, scope=COURSE_KEY_SCOPE)
+    # An `mlo_` token passed as it is: the scope it was exchanged for.
+    return Credentials(token=token, kind=kind, scope=scope)
+
+
 def resolve_credentials(api_key: str | None = None, *,
+                        course_key: str | None = None,
                         base_url: str = PROD_BASE_URL,
                         scope: str = "user",
                         audience: str | None = None,
                         allow_insecure: bool = False,
+                        oidc: bool = True,
                         environ=None) -> Credentials:
     """Resolve the bearer token to send (module docstring: the order).
 
     `scope` and `audience` matter only for the GitHub Actions exchange: an
-    API key carries its own scope.
+    API key carries its own, and a course key pushes its course. `oidc=False`
+    never tries the exchange: without a key the call raises.
     """
     environ = os.environ if environ is None else environ
     check_transport(base_url, allow_insecure)
 
-    key = api_key if api_key is not None else environ.get(ENV_API_KEY)
-    if key is not None:
-        kind = check_token_shape(key)
-        key_scope = key.split("_", 3)[1] if kind == KIND_API_KEY else scope
-        return Credentials(token=key, kind=kind, scope=key_scope)
+    if api_key is not None and course_key is not None:
+        raise AuthenticationError("pass api_key= or course_key=, not both")
+    if api_key is not None:
+        return _key_credentials(api_key, "api_key", scope)
+    if course_key is not None:
+        return _key_credentials(course_key, "course_key", scope)
+    env_key, env_course_key = environ.get(ENV_API_KEY), environ.get(ENV_COURSE_KEY)
+    if env_key is not None and env_course_key is not None:
+        raise AuthenticationError(
+            f"both {ENV_API_KEY} and {ENV_COURSE_KEY} are set: unset one. A course "
+            f"edited on GitHub is pushed with its course key ({ENV_COURSE_KEY}); "
+            f"everything else takes a personal key ({ENV_API_KEY})."
+        )
+    if env_key is not None:
+        return _key_credentials(env_key, ENV_API_KEY, scope)
+    if env_course_key is not None:
+        return _key_credentials(env_course_key, ENV_COURSE_KEY, scope)
 
-    if in_github_actions_oidc(environ):
+    if oidc and in_github_actions_oidc(environ):
         if scope in LEGACY_OIDC_SCOPES:
             warnings.warn(
                 f"scope={scope!r} is deprecated: the {scope} scope is now "
@@ -260,6 +371,13 @@ def resolve_credentials(api_key: str | None = None, *,
             source_revision=reply["source_revision"],
         )
 
+    if not oidc:
+        raise AuthenticationError(
+            f"No ML Arena key. A course is pushed with its course key: set "
+            f"{ENV_COURSE_KEY} (the course's Settings › GitHub creates it; in a "
+            f"workflow, the repository secret of that name), or {ENV_API_KEY} with a "
+            f"personal author key for a course edited in the console."
+        )
     hint = ""
     if environ.get("GITHUB_ACTIONS") == "true":
         hint = (" This GitHub Actions job cannot request an OIDC token: add "
@@ -267,7 +385,8 @@ def resolve_credentials(api_key: str | None = None, *,
     raise AuthenticationError(
         "No ML Arena credential. Use one of: (1) pass api_key= "
         "(mlarena.connect(api_key=\"mlk_…\")); (2) set the MLARENA_API_KEY "
-        "environment variable; (3) run inside a GitHub Actions job with "
+        "environment variable (or MLARENA_COURSE_KEY, a course's key); (3) run "
+        "inside a GitHub Actions job with "
         "`permissions: id-token: write`, from a repository linked to your "
         "account (Profile → GitHub)." + hint
     )

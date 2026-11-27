@@ -39,10 +39,11 @@ REVISION = {
 }
 
 _GITHUB_ENV = (
-    "MLARENA_API_KEY", "MLARENA_BASE_URL", "MLARENA_OIDC_AUDIENCE",
+    "MLARENA_API_KEY", "MLARENA_COURSE_KEY", "MLARENA_BASE_URL", "MLARENA_OIDC_AUDIENCE",
     "ACTIONS_ID_TOKEN_REQUEST_URL", "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
     "GITHUB_ACTIONS", "GITHUB_STEP_SUMMARY", "GITHUB_OUTPUT", "GITHUB_SHA", "GITHUB_REF_NAME",
-    "GITHUB_REF_TYPE",
+    "GITHUB_REF_TYPE", "GITHUB_REPOSITORY", "GITHUB_REF", "GITHUB_ACTOR", "GITHUB_SERVER_URL",
+    "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT",
 )
 
 
@@ -667,6 +668,7 @@ COURSE_PLAN = {
     }],
     "unmanaged_modules": ["extra"],
     "unmanaged_challenges": ["Old maze"],
+    "unpublished_modules": [], "removed_challenges": [], "unplaced_challenges": [],
     "source_revision": REVISION,
     "url": "/courses/intro-to-rl",
     "warnings": [
@@ -675,6 +677,38 @@ COURSE_PLAN = {
         "visible to the students of course 'Intro to RL' (it is private and the course "
         "does not assign it), so they will not see this block",
     ],
+}
+
+
+COURSE_KEY = "mlc_0123456789abcdef_0123456789abcdef0123456789abcdef"
+
+COURSE_GITHUB = {
+    "edited_in": "github",
+    "repository": {"repository": "racousin/python-medecine", "branch": "main",
+                   "path": "", "connected_by_user_id": 7,
+                   "connected_at_ts": "2026-11-27T10:00:00Z"},
+    "keys": [
+        {"id": 3, "label": "GitHub Actions", "created_by_user_id": 7,
+         "created_by_username": "alice", "created_at_ts": "2026-11-27T10:00:00Z",
+         "expires_at_ts": "2027-11-27T10:00:00Z", "last_used_at_ts": "2026-11-27T11:00:00Z",
+         "revoked_at_ts": None, "revoked_reason": None},
+        {"id": 1, "label": "Laptop", "created_by_user_id": 8,
+         "created_by_username": "bob", "created_at_ts": "2026-11-20T10:00:00Z",
+         "expires_at_ts": "2026-12-20T10:00:00Z", "last_used_at_ts": None,
+         "revoked_at_ts": "2026-11-25T10:00:00Z", "revoked_reason": "staff_left"},
+    ],
+    "runs": [
+        {"id": 12, "course_key_id": 3, "repository": "racousin/python-medecine",
+         "commit_sha": "abc1234def5678", "ref": "refs/heads/main",
+         "run_url": "https://github.com/racousin/python-medecine/actions/runs/9/attempts/1",
+         "actor_login": "racousin", "is_dry_run": False, "outcome": "applied",
+         "message": None, "plan": {}, "created_at_ts": "2026-11-27T11:00:00Z"},
+        {"id": 11, "course_key_id": 1, "repository": None, "commit_sha": None, "ref": None,
+         "run_url": None, "actor_login": None, "is_dry_run": True, "outcome": "refused",
+         "message": "this key was revoked: staff_left", "plan": None,
+         "created_at_ts": "2026-11-26T11:00:00Z"},
+    ],
+    "changes": [],
 }
 
 
@@ -706,6 +740,9 @@ class FakeClient:
             token=API_KEY, kind="api_key", scope="user")
         self.challenge_report = challenge_report or CHALLENGE_REPORT
         self.course_plan = course_plan or COURSE_PLAN
+        self.whoami = {"course_id": 100, "slug": "intro-to-rl", "edited_in": "github",
+                       "expires_at_ts": "2027-11-27T10:00:00Z"}
+        self.github = COURSE_GITHUB
 
     def _challenge(self):
         return {"id": 4, "slug": "lunar-lander", "name": "Lunar Lander",
@@ -753,22 +790,43 @@ class FakeClient:
         if self.error is not None:
             raise self.error
         os.makedirs(os.path.join(path, ".github", "workflows"), exist_ok=True)
-        for name in ("course.yaml", "README.md", ".github/workflows/push.yml"):
+        os.makedirs(os.path.join(path, "challenges", "house-prices", "data"), exist_ok=True)
+        for name in ("course.yaml", "README.md", ".github/workflows/ml-arena.yml",
+                     "challenges/house-prices/env.py"):
             with open(os.path.join(path, name), "w") as fh:
                 fh.write("x")
         return EXPORTED_MANIFEST
 
+    def course_key_whoami(self):
+        self.calls.append(("course_key_whoami",))
+        return self.whoami
+
+    def course(self, slug):
+        self.calls.append(("course", slug))
+        return {"id": 100, "slug": slug}
+
+    def course_github(self, course_id):
+        self.calls.append(("course_github", course_id))
+        return self.github
+
 
 @pytest.fixture
 def fake(monkeypatch):
-    """Install a FakeClient as the CLI's client; records how it was asked for."""
+    """Install a FakeClient as the CLI's client; records how it was asked for
+    (`scope` "course key or API key" for the course commands, which never
+    take the OIDC exchange)."""
     def install(client):
         asked = []
 
         def connect(base_url, scope, audience):
             asked.append({"base_url": base_url, "scope": scope, "audience": audience})
             return client
+
+        def connect_course(base_url):
+            asked.append({"base_url": base_url, "scope": "course key or API key"})
+            return client
         monkeypatch.setattr(cli, "_connect", connect)
+        monkeypatch.setattr(cli, "_connect_course", connect_course)
         client.asked = asked
         return client
     return install
@@ -1061,7 +1119,7 @@ def test_cli_course_push_prints_the_plan(fake, tmp_path, capsys, actions):
     client = fake(FakeClient())
     assert cli.main(["course", "push", str(tmp_path), "--slug", "intro-to-rl",
                      "--dry-run", "--prune"]) == 0
-    assert client.asked[0]["scope"] == "author"
+    assert client.asked[0]["scope"] == "course key or API key"
     assert client.calls == [("push_course", str(tmp_path),
                              {"slug": "intro-to-rl", "subpath": None,
                               "dry_run": True, "prune": True})]
@@ -1106,8 +1164,16 @@ def test_cli_course_push_dry_run_and_pruned_lines(fake, tmp_path, capsys):
                              {"slug": None, "subpath": "courses/rl",
                               "dry_run": False, "prune": False})]
     out = capsys.readouterr().out
-    assert "Dry run: nothing was changed" in out
+    # A plan the run did not ask for: the course is `connecting`.
+    assert "Dry run: nothing was changed" not in out
+    assert ("planned (connecting): nothing was changed. Switch to GitHub editing in "
+            "Settings › GitHub; the next push then applies") in out
     assert "    lesson old-intro: pruned (deleted)" in out
+
+    assert cli.main(["course", "push", "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert "Dry run: nothing was changed" in out
+    assert "planned (connecting)" not in out
 
 
 def test_cli_course_push_assets_line_only_for_what_moved(fake, capsys):
@@ -1126,7 +1192,7 @@ def test_cli_course_export_writes_the_folder_and_names_the_next_step(fake, tmp_p
     client = fake(FakeClient())
     target = str(tmp_path / "rl")
     assert cli.main(["course", "export", "intro-to-rl", target]) == 0
-    assert client.asked[0]["scope"] == "author"
+    assert client.asked[0]["scope"] == "course key or API key"
     assert client.calls == [("export_course_to_dir", "intro-to-rl", target,
                              {"overwrite": False})]
     out = capsys.readouterr().out
@@ -1134,9 +1200,12 @@ def test_cli_course_export_writes_the_folder_and_names_the_next_step(fake, tmp_p
     assert "  foundations/: 2 lessons" in out
     assert "  bandits/: 1 lesson\n" in out
     assert "  cover.png (cover)" in out
-    assert "  .github/workflows/push.yml" in out
+    assert "  challenges/house-prices/" in out
+    assert "  .github/workflows/ml-arena.yml" in out
     assert "  README.md" in out
-    assert f"Next: mlarena course push --dry-run {target}" in out
+    assert f"Check: mlarena course push --dry-run {target}" in out
+    assert "MLARENA_COURSE_KEY" in out
+    assert "keep the repository private" in out
 
 
 def test_cli_course_export_defaults_to_a_folder_named_after_the_slug(
@@ -1187,7 +1256,6 @@ def test_cli_prints_a_terms_refusal_and_who_accepts_in_a_github_actions_run(
     command calls that answers 403 `terms_required` is printed like any
     refusal: the server's sentence, the page of the terms, and who accepts.
     In a workflow that is the account's holder: its token cannot."""
-    _write(str(tmp_path), "course.yaml", b"course:\n  name: RL\n  slug: rl\nmodules: []\n")
     client = mlarena.MLArenaClient(
         token=CI_TOKEN, base_url="https://example.com",
         credentials=ci_auth.Credentials(
@@ -1200,7 +1268,7 @@ def test_cli_prints_a_terms_refusal_and_who_accepts_in_a_github_actions_run(
     client._request = rec
     monkeypatch.setattr(cli, "_connect", lambda base_url, scope, audience: client)
 
-    assert cli.main(["course", "push", str(tmp_path)]) == 1
+    assert cli.main(["challenge", "push", str(tmp_path), "--challenge", "4"]) == 1
 
     captured = capsys.readouterr()
     message = (f"{sentence} Read them at https://example.com/terms . A GitHub Actions run "
@@ -1210,7 +1278,7 @@ def test_cli_prints_a_terms_refusal_and_who_accepts_in_a_github_actions_run(
     assert f"::error title=mlarena::{message}" in captured.out
     assert message in actions.read_text()
     # The command sent its one request and accepted nothing for the account.
-    assert [call["path"] for call in rec.calls] == ["/teacher/courses/rl/bundle"]
+    assert [call["path"] for call in rec.calls] == ["/challenges/4"]
 
 
 def test_cli_site_url_follows_the_audience(fake, tmp_path, capsys, monkeypatch):
@@ -1361,3 +1429,14 @@ def test_a_platform_revision_is_labelled_without_a_commit():
                 "event_name": None, "run_url": None, "commit_url": None}
     assert cli._revision_label(platform) == "platform (bundle)"
     assert cli._revision_label(REVISION) == "alice/agent@0123456"
+
+
+def test_a_course_key_revision_is_labelled_with_what_the_run_reported():
+    """A course-key push stamps the repository and commit as the run reported
+    them: either may be missing (a push from a laptop reports neither)."""
+    from mlarena import cli
+    keyed = {**REVISION, "transport": "course_key"}
+    assert cli._revision_label(keyed) == "alice/agent@0123456"
+    assert cli._revision_label({**keyed, "commit_sha": None}) == "alice/agent"
+    assert cli._revision_label(
+        {**keyed, "repository": None, "commit_sha": None}) == "a repository"

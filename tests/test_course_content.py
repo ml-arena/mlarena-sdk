@@ -288,12 +288,12 @@ def test_update_module_and_lesson_accept_a_slug():
     _expect(rec.last["json"] == {"slug": "intro"}, rec.last["json"])
 
 
-def test_detach_module():
-    c, rec = make_client(lambda *_: (200, {"id": 2, "content_origin": "editor"}))
-    out = c.detach_module(2)
-    _expect(rec.last["method"] == "POST", rec.last["method"])
-    _expect(rec.last["path"] == "/teacher/modules/2/detach", rec.last["path"])
-    _expect(out["content_origin"] == "editor", out)
+def test_detach_module_is_gone():
+    """4.26.0: one writer per course (`edited_in`), not per module: the
+    detach route is deleted, and its method with it."""
+    c, rec = make_client()
+    _expect(not hasattr(c, "detach_module"), "detach_module")
+    _expect(rec.calls == [], rec.calls)
 
 
 def test_upload_module_asset_multipart():

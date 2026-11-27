@@ -7,6 +7,7 @@ from mlarena.exceptions import (
     ChallengeNotFoundError,
     ChatSessionNotFoundError,
     CompetitionNotFoundError,  # deprecated alias of ChallengeNotFoundError
+    CourseEditedOnGithubError,
     EnrollmentRequiredError,
     ExerciseAttemptNotFoundError,
     MaintenanceError,
@@ -19,13 +20,14 @@ from mlarena.exceptions import (
 )
 from mlarena.metrics import format_metric
 
-__version__ = "4.25.0"
+__version__ = "4.26.0"
 
 
 def connect(
     api_key: str | None = None,
     base_url: str = PROD_BASE_URL,
     *,
+    course_key: str | None = None,
     allow_insecure: bool = False,
     scope: str = "user",
     audience: str | None = None,
@@ -34,8 +36,9 @@ def connect(
 
     The credential is resolved in this order (`mlarena.ci_auth`):
 
-    1. `api_key`;
-    2. the `MLARENA_API_KEY` environment variable;
+    1. `api_key` or `course_key` (not both);
+    2. the `MLARENA_API_KEY` or `MLARENA_COURSE_KEY` environment variable
+       (not both);
     3. inside a GitHub Actions job with `permissions: id-token: write`, the
        job's OIDC token, exchanged for a short-lived `mlo_…` token of the
        account the repository is linked to. No secret is stored.
@@ -44,6 +47,11 @@ def connect(
         api_key: Full bearer token in the canonical form
             ``mlk_<scope>_<lookup>_<secret>`` (copy it from your Profile page).
             Older `key_id:key_pass` colon-separated form is no longer supported.
+        course_key: A course's key, ``mlc_<lookup>_<secret>`` (the course's
+            Settings › GitHub, or ``create_course_key``). It reaches two
+            routes: ``course_key_whoami()`` and ``push_course`` of its
+            course; every other method answers 403. An ``mlc_`` token passed
+            as ``api_key`` is read the same way.
         base_url: ML Arena server URL.
         allow_insecure: Opt-in escape hatch to allow ``http://`` URLs against
             non-loopback hosts. ``http://localhost`` and ``http://127.0.0.1``
@@ -69,7 +77,8 @@ def connect(
     """
     def resolve():
         return resolve_credentials(
-            api_key, base_url=base_url, scope=scope, audience=audience,
+            api_key, course_key=course_key, base_url=base_url, scope=scope,
+            audience=audience,
             allow_insecure=allow_insecure,
         )
 

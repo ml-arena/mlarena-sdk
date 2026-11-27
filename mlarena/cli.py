@@ -4,13 +4,18 @@
     mlarena submit --challenge <slug-or-id> [--files a b … | --dir DIR] …
     mlarena challenge push [DIR] --challenge <slug-or-id> [--path SUBPATH] [--dry-run]
     mlarena course push [DIR] [--slug SLUG] [--path SUBPATH] [--dry-run] [--prune]
+    mlarena course status [--course SLUG_OR_ID]
     mlarena course export SLUG [DIR] [--overwrite]
 
 Each command is a composition of `MLArenaClient` methods: the CLI has no
-route of its own. The credential is resolved by `mlarena.connect()`
-(`MLARENA_API_KEY`, else the GitHub Actions OIDC exchange), so the same line
-runs on a laptop and in a workflow. Inside GitHub Actions the outcome is also
-appended to the job summary, and a failure is an `::error::` annotation.
+route of its own. `whoami`, `submit` and `challenge push` resolve their
+credential with `mlarena.connect()` (`MLARENA_API_KEY`, else the GitHub
+Actions OIDC exchange), so the same line runs on a laptop and in a workflow.
+The `course` commands take a key only: the course's own key
+(`MLARENA_COURSE_KEY`, the repository secret of a course edited on GitHub) or
+a personal one (`MLARENA_API_KEY`); a course is never pushed with the OIDC
+exchange. Inside GitHub Actions the outcome is also appended to the job
+summary, and a failure is an `::error::` annotation.
 
 Exit codes: 0 done, 1 refused by the server or failed, 2 usage.
 """
@@ -25,11 +30,16 @@ import tempfile
 import mlarena
 from mlarena.bundle import DEFAULT_EXCLUDES
 from mlarena.ci_auth import (
+    ENV_API_KEY,
     ENV_BASE_URL,
+    ENV_COURSE_KEY,
+    KIND_COURSE_KEY,
     KIND_GITHUB_ACTIONS,
     PROD_BASE_URL,
     oidc_audience,
+    resolve_credentials,
 )
+from mlarena.client import MLArenaClient
 from mlarena.exceptions import MLArenaError, WaitTimeoutError
 
 EXIT_OK = 0
@@ -114,6 +124,15 @@ def _connect(base_url: str, scope: str, audience: str | None):
     return mlarena.connect(base_url=base_url, scope=scope, audience=audience)
 
 
+def _connect_course(base_url: str):
+    """The client of a `course` command: the course's key
+    (`MLARENA_COURSE_KEY`) or a personal key (`MLARENA_API_KEY`), never the
+    GitHub Actions OIDC exchange (tests replace this function)."""
+    credentials = resolve_credentials(base_url=base_url, oidc=False)
+    return MLArenaClient(token=credentials.token, base_url=base_url,
+                         credentials=credentials)
+
+
 def _site_url(args) -> str:
     """The console's URL: the OIDC audience, which is the platform's public
     URL (the base URL unless overridden, as on a local stack)."""
@@ -131,7 +150,11 @@ def _revision_label(revision: dict) -> str:
     """A commit of a repository, or a change made on the platform (a push
     from outside a GitHub job: no repository, no commit)."""
     if revision["provider"] == "github":
-        return f"{revision['repository']}@{revision['commit_sha'][:7]}"
+        # A course-key push records the repository and commit as the run
+        # reported them, and a run outside GitHub Actions reports neither.
+        repository = revision["repository"] or "a repository"
+        commit = revision["commit_sha"]
+        return f"{repository}@{commit[:7]}" if commit else repository
     return f"platform ({revision['transport']})"
 
 
@@ -145,6 +168,8 @@ def _is_excluded(name: str) -> bool:
 
 
 def _auth_label(credentials) -> str:
+    if credentials.kind == KIND_COURSE_KEY:
+        return "course key"
     if credentials.kind == KIND_GITHUB_ACTIONS:
         return (f"GitHub Actions run of {_revision_label(credentials.source_revision)} "
                 f"(scope {credentials.scope})")
@@ -430,7 +455,7 @@ PLAN_PATHS_SHOWN = 3
 
 def _action(entry: dict) -> str:
     """`updated (body_md, title)`: the action, and the fields that changed
-    when there are any (an `updated` or `adopted` item)."""
+    when there are any (an `updated` or `created` item)."""
     if entry["changes"]:
         return f"{entry['action']} ({', '.join(entry['changes'])})"
     return entry["action"]
@@ -456,13 +481,20 @@ def _assets_line(assets: dict) -> str | None:
     return f"assets: {', '.join(parts)}" if parts else None
 
 
-def _course_plan_lines(report: dict) -> list[str]:
+# A push with the course's key while the course is `connecting` is a plan,
+# whatever the run asked for.
+CONNECTING_PLAN = ("planned (connecting): nothing was changed. Switch to GitHub "
+                   "editing in Settings › GitHub; the next push then applies")
+
+
+def _course_plan_lines(report: dict, *, asked_dry_run: bool) -> list[str]:
     """`CourseBundleResponse` (`backend/app/views/teacher/_schemas.py`) as
-    text. The one place its keys are read."""
+    text. The one place its keys are read. A plan the run did not ask for
+    is the course's mode (`connecting`): said as such."""
     course = report["course"]
     lines = []
     if report["dry_run"]:
-        lines.append("Dry run: nothing was changed")
+        lines.append("Dry run: nothing was changed" if asked_dry_run else CONNECTING_PLAN)
     lines.append(f"course {course['slug']}: {_action(course)}")
     for module in report["modules"]:
         lines.append(f"  module {module['slug']}: {_action(module)}{_renamed(module)}")
@@ -481,6 +513,13 @@ def _course_plan_lines(report: dict) -> list[str]:
         lines.append(f"  module {slug}: not in the manifest, untouched")
     lines += [f"  challenge {name}: in no challenges entry of the manifest, left where it is"
               for name in report["unmanaged_challenges"]]
+    # A course-key push: the repository is the whole course (docs/course_github.md §7).
+    lines += [f"  module {slug}: not in the repository, unpublished (its lessons kept)"
+              for slug in report["unpublished_modules"]]
+    lines += [f"  challenge {name}: not in the repository, taken out of its module "
+              "(its submissions kept)" for name in report["removed_challenges"]]
+    lines += [f"  challenge {c['name']}: in no module ({c['status']}); stop, archive or delete "
+              "it in the console, or list it again" for c in report["unplaced_challenges"]]
     if report["source_revision"] is not None:
         lines.append(f"source: {_revision_label(report['source_revision'])}")
     lines += [f"warning: {warning}" for warning in report["warnings"]]
@@ -495,16 +534,32 @@ def _annotate_warning(message: str) -> None:
     print(f"::warning title=mlarena::{escaped}")
 
 
+def _key_course(client, wanted: str | None, option: str) -> dict:
+    """`CourseKeyWhoamiOut` of the client's course key; `wanted` (the
+    command's --slug or --course) must name that course when given."""
+    whoami = client.course_key_whoami()
+    if wanted is not None and wanted not in (whoami["slug"], str(whoami["course_id"])):
+        raise UsageError(
+            f"{option} {wanted}: the course key in {ENV_COURSE_KEY} belongs to the "
+            f"course {whoami['slug']}, and pushes that course only")
+    return whoami
+
+
 def cmd_course_push(args) -> int:
-    client = _connect(args.base_url, "author", args.audience)
+    client = _connect_course(args.base_url)
     heading = "ML Arena course push"
+    slug = args.slug
     try:
+        if client.credentials.kind == KIND_COURSE_KEY:
+            whoami = _key_course(client, args.slug, "--slug")
+            slug = whoami["slug"]
+            _out(f"Course {slug} (edited in: {whoami['edited_in']}), with its course key")
         report = client.push_course(
-            args.directory, slug=args.slug, subpath=args.path,
+            args.directory, slug=slug, subpath=args.path,
             dry_run=args.dry_run, prune=args.prune)
     except MLArenaError as err:
         return _fail(str(err), heading=heading)
-    lines = _course_plan_lines(report)
+    lines = _course_plan_lines(report, asked_dry_run=args.dry_run)
     for line in lines:
         _out(line)
     for warning in report["warnings"]:
@@ -526,9 +581,13 @@ def _lesson_count(lessons: list) -> int:
     return sum(1 + len(lesson.get("children", [])) for lesson in lessons)
 
 
+# The workflow and the README a staff export writes beside the course.
+EXPORT_EXTRAS = (os.path.join(".github", "workflows", "ml-arena.yml"), "README.md")
+
+
 def cmd_course_export(args) -> int:
     directory = args.directory if args.directory is not None else os.path.join(".", args.slug)
-    client = _connect(args.base_url, "author", args.audience)
+    client = _connect_course(args.base_url)
     try:
         manifest = client.export_course_to_dir(args.slug, directory,
                                                overwrite=args.overwrite)
@@ -542,16 +601,93 @@ def cmd_course_export(args) -> int:
     cover = manifest["course"].get("cover")
     if cover:
         _out(f"  {cover} (cover)")
-    for extra in (os.path.join(".github", "workflows", "push.yml"), "README.md"):
+    challenges = os.path.join(directory, "challenges")
+    if os.path.isdir(challenges):
+        for name in sorted(os.listdir(challenges)):
+            if os.path.isdir(os.path.join(challenges, name)):
+                _out(f"  challenges/{name}/")
+    for extra in EXPORT_EXTRAS:
         if os.path.isfile(os.path.join(directory, extra)):
             _out(f"  {extra.replace(os.sep, '/')}")
     _out("")
-    _out(f"Next: mlarena course push --dry-run {directory}")
-    _out("  every lesson should read 'unchanged', and a module written in the Studio "
-         "'adopted'. Then commit the folder to a GitHub repository: each push to main "
-         "updates the course. The course's owner makes the first push.")
+    _out(f"Check: mlarena course push --dry-run {directory}")
+    _out("  every item should read 'unchanged'.")
     if os.path.isfile(os.path.join(directory, "README.md")):
-        _out("  README.md lists what to fix before the first push, if anything.")
+        _out("  To edit the course on GitHub, follow README.md: a private repository, "
+             "Settings › GitHub (connect it, create the key, add it as the secret "
+             f"{ENV_COURSE_KEY}), then run the workflow. It also lists what to fix "
+             "before the first push, if anything.")
+    if os.path.isdir(challenges):
+        _out("  The challenges/ folders hold answer keys and hidden tests: keep the "
+             "repository private.")
+    return EXIT_OK
+
+
+# --------------------------------------------------------------------------- #
+# course status
+# --------------------------------------------------------------------------- #
+
+# `course status` lists this many runs; `course_repository_runs` pages the rest.
+STATUS_RUNS_SHOWN = 5
+
+
+def _key_line(key: dict) -> str:
+    """One `CourseKeyOut` row."""
+    line = (f"  #{key['id']} {key['label']}: by {key['created_by_username']}, "
+            f"created {key['created_at_ts']}")
+    if key["revoked_at_ts"] is not None:
+        return f"{line}, revoked {key['revoked_at_ts']} ({key['revoked_reason']})"
+    line += f", expires {key['expires_at_ts']}"
+    last_used = key["last_used_at_ts"]
+    return line + (f", last used {last_used}" if last_used is not None else ", never used")
+
+
+def _run_line(run: dict) -> str:
+    """One `CourseRepositoryRunOut` row, as the run reported itself."""
+    where = run["repository"] or "?"
+    if run["commit_sha"]:
+        where += f"@{run['commit_sha'][:7]}"
+    parts = [f"  #{run['id']} {run['created_at_ts']} {run['outcome']}"
+             + (" (dry run)" if run["is_dry_run"] else ""), where]
+    if run["actor_login"]:
+        parts.append(f"by @{run['actor_login']}")
+    line = " ".join(parts)
+    return f"{line}: {run['message']}" if run["message"] else line
+
+
+def cmd_course_status(args) -> int:
+    client = _connect_course(args.base_url)
+    if client.credentials.kind == KIND_COURSE_KEY:
+        whoami = _key_course(client, args.course, "--course")
+        _out(f"course:    {whoami['slug']} (#{whoami['course_id']})")
+        _out(f"edited in: {whoami['edited_in']}")
+        _out(f"key:       this course key, expires {whoami['expires_at_ts']}")
+        _out("The keys and the runs are the staff's: the course's Settings › GitHub, "
+             f"or `mlarena course status --course {whoami['slug']}` with a personal "
+             f"key in {ENV_API_KEY}.")
+        return EXIT_OK
+    if args.course is None:
+        raise UsageError(
+            f"pass --course SLUG_OR_ID with a personal key, or set {ENV_COURSE_KEY} "
+            f"(a course key names its course)")
+    course_id = (int(args.course) if args.course.isdigit()
+                 else client.course(args.course)["id"])
+    github = client.course_github(course_id)
+    _out(f"course:     {args.course} (#{course_id})")
+    _out(f"edited in:  {github['edited_in']}")
+    repository = github["repository"]
+    if repository is None:
+        _out("repository: none connected")
+    else:
+        folder = f", folder {repository['path']}" if repository["path"] else ""
+        _out(f"repository: {repository['repository']} (branch {repository['branch']}{folder})")
+    _out(f"keys ({len(github['keys'])}):" if github["keys"] else "keys:       none")
+    for key in github["keys"]:
+        _out(_key_line(key))
+    runs = github["runs"][:STATUS_RUNS_SHOWN]
+    _out(f"runs (last {len(runs)}):" if runs else "runs:       none")
+    for run in runs:
+        _out(_run_line(run))
     return EXIT_OK
 
 
@@ -565,7 +701,9 @@ def build_parser() -> argparse.ArgumentParser:
         prog="mlarena",
         description="ML Arena from the command line and from GitHub Actions. "
                     "Credential: MLARENA_API_KEY, else the GitHub Actions OIDC "
-                    "token of a job with `permissions: id-token: write`.",
+                    "token of a job with `permissions: id-token: write`; the "
+                    "course commands take MLARENA_COURSE_KEY (a course's key) "
+                    "or MLARENA_API_KEY, never the OIDC token.",
     )
     parser.add_argument("--version", action="version",
                         version=f"mlarena {mlarena.__version__}")
@@ -627,14 +765,16 @@ def build_parser() -> argparse.ArgumentParser:
     course_commands = course.add_subparsers(
         dest="course_command", required=True, metavar="COMMAND")
     course_push = course_commands.add_parser(
-        "push", help="create or update a course from a directory (course.yaml)")
+        "push", help="update a course from a directory (course.yaml): with the "
+                     "course's key (MLARENA_COURSE_KEY) or a personal key")
     course_push.add_argument(
         "directory", nargs="?", default=".", metavar="DIR",
         help="the course folder (course.yaml at its root) or a .zip / .tar.gz "
              "of it (default: the current directory)")
     course_push.add_argument(
-        "--slug", help="the course's slug (default: course.slug of the "
-                       "manifest; required for an archive)")
+        "--slug", help="the course's slug (default: the course of the course "
+                       "key, else course.slug of the manifest; required for an "
+                       "archive pushed with a personal key)")
     course_push.add_argument("--path", metavar="SUBPATH",
                              help="the folder inside DIR that holds the course")
     course_push.add_argument("--dry-run", action="store_true",
@@ -644,6 +784,15 @@ def build_parser() -> argparse.ArgumentParser:
                                   "with their students' progress (default: "
                                   "unpublish them)")
     course_push.set_defaults(run=cmd_course_push)
+
+    course_status = course_commands.add_parser(
+        "status", help="where a course is edited (console or GitHub), its "
+                       "repository, keys and last runs")
+    course_status.add_argument(
+        "--course", metavar="SLUG_OR_ID",
+        help="the course: its id or slug (required with a personal key; with "
+             "a course key, its own course)")
+    course_status.set_defaults(run=cmd_course_status)
 
     course_export = course_commands.add_parser(
         "export", help="write a course as a folder that `course push` and a "

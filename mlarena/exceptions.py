@@ -89,6 +89,27 @@ class EnrollmentRequiredError(PermissionDeniedError):
         return self.body["course_id"]
 
 
+class CourseEditedOnGithubError(MLArenaError):
+    """Raised when a write reaches a course edited on GitHub (HTTP 409,
+    `edited_in: "github"`).
+
+    A course is edited in one place: the console (and the SDK, with a
+    personal key) or a GitHub repository, whose workflow pushes it with the
+    course's key (`mlarena course push`). In GitHub mode every write of its
+    content (lessons, modules, a challenge's files, config, page and data)
+    is refused with this error, and so is a push of the course with a
+    personal key; operations (enrollment, staff, Start and Stop, dates and
+    visibility) stay open. The message is the server's sentence; `repository`
+    is the `owner/name` the course is edited in. Edit the repository, or
+    switch the course back with `switch_course_edited_in(course_id,
+    "console")`, which revokes its keys.
+    """
+
+    @property
+    def repository(self) -> str:
+        return self.body["repository"]
+
+
 class MaintenanceError(MLArenaError):
     """Raised when the platform is in maintenance mode (HTTP 503).
 

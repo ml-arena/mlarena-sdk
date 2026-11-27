@@ -60,6 +60,59 @@ client.leaderboard(ch["id"])                      # a DataFrame with pandas
   An error once the submission exists (a refused upload, a deploy over your
   daily quota) carries `err.submission_id` and says how to deploy or delete it.
 
+## 4.26.0 — a course is edited in the console or on GitHub; course keys
+
+Requires a platform at or after the backend change that adds
+`academic_course.edited_in` (docs/course_github.md). Breaking for
+`detach_module` and for `mlarena course push` / `course export` in a GitHub
+Actions job without a key.
+
+- **One place to edit a course.** `course_github(course_id)` reads where a
+  course is edited (`edited_in`: `console`, `connecting`, `github`), its
+  repository, its keys, its last runs and mode changes (Settings › GitHub).
+  `set_course_repository(course_id, repository, branch="main", path="")`
+  connects a repository (`console` → `connecting`, or `github` at once for an
+  empty course), `switch_course_edited_in(course_id, "github" | "console")`
+  moves it (back to the console revokes every key),
+  `create_course_key(course_id, label, expires_in_days=365)` mints a course
+  key (`mlc_…`, its `token` served once), `revoke_course_key(course_id,
+  key_id)` revokes one, `course_repository_runs(course_id, before_id=None)`
+  pages the runs.
+- **`CourseEditedOnGithubError`** (409, a subclass of `MLArenaError`): a
+  write of a course edited on GitHub, or of one of its challenges, and a
+  `push_course` with a personal key to such a course. The message is the
+  server's sentence; `err.repository` is `owner/name`.
+- **Course keys as a credential.** `connect(course_key="mlc_…")`, an `mlc_`
+  token passed as `api_key=`, or `MLARENA_COURSE_KEY`. Setting both
+  `MLARENA_API_KEY` and `MLARENA_COURSE_KEY` raises. A course key reaches
+  `course_key_whoami()` (`GET /api/auth/course_key`: `course_id`, `slug`,
+  `edited_in`, `expires_at_ts`) and `push_course` of its own course, nothing
+  else. `push_course` with a course key and no `slug=` pushes the key's
+  course: the manifest needs no `course.slug`.
+- **The run a push comes from.** Inside GitHub Actions, `push_course` sends
+  `X-MLArena-CI-Repository`, `-Commit`, `-Ref`, `-Run-Url` and `-Actor`
+  (from `GITHUB_REPOSITORY`, `GITHUB_SHA`, `GITHUB_REF`, the run's URL and
+  `GITHUB_ACTOR`; `ci_auth.ci_context_headers`), which the course's run row
+  records as reported.
+- **`mlarena course push`** takes `MLARENA_COURSE_KEY` (it asks the key's
+  course and pushes it; a `--slug` naming another course exits 2) or
+  `MLARENA_API_KEY` (as before). It no longer uses the GitHub Actions OIDC
+  exchange, nor does `course export`: a run without a key fails and says
+  which to set. A plan the run did not ask for (the course is
+  `connecting`) prints `planned (connecting): … Switch to GitHub editing in
+  Settings › GitHub`. `submit` and `challenge push` keep OIDC.
+- **`mlarena course status [--course SLUG_OR_ID]`** prints the mode, the
+  repository, the keys and the last runs (a personal key and `--course`), or
+  the key's course, its mode and the key's expiry (a course key alone).
+- **`mlarena course export`** lists the `challenges/<slug>/` folders and
+  `.github/workflows/ml-arena.yml` a staff export holds.
+- **Removed: `detach_module`.** The route is deleted: a course has one
+  writer (`edited_in`), not one per module.
+- `push_course`'s answer carries `run_id` (the run row of a push with the
+  course's key). `course.visibility`, `course.start_date` and
+  `course.end_date` in a manifest are refused by the server: they are the
+  console's (`update_course`).
+
 ## 4.25.0 — organizations; no instructor name
 
 Requires a platform at or after the backend change of 2026-11-27
@@ -1956,12 +2009,20 @@ mlarena course export my-course ./my-course
   `gh-<sha7>`, and a commit already submitted is reported, not submitted
   again.
 - `mlarena challenge push [DIR] --challenge <slug-or-id> [--path SUBPATH] [--dry-run]`
+mlarena course status --course my-course
   replaces the challenge's files with the directory (`push_challenge`) and
   prints what changed, the config result and the `env.py` check.
 - `mlarena course push [DIR] [--slug SLUG] [--path SUBPATH] [--dry-run] [--prune]`
-  applies a course directory (`push_course`) and prints the plan: each module
-  and lesson created, updated (with the fields that changed), unchanged or
-  orphaned, and the files written and removed.
+  applies a course directory (`push_course`) and prints the plan: each module,
+  lesson and challenge created, updated (with the fields that changed),
+  unchanged or orphaned, and the files written and removed. With
+  `MLARENA_COURSE_KEY` it pushes the key's course (no slug needed) and sends
+  the run it comes from; while the course is `connecting` the answer is a
+  plan, printed as `planned (connecting)`.
+- `mlarena course status [--course SLUG_OR_ID]` prints where the course is
+  edited, its repository, its keys and its last runs (with a personal key and
+  `--course`); with a course key alone, the key's course, its mode and the
+  key's expiry.
 - `mlarena course export SLUG [DIR] [--overwrite]` writes a course you can
   read as a folder that `course push` takes back unchanged (`DIR` defaults to
   `./SLUG` and must be new or empty unless `--overwrite`): the way to start a
@@ -1983,8 +2044,16 @@ mlarena course export my-course ./my-course
 **Credential.** `MLARENA_API_KEY` when it is set. Otherwise, in a GitHub
 Actions job with `permissions: id-token: write`, the job proves who it is with
 GitHub's OIDC token and receives a 15-minute token: there is no secret to
-store in the repository. `submit` asks for the `user` scope, `challenge push`,
-`course push` and `course export` for `author`.
+store in the repository. `submit` asks for the `user` scope, `challenge push`
+for `author` (a challenge with no course: the platform refuses the token on
+anything course-related).
+
+**A course is pushed with its key**, never with the OIDC token: the course
+commands read `MLARENA_COURSE_KEY` (a course's key, `mlc_…`, minted in its
+Settings › GitHub and stored as the repository secret of that name) or
+`MLARENA_API_KEY` (a personal author key, for a course edited in the
+console). The key belongs to the course, not to whoever triggered the run,
+and reaches nothing else.
 
 **One-time setup.**
 
@@ -2045,14 +2114,14 @@ jobs:
       - run: mlarena challenge push . --challenge my-challenge
 ```
 
-**Teacher: push the course on every commit to `main`**
+**Teacher: push the course on every commit to `main`** (the course is
+edited on GitHub; the key is the repository secret `MLARENA_COURSE_KEY`)
 
 ```yaml
 on:
   push:
     branches: [main]
 permissions:
-  id-token: write
   contents: read
 jobs:
   push:
@@ -2071,9 +2140,11 @@ without applying it.
 
 ## API reference
 
-### `mlarena.connect(api_key=None, base_url="https://ml-arena.com", *, scope="user", audience=None)`
+### `mlarena.connect(api_key=None, base_url="https://ml-arena.com", *, course_key=None, scope="user", audience=None)`
 
-Create a client. `api_key` is the full `mlk_<scope>_<lookup>_<secret>` token; left out, the credential is `MLARENA_API_KEY`, else the GitHub Actions OIDC exchange (`scope` is the scope asked for there). `client.credentials` (`kind`, `scope`, `username`, `source_revision`) says which was used.
+Create a client. `api_key` is the full `mlk_<scope>_<lookup>_<secret>` token, `course_key` a course's `mlc_<lookup>_<secret>` key (one of the two); left out, the credential is `MLARENA_API_KEY` or `MLARENA_COURSE_KEY` (not both), else the GitHub Actions OIDC exchange (`scope` is the scope asked for there). `client.credentials` (`kind`: `api_key`, `course_key` or `github_actions`; `scope`, `username`, `source_revision`) says which was used.
+    env:
+      MLARENA_COURSE_KEY: ${{ secrets.MLARENA_COURSE_KEY }}
 
 ### Account
 
@@ -2083,6 +2154,9 @@ Create a client. `api_key` is the full `mlk_<scope>_<lookup>_<secret>` token; le
 - `client.trusted_repositories()`, `client.add_trusted_repository("owner/name")`, `client.remove_trusted_repository(id)` — the repositories you do not own whose GitHub Actions runs may act as you.
 
 ### Submissions (user scope)
+The template [`ml-arena/template-course`](https://github.com/ml-arena/template-course)
+is that workflow through `ml-arena/mlarena-action@v2`.
+
 
 - `client.submit(challenge_id, agent=None, files=None, submission_name=None, runtime_id=None, runtime=None, wait=False, timeout_sec=None, poll_sec=5.0, *, deploy=True, allow_same_commit=False)` — one-shot check + create + (pick runner) + upload + deploy. `agent=` is a class (its source only, as `agent.py`) or a module; `files=` a list of paths. Before the create it refuses an unknown runtime, a path or an instance as `agent=`, `agent=` on a challenge whose entry file is not `agent.py`, a missing file, two files with one base name, and files over `max_upload_files` / `max_upload_size_bytes`. Every error raised after the create carries `err.submission_id` (nothing is deleted). Returns `{"submission_id", "deploy"}`, plus `"status"` with `wait=True`; `deploy=False` stops after the upload check. From a GitHub Actions run, a commit that already made a submission returns `{"submission_id", "deploy": None, "already_submitted": True, "status"}` unless `allow_same_commit=True`.
 - `client.create_submission(challenge_id, submission_name, copy_from_submission_id=None, *, allow_same_commit=False)` — from a GitHub Actions run, a second create for the same commit is a 409 whose `err.body["submission_id"]` is the existing submission.
@@ -2398,9 +2472,11 @@ print(plan["course"], plan["url"])
 teacher.export_course_to_dir("intro-to-rl", "intro-to-rl/")
 ```
 
-A module written by a bundle is managed by it: the editor and the module /
-lesson write methods answer 409 until `detach_module(module_id)`. A lesson
-that left the manifest is unpublished and kept (`prune=True` deletes it).
+A course is edited in one place (`course_github(course_id)["edited_in"]`): in
+the console (and with a personal key), or on GitHub, where only a push with
+the course's key writes its content and every other write raises
+`CourseEditedOnGithubError`. A lesson that left the manifest is unpublished
+and kept (`prune=True` deletes it).
 `import_course_from_github(slug, "owner/name", ref=None, path=None)` applies a
 public repository the same way; `mlarena course push` does it from a GitHub
 Actions workflow.
@@ -2425,7 +2501,7 @@ print(student.my_progress(landing["id"]))                # content % + next less
 
 ### Course authoring (author scope)
 
-- `client.create_course_module(course_id, title, *, slug=None, summary=None, icon=None, is_published=None)` — a module (a section of the course), `get_module`, `update_module(id, **fields)` (`title`, `slug`, `summary`, `icon`, `is_published`), `delete_module(id)` (the owner's; refused while it holds a challenge), `detach_module(id)` (a bundle-managed module back to the editor).
+- `client.create_course_module(course_id, title, *, slug=None, summary=None, icon=None, is_published=None)` — a module (a section of the course), `get_module`, `update_module(id, **fields)` (`title`, `slug`, `summary`, `icon`, `is_published`), `delete_module(id)` (the owner's; refused while it holds a challenge).
 - `client.update_course_challenge(module_id, challenge_id, *, pass_threshold=…, module_id=…)` — a course challenge's pass bar (`None` removes it) and its module (another module of the same course: the path's `module_id` is where it is now), `reorder_module_challenges(module_id, ordered_challenge_ids)`.
 - `client.create_lesson(module_id, title, kind="lesson", slug=None, parent_lesson_id=None, body_md="", gated=False)`, `get_lesson`, `update_lesson(id, **fields)`, `delete_lesson`, `reorder_lessons`.
 - `client.upload_module_asset(module_id, file_path, path=None)` (returns `{path, url}`; link it from a lesson body by its `path`: `![fig](media/fig.png)`), `list_module_assets(module_id)`, `delete_module_asset(module_id, path)`.
@@ -2448,6 +2524,7 @@ print(student.my_progress(landing["id"]))                # content % + next less
 
 #### Lesson directives
 
+- `client.course_github(course_id)`, `set_course_repository(course_id, repository, branch="main", path="")`, `switch_course_edited_in(course_id, to)`, `create_course_key(course_id, label, expires_in_days=365)`, `revoke_course_key(course_id, key_id)`, `course_repository_runs(course_id, before_id=None)` — Settings › GitHub: where the course is edited, its repository, keys and runs. `course_key_whoami()` — with a course key: its course.
 A lesson body is Markdown plus `mlarena:` blocks: a fenced code block whose
 info string is `mlarena:<type>` followed by `key=value` arguments (values
 with spaces in quotes), closed by a ```` ``` ```` line; the block's body is

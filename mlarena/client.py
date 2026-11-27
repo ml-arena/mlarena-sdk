@@ -25,12 +25,18 @@ import yaml
 
 from mlarena.bundle import bundle_root, check_extract_target, extract_bundle, read_bundle
 from mlarena.chat import ChatConversation
-from mlarena.ci_auth import KIND_GITHUB_ACTIONS
+from mlarena.ci_auth import (
+    COURSE_KEY_WHOAMI_PATH,
+    KIND_COURSE_KEY,
+    KIND_GITHUB_ACTIONS,
+    ci_context_headers,
+)
 from mlarena.exercise import format_attempt, source_of
 from mlarena.exceptions import (
     AuthenticationError,
     ChallengeNotFoundError,
     ChatSessionNotFoundError,
+    CourseEditedOnGithubError,
     EnrollmentRequiredError,
     ExerciseAttemptNotFoundError,
     MaintenanceError,
@@ -103,8 +109,10 @@ class MLArenaClient:
     which endpoints are reachable — a `user`-scope token cannot call an
     `author`-required route. A GitHub Actions run sends the
     short-lived `mlo_…` token of its OIDC exchange instead, which the backend
-    reads like a key of the scope it was issued for (`mlarena.connect()`
-    resolves either; `credentials` says which).
+    reads like a key of the scope it was issued for. A course's key
+    (`mlc_…`, `connect(course_key=…)` or `MLARENA_COURSE_KEY`) reaches only
+    `course_key_whoami()` and `push_course` of its course (`mlarena.connect()`
+    resolves each; `credentials` says which).
     """
 
     def __init__(self, token: str, base_url: str, credentials=None,
@@ -169,6 +177,13 @@ class MLArenaClient:
             raise _error(cls, resp, _safe_error(resp, "Access denied"))
         if resp.status_code == 404:
             raise _error(not_found, resp, _safe_error(resp, "Not found"))
+        if resp.status_code == 409:
+            body = _json_body(resp)
+            # A write of a course edited on GitHub, or of one of its
+            # challenges (`refuse_if_edited_on_github`): the server's sentence.
+            if body is not None and body.get("edited_in") == "github":
+                raise _error(CourseEditedOnGithubError, resp,
+                             _safe_error(resp, "This course is edited on GitHub"))
         if resp.status_code == 503:
             body = _json_body(resp)
             # Only the backend's maintenance gate sets the flag; any other 503
@@ -6199,9 +6214,8 @@ class MLArenaClient:
         (hidden from students, with its lessons and challenges) without
         touching anything else. A new `slug` changes the module's URLs (409
         when its course already has a module with it); its lessons and their
-        progress are kept. A module managed by a bundle
-        (`content_origin == "bundle"`) refuses edits with a 409 naming its
-        source: change the files and push again, or `detach_module`.
+        progress are kept. In a course edited on GitHub the call raises
+        `CourseEditedOnGithubError` (409): change the repository instead.
         """
         allowed = {"title", "slug", "summary", "icon", "is_published"}
         body = _filtered_fields(fields, allowed, "update_module")
@@ -6224,21 +6238,6 @@ class MLArenaClient:
         return self._json_call(
             "DELETE", f"/teacher/modules/{module_id}",
             error_label="delete_module",
-        )
-
-    def detach_module(self, module_id: int) -> dict:
-        """Hand a bundle-managed module back to the editor — the course's
-        owner or an admin (403 for an assistant).
-
-        Mirrors `POST /api/teacher/modules/{id}/detach`. A module last
-        written by a course bundle (`push_course`, `mlarena course push`) has
-        `content_origin == "bundle"` and refuses editor writes; detaching
-        sets it to `editor`. The next push of a bundle that names the module
-        takes it over again. Returns the module detail.
-        """
-        return self._json_call(
-            "POST", f"/teacher/modules/{module_id}/detach",
-            error_label="detach_module",
         )
 
     def update_course_challenge(self, module_id: int, challenge_id: int, /,
@@ -7340,8 +7339,9 @@ class MLArenaClient:
         `archive`, query `dry_run` / `prune`). `path` is the course directory
         (`course.yaml`, the lessons' markdown, their images and files),
         zipped by `mlarena.bundle.make_bundle`, or an existing `.zip` /
-        `.tar.gz` of it. `slug` is the course's; by default it is read from
-        the manifest's `course.slug`. `subpath` names the folder inside the
+        `.tar.gz` of it. `slug` is the course's; by default it is the course
+        of the client's course key (`course_key_whoami()`), else the
+        manifest's `course.slug`. `subpath` names the folder inside the
         directory `path` that holds the course (one repository, several
         courses): only that folder is bundled, as `push_challenge` does. The
         course route takes no sub-folder, so an archive is pushed whole and
@@ -7355,6 +7355,10 @@ class MLArenaClient:
               foundations/
                 what-is-rl.md        # a lesson body, named by the manifest
                 images/loop.png      # linked from it as ![](images/loop.png)
+              challenges/house-prices/   # a challenge folder, named by an entry
+                env.py, challenge.toml, overview.md, image.png, agent.py
+                data/                # the files participants download
+                benchmark/           # the benchmark submission
 
         A relative path is relative to the folder of the file that writes
         it, as on GitHub: a path of the manifest (`file`, `cover`) from the
@@ -7366,12 +7370,9 @@ class MLArenaClient:
 
             course:
               name: "Intro to RL"
-              slug: intro-to-rl
+              slug: intro-to-rl      # optional: when written, the course's slug
               code: "RL101"          # optional
               description: "..."     # optional markdown
-              visibility: public     # private | public
-              start_date: 2026-01-01
-              end_date: 2026-06-01
               cover: cover.png       # optional, from the directory's root
             modules:
               - title: "Foundations"
@@ -7380,9 +7381,12 @@ class MLArenaClient:
                 icon: book           # optional
                 is_published: true   # optional (default true): false = hidden from students
                 challenges:          # optional: challenges of this course, placed here
-                  - slug: cartpole-v1       # the challenge's URL slug (or challenge_id:)
+                  - name: "House prices"    # the challenge's identity in the course
+                    folder: challenges/house-prices   # optional: its files (below)
+                    kernel_version: file_v1 # required when the push creates it
                     pass_threshold: 195.0   # optional: the score that validates it; left
                                             # out keeps the bar, null clears it
+                  - slug: cartpole-v1       # places an existing challenge of the course
                 lessons:
                   - title: "What is RL?"
                     slug: what-is-rl
@@ -7413,16 +7417,25 @@ class MLArenaClient:
         bundle: `MLArenaError` with the server's message, nothing written.
         `dry_run=True` returns the same plan and writes nothing.
 
-        A module written by a bundle is managed by it: the console's editor
-        and the module / lesson write methods answer 409 until
-        `detach_module`. Relative links in a lesson are kept as written; the
+        Visibility and dates are the console's (`update_course`): a
+        manifest that writes `course.visibility`, `course.start_date` or
+        `course.end_date` is refused with the setting to use. A course is
+        edited in one place (`course_github`): with a personal key the push
+        applies to a course edited in the console (`console` or
+        `connecting`) and raises `CourseEditedOnGithubError` for one edited
+        on GitHub; with the course's key it applies in `github` mode, is a
+        plan only (`dry_run` true in the answer) while `connecting`, and
+        writes a run row either way (`course_repository_runs`). Inside a
+        GitHub Actions job the request carries the run it comes from
+        (`ci_auth.ci_context_headers`: repository, commit, ref, run URL,
+        actor), which that row records. Relative links in a lesson are kept as written; the
         files they name become the module's assets, keyed by the link (the
         lessons of a module share one store: two lessons that link one key
         to different files are refused).
 
         Returns the server's plan: `dry_run`, `course` (`id`, `slug`,
         `action`, `changes`), `modules` (each `slug`, `id`, `action` —
-        `created` | `updated` | `unchanged` | `adopted` —, `changes`,
+        `created` | `updated` | `unchanged` —, `changes`,
         `renamed_from`, `lessons` (each with `action` and `changes`, the
         fields an `updated` lesson changed), `challenges` (each entry's
         `name`, `id`, `action` — `updated` | `unchanged` — and `changes`
@@ -7431,7 +7444,8 @@ class MLArenaClient:
         `removed` and their store keys `written_paths` / `removed_paths`),
         `unmanaged_modules`, `unmanaged_challenges` (the names of the
         course's challenges no entry names, in course order),
-        `source_revision`, the course's `url`, and `warnings`: first one
+        `source_revision`, the course's `url`, `run_id` (the course's run
+        row that a push with its key wrote), and `warnings`: first one
         sentence per manifest key that is no longer used, then one per
         `mlarena:` block whose challenge the students of this course will
         not see, naming its module and lesson; `[]` when there is nothing to
@@ -7446,6 +7460,10 @@ class MLArenaClient:
                 "push_course takes subpath= only with a directory: an archive "
                 "is pushed whole, with the manifest at its root"
             )
+        if slug is None and self.credentials is not None \
+                and self.credentials.kind == KIND_COURSE_KEY:
+            # The key names its course: the manifest needs no slug.
+            slug = self.course_key_whoami()["slug"]
         if slug is None:
             if not os.path.isdir(path):
                 raise MLArenaError(
@@ -7461,7 +7479,7 @@ class MLArenaClient:
             params["prune"] = "true"
         resp = self._request(
             "PUT", self._url(f"/teacher/courses/{quote(slug, safe='')}/bundle"),
-            headers=self._headers(),
+            headers={**self._headers(), **ci_context_headers()},
             params=params or None,
             files={"archive": (filename, archive)},
             timeout=300,
@@ -7522,11 +7540,17 @@ class MLArenaClient:
         folder holds `course.yaml`, each lesson body at
         `<module-slug>/<lesson-slug>.md` with the files it links beside it
         (a link is relative to the lesson file's folder, as on GitHub), and
-        the cover. For a course you manage it also holds
-        `.github/workflows/push.yml` (the course template's workflow: commit
-        the folder to a GitHub repository and each push to `main` updates
-        the course) and a `README.md`, which lists under "Fix before your
-        first push" any link of a lesson to a file the course does not hold.
+        the cover. For a course you manage it also holds one folder per
+        challenge, `challenges/<challenge-slug>/` (its code, `challenge.toml`,
+        `overview.md`, image, starter `agent.py`, `data/`, `benchmark/`: the
+        answer keys and hidden tests, so keep the repository private),
+        `.github/workflows/ml-arena.yml` (the course template's workflow: it
+        pushes the course with its key on every commit to `main`) and a
+        `README.md` with the steps to connect the repository (Settings ›
+        GitHub: connect, create the key, add it as the secret
+        `MLARENA_COURSE_KEY`, run the workflow); it lists under "Fix before
+        your first push" any link of a lesson to a file the course does not
+        hold. A learner's export holds the lessons only.
 
         `path` is created when missing. An existing folder must be empty, so
         an export never mixes with other files by accident; `overwrite=True`
@@ -7537,9 +7561,9 @@ class MLArenaClient:
         `MLArenaError` and writes nothing.
 
         Returns the parsed `course.yaml`, the dict `push_course` reads.
-        Next step: `push_course(path, dry_run=True)` reports every lesson
-        *unchanged*, and a module written in the Studio *adopted* (it moves
-        to the repository; only the module's owner's push does that).
+        Pushed back unchanged (`push_course(path, dry_run=True)`, or the
+        first run of the workflow while the course is `connecting`), the plan
+        reads *unchanged* everywhere.
         """
         # Refused before the download: a folder that already holds files.
         check_extract_target(path, overwrite)
@@ -7553,8 +7577,149 @@ class MLArenaClient:
         extract_bundle(resp.content, path, overwrite=overwrite)
         return _load_course_manifest(os.path.abspath(path))
 
+    # ---- A course edited in the console or on GitHub (course keys) ---------
+
+    def course_github(self, course_id: int) -> dict:
+        """Where a course is edited, and its repository, keys, runs and mode
+        changes — Settings › GitHub (author scope; the course's owner, an
+        assistant or an admin).
+
+        Mirrors `GET /api/teacher/course/{id}/github` → `CourseGithubOut`:
+        `edited_in` (`console`: the console and personal keys write the
+        content; `connecting`: the same, and a push with the course's key is
+        a plan; `github`: only a push with the course's key writes it),
+        `repository` (`{repository, branch, path, connected_by_user_id,
+        connected_at_ts}`, or None before the first connection; kept when the
+        course goes back to the console), `keys` (`CourseKeyOut` rows: `id`,
+        `label`, `created_by_user_id`, `created_by_username`,
+        `created_at_ts`, `expires_at_ts`, `last_used_at_ts`,
+        `revoked_at_ts`, `revoked_reason` — `revoked`, `staff_left`,
+        `console_mode`, `course_archived`, `account_closed` — never the
+        secret), `runs` (the last 20 `CourseRepositoryRunOut`: `id`,
+        `course_key_id`, `repository`, `commit_sha`, `ref`, `run_url`,
+        `actor_login` as the run reported them, `is_dry_run`, `outcome` —
+        `applied`, `planned`, `refused`, `failed` —, `message`, `plan`,
+        `created_at_ts`) and `changes` (the last 10 mode changes:
+        `from_value`, `to_value`, `user_id`, `username`,
+        `revoked_key_count`, `created_at_ts`).
+        """
+        return self._json_call(
+            "GET", f"/teacher/course/{course_id}/github",
+            error_label="course_github",
+        )
+
+    def set_course_repository(self, course_id: int, repository: str,
+                              branch: str = "main", path: str = "") -> dict:
+        """Connect a course to a GitHub repository, or rename the one it is
+        connected to.
+
+        Mirrors `PUT /api/teacher/course/{id}/github/repository`
+        `{"repository", "branch", "path"}` → `CourseGithubOut` (as
+        `course_github`). `repository` is `owner/name`; `branch` the branch
+        the workflow pushes from; `path` the course's folder in the
+        repository (empty: its root; one folder per course when a repository
+        holds several). They are links, not a credential: the course's key
+        is. From `console` the course becomes `connecting` (every editor
+        stays open and a push with its key is a plan), or `github` at once
+        when it holds no module and no challenge. In the other modes the
+        call only updates the links (a repository transferred to its
+        teacher).
+        """
+        return self._json_call(
+            "PUT", f"/teacher/course/{course_id}/github/repository",
+            json_body={"repository": repository, "branch": branch, "path": path},
+            error_label="set_course_repository",
+        )
+
+    def switch_course_edited_in(self, course_id: int, to: str) -> dict:
+        """Move a course between the console and its repository.
+
+        Mirrors `POST /api/teacher/course/{id}/github/switch` `{"to"}` →
+        `CourseGithubOut`. `to="github"` from `connecting` only, once the last
+        run of its key is a `planned` one (refused while it is `refused` or
+        `failed`): from then on only a push with the course's key writes its
+        content, and the next commit applies. `to="console"` from
+        `connecting` or `github`: the content is edited here again, every key
+        of the course is revoked (`console_mode`) and its pushes are refused;
+        the repository is not changed. The change is recorded
+        (`course_github()["changes"]`).
+        """
+        return self._json_call(
+            "POST", f"/teacher/course/{course_id}/github/switch",
+            json_body={"to": to}, error_label="switch_course_edited_in",
+        )
+
+    def create_course_key(self, course_id: int, label: str,
+                          expires_in_days: int = 365) -> dict:
+        """Mint a course key, the credential a repository pushes the course
+        with.
+
+        Mirrors `POST /api/teacher/course/{id}/keys`
+        `{"label", "expires_in_days"}` → `CourseKeyCreatedOut{key, token}`:
+        `key` is the `CourseKeyOut` row (as in `course_github`), `token` the
+        key itself, `mlc_<lookup>_<secret>`, served in this answer only. Add
+        it to the repository as the Actions secret `MLARENA_COURSE_KEY`.
+        `expires_in_days` is 30, 90 or 365. Refused while the course is
+        edited in the console (connect a repository first); at most 5 live
+        keys per course (a rotation: create, replace the secret, check one
+        green run, `revoke_course_key` the old one). A key acts as its
+        creator, with no admin right, and is revoked when its creator leaves
+        the course's staff or closes their account, when the course goes
+        back to the console or is archived.
+        """
+        return self._json_call(
+            "POST", f"/teacher/course/{course_id}/keys",
+            json_body={"label": label, "expires_in_days": expires_in_days},
+            ok=(200, 201), error_label="create_course_key",
+        )
+
+    def revoke_course_key(self, course_id: int, key_id: int) -> dict:
+        """Revoke a course key (`revoked_reason` `revoked`): the next push
+        with it is refused, and the refusal is a run row.
+
+        Mirrors `DELETE /api/teacher/course/{id}/keys/{key_id}` → the
+        `CourseKeyOut` row.
+        """
+        return self._json_call(
+            "DELETE", f"/teacher/course/{course_id}/keys/{key_id}",
+            error_label="revoke_course_key",
+        )
+
+    def course_repository_runs(self, course_id: int,
+                               before_id: int | None = None) -> list:
+        """The pushes that reached the course with one of its keys, newest
+        first, a page at a time.
+
+        Mirrors `GET /api/teacher/course/{id}/github/runs?before_id=` →
+        `[CourseRepositoryRunOut]` (the rows of `course_github()["runs"]`).
+        `before_id` is the `id` of the last row of the previous page.
+        """
+        params = {"before_id": before_id} if before_id is not None else None
+        return self._json_call(
+            "GET", f"/teacher/course/{course_id}/github/runs", params=params,
+            error_label="course_repository_runs",
+        )
+
+    def course_key_whoami(self) -> dict:
+        """Which course the client's course key belongs to.
+
+        Mirrors `GET /api/auth/course_key` → `CourseKeyWhoamiOut{course_id,
+        slug, edited_in, expires_at_ts}`. A course key only (`mlc_…`): any
+        other credential is refused. `mlarena course push` reads it to know
+        which course it pushes, so the manifest needs no slug.
+        """
+        resp = self._request(
+            "GET", f"{self._base_url}{COURSE_KEY_WHOAMI_PATH}",
+            headers=self._headers(),
+        )
+        self._handle_response(resp)
+        if resp.status_code != 200:
+            raise _failed(MLArenaError, "course_key_whoami", resp)
+        return resp.json()
+
     def __repr__(self) -> str:
-        # mlk_<scope>_<lookup>_<secret> / mlo_<lookup>_<secret>: never the secret.
+        # mlk_<scope>_<lookup>_<secret> / mlo_<lookup>_<secret> /
+        # mlc_<lookup>_<secret>: never the secret.
         head = self._token.split("_")
         masked = "_".join(head[:-1] + ["…"]) if len(head) in (3, 4) else "…"
         return f"MLArenaClient(base_url='{self._base_url}', token='{masked}')"
