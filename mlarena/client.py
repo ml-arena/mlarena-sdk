@@ -5651,13 +5651,15 @@ class MLArenaClient:
         the share of `full_grant` used (0 to 100), `alert_pct` the alert
         level reached (80, 100 or None), and `grants` (oldest first) each
         `{id, kind, amount, consumed, expires_at_ts, note, created_at_ts,
-        is_active}`, `kind` being `entry` (the grant a new account starts
-        with) or `admin`. At 0 or below, the owner's challenges on a machine
+        is_active}`, `kind` being `monthly` (the free allowance, one grant
+        each calendar month, expiring at the next), `entry` (what an account
+        created before the monthly grant started with) or `admin`. At 0 or below, the owner's challenges on a machine
         of that balance are on hold: their queued runs wait, their chat and
         exercise pods stop, and new work is refused until a grant.
         Amounts are four-decimal strings (`"5000.0000"`): parse them with
-        `decimal.Decimal`. The first read creates the two balances (the CPU
-        one with its entry grant). More credits come from an admin.
+        `decimal.Decimal`. The first read creates the two balances, and the
+        first read of a month writes the CPU one's monthly grant. More
+        credits come from an admin.
         """
         return self._json_call("GET", "/credits", error_label="credits")
 
