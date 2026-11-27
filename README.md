@@ -767,7 +767,7 @@ Requires a platform at Alembic `a7d1e5c9b3f6` or later.
 
   ```python
   course = client.use_challenge_with_class("titanic", end_date="2027-06-30")
-  print(course["join_code"])                      # students: enroll_in_course(code)
+  print(course["join_code"])  # students open https://<console>/enroll/<join_code>
   ```
 
 ## 4.17.1 — a course's leaderboard names its participants to the course's members only
@@ -2463,9 +2463,9 @@ method↔route table for the full surface.
 
 **Create + enroll**
 
-- `client.create_course(name, code=None, start_date, end_date, slug=None, description=None, visibility=None, ask_student_identity=None)` — any token scope (capped by `max_courses_limit`: 10 active, not archived, courses by default; admins exempt). `visibility` is `private` (default) or `public`; `ask_student_identity` is off unless you turn it on. Add challenges afterwards with `add_course_challenge`, or make a course and its challenge in one call with `create_challenge_for_class`. The response carries the course's `join_code` — the single enrollment token to share with students.
-- `client.enroll_in_course(join_code, student_email=None, student_number=None)` — join with the course's short join code (the token in its `/enroll/<join_code>` link).
-- `client.enrollment_info(join_code)` — preview a course before enrolling (public).
+- `client.create_course(name, code=None, start_date, end_date, slug=None, description=None, visibility=None, ask_student_identity=None)` — any token scope (capped by `max_courses_limit`: 10 active, not archived, courses by default; admins exempt). `visibility` is `private` (default) or `public`; `ask_student_identity` is off unless you turn it on. Add challenges afterwards with `add_course_challenge`, or make a course and its challenge in one call with `create_challenge_for_class`. The response carries the course's `join_code` — the single enrollment token; students get it inside the join link `https://<console>/enroll/<join_code>`.
+- `client.enroll_in_course(join_code, student_email=None, student_number=None)` — join with the join link the teacher sent (`https://…/enroll/<join_code>`) or the token it ends with.
+- `client.enrollment_info(join_code)` — preview a course from its join link or token before enrolling (public).
 - `client.list_courses(show_all=False)` — your enrolled + active courses (a challenge's course is `challenge(id)["course_id"]`).
 
 **Author a whole course from a directory**
@@ -2498,13 +2498,14 @@ and kept (`prune=True` deletes it).
 public repository the same way; `mlarena course push` does it from a GitHub
 Actions workflow.
 
-**Enroll by join code, then read + complete lessons**
+**Enroll with the join link, then read + complete lessons**
 
 ```python
 import mlarena
 
 student = mlarena.connect(api_key="mlk_user_…")
-student.enroll_in_course("JOINME", student_email="s@uni.edu", student_number="42")
+student.enroll_in_course("https://ml-arena.com/enroll/JOINME",
+                         student_email="s@uni.edu", student_number="42")
 
 landing = student.course("intro-to-rl")                  # modules + lesson TOC
 for module in landing["modules"]:
@@ -2530,7 +2531,7 @@ print(student.my_progress(landing["id"]))                # content % + next less
 - `client.copy_module_into_course(course_id, module_id)` — the console's "Copy a module from another course": a module of a course you are staff of, with its lessons, assets and challenges (as draft copies; a module that holds a challenge needs the terms of use accepted, 403 `terms_required` otherwise and nothing is copied); `client.list_copyable_modules(course_id)` lists the modules of your other courses.
 - `client.update_course(id, *, end_date=…, **fields)` — only the keywords passed are sent and a `None` is not, except `end_date=None`, which clears the end date; `visibility` is `private` or `public`. `set_course_cover`, `list_course_modules`, `reorder_modules`, `course_progress(course_id)` — teacher follow dashboard.
 - `client.teacher_course(course_id)` — one course for its workspace: the row, your `role` (what you are to it: `owner` | `assistant` | `None` for an admin who is neither), `has_owner_rights` (whether you may do what only the owner may: the owner and an admin), `may_list_as_example` (whether you may list it as an example: the publishing right with the owner's rights), `owner_username`, the settings (`ask_student_identity`, `report_recipients`, `report_to_assistants`, `report_last_sent_at_ts`) and the counts (`enrollment_count`, `assistant_count`, `module_count`, `challenge_count`). `update_course` writes the settings too and returns the same shape.
-- `client.archive_course(id)` / `unarchive_course(id)` — the owner's: an archived course takes no enrollment, leaves the catalog and stops counting in the limit of active courses (`max_courses_limit`, 10 by default); its students and staff keep it. `client.duplicate_course(id, name=None)` — a new private course of yours with the settings and a copy of every module, lesson and challenge (the challenges as drafts with empty boards; no enrollment, progress, dates or assistants; fresh join code): for the course's staff, and for any author on an example course. A course that holds a challenge you would copy needs the terms of use accepted (403 `terms_required` otherwise; nothing is copied, no course is left). `client.delete_course(id)` — a course goes with its modules, lessons and challenges, so it needs no enrolled user, no example listing and challenges that may all be deleted (drafts with nothing on them); it answers `{can_delete, enrollment_count, example_listed_at_ts, deleted_modules, deleted_challenges, blocking_challenges, storage_left}`; `client.course_deletion(id)` serves that plan before the fact.
+- `client.archive_course(id)` / `unarchive_course(id)` — the owner's: an archived course takes no enrollment, leaves the catalog and stops counting in the limit of active courses (`max_courses_limit`, 10 by default); its students and staff keep it. `client.duplicate_course(id, name=None)` — a new private course of yours with the settings and a copy of every module, lesson and challenge (the challenges as drafts with empty boards; no enrollment, progress, dates or assistants; a fresh join link): for the course's staff, and for any author on an example course. A course that holds a challenge you would copy needs the terms of use accepted (403 `terms_required` otherwise; nothing is copied, no course is left). `client.delete_course(id)` — a course goes with its modules, lessons and challenges, so it needs no enrolled user, no example listing and challenges that may all be deleted (drafts with nothing on them); it answers `{can_delete, enrollment_count, example_listed_at_ts, deleted_modules, deleted_challenges, blocking_challenges, storage_left}`; `client.course_deletion(id)` serves that plan before the fact.
 - `client.unlist_course_example(id)` — take a course out of the examples (the owner's rights). Listing a public course as an example, a starting point for teachers, is an admin's, in the console. A copy takes the scoring files, the data, the exercise solutions and the data-feed keys, and every copy starts with the same data and the same scoring files: list a course whose challenges a copy does not spoil (a live feed, a multiplayer game, a configurable base).
 - `client.credits()` — your CPU and GPU balances, with their grants; `client.credit_usage(resource, group_by, since=None, course_id=None, challenge_id=None)` — what was charged, by `course`, `challenge` or `kind`, on your account or, for its staff, on one course or challenge. A credit is a minute on a machine at its rate (`machines()` rows: `rate`); the owner of a challenge pays for it. When that owner has none left on the balance the challenge's machine draws from, new work for the challenge is refused with a 409 whose `err.body["reason"]` is `"out_of_credits"` (beside `error`, the sentence): a deploy, a chat conversation or message, an exercise Check, a benchmark run, a re-score, an update of a started challenge's files; Start and an exercise self-test list it as the `out_of_credits` start blocker, a chat session as its `can_send_reason`. Work accepted before finishes.
 - `client.send_course_report(id)` — mails the course report now (two leaderboard CSVs per challenge) to the owner, the assistants (`report_to_assistants`) and `report_recipients`; one send per course every 10 minutes.

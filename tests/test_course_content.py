@@ -569,6 +569,26 @@ def test_enroll_uses_join_code():
         pass
 
 
+def test_enroll_takes_the_join_link():
+    # The console hands students the link, never the bare code.
+    c, rec = make_client(lambda *_: (201, {"message": "ok"}))
+    c.enroll_in_course("https://ml-arena.com/enroll/QXM0W9DE")
+    _expect(rec.last["path"] == "/academic_courses/enroll/QXM0W9DE", rec.last["path"])
+    c.enroll_in_course("https://ml-arena.com/enroll/QXM0W9DE/?redirect=%2Fcourses%2Frl")
+    _expect(rec.last["path"] == "/academic_courses/enroll/QXM0W9DE", rec.last["path"])
+
+    c, rec = make_client(lambda *_: (200, {"course": {}}))
+    c.enrollment_info("http://localhost:3000/enroll/AB12CD34")
+    _expect(rec.last["path"] == "/academic_courses/enroll/AB12CD34", rec.last["path"])
+
+    for bad in ("https://ml-arena.com/courses/rl", "https://ml-arena.com/enroll/"):
+        try:
+            c.enrollment_info(bad)
+            raise AssertionError(f"expected MLArenaError for {bad}")
+        except MLArenaError:
+            pass
+
+
 # --------------------------------------------------------------------------- #
 # High-level helpers
 # --------------------------------------------------------------------------- #

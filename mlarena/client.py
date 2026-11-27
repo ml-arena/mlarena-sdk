@@ -18,7 +18,7 @@ import time
 import warnings
 from pathlib import Path
 from typing import Iterator
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import requests
 import yaml
@@ -5732,8 +5732,9 @@ class MLArenaClient:
         term dates (a course with no end date never closes). They are kept
         positional for backwards compatibility with the original signature. The
         backend mints the course's `join_code` — the single enrollment token —
-        and returns it in the course dict; share that, or the
-        `/enroll/<join_code>` link built from it, with students.
+        and returns it in the course dict; send students the join link built
+        from it (`https://<console>/enroll/<join_code>`, the console's
+        Overview shows it).
 
         Keywords:
             slug:        kebab URL slug (`^[a-z0-9-]+$`); auto-derived from the
@@ -5778,10 +5779,12 @@ class MLArenaClient:
         )
 
     def enrollment_info(self, join_code: str) -> dict:
-        """Preview a course from its join code (without enrolling).
+        """Preview a course from its join link (without enrolling).
 
         Mirrors `GET /api/academic_courses/enroll/<join_code>` — the same public
-        lookup the console's EnrollPage makes. Returns
+        lookup the console's EnrollPage makes. `join_code` is the join link the
+        teacher sends (`https://…/enroll/<join_code>`) or the token it ends
+        with. Returns
         `{course, challenge_names, lesson_count, already_enrolled,
         ask_student_identity, has_student_info}`; the course sits under
         `course` with its own field names (`id`, `name`, `code`, `slug`, ...,
@@ -5793,7 +5796,7 @@ class MLArenaClient:
         who is already enrolled in it (`already_enrolled: true`).
         """
         return self._json_call(
-            "GET", f"/academic_courses/enroll/{join_code}",
+            "GET", f"/academic_courses/enroll/{_join_code_of(join_code)}",
             error_label="enrollment_info",
         )
 
@@ -5803,9 +5806,9 @@ class MLArenaClient:
         """Enroll the authenticated user in a course.
 
         Mirrors `POST /api/academic_courses/enroll/<join_code>`. A course has a
-        single enrollment token, its `join_code` — pass it positionally or as
-        `join_code=`. A full `/enroll/<join_code>` URL is not accepted; pass the
-        code itself.
+        single enrollment token, its `join_code`, which the join link the
+        teacher sends ends with (`https://…/enroll/<join_code>`) — pass the
+        link or the token, positionally or as `join_code=`.
 
         `student_email` / `student_number` fill the caller's global student
         identity when it isn't set yet (they never overwrite values already on
@@ -5819,14 +5822,14 @@ class MLArenaClient:
         `{message, challenge_ids, course_slug}`.
         """
         if join_code is None:
-            raise MLArenaError("enroll_in_course requires a join code")
+            raise MLArenaError("enroll_in_course requires the course's join link")
         body: dict = {}
         if student_email is not None:
             body["student_email"] = student_email
         if student_number is not None:
             body["student_number"] = student_number
         return self._json_call(
-            "POST", f"/academic_courses/enroll/{join_code}", json_body=body,
+            "POST", f"/academic_courses/enroll/{_join_code_of(join_code)}", json_body=body,
             ok=(200, 201), error_label="enroll_in_course",
         )
 
@@ -6591,8 +6594,8 @@ class MLArenaClient:
         when the server's body had none.
 
         Returns `{"course": <the create_course answer>, "challenge": <the
-        add_course_challenge answer>}`: share `course["join_code"]` (or the
-        `/enroll/<join_code>` link) with students.
+        add_course_challenge answer>}`: send students the join link,
+        `https://<console>/enroll/<join_code>` with `course["join_code"]`.
         """
         self._refuse_without_terms()
         course = self.create_course(name, end_date=end_date)
@@ -6816,7 +6819,7 @@ class MLArenaClient:
         """Archive a course — its owner or an admin.
 
         Mirrors `POST /api/teacher/course/{id}/archive`. An archived course
-        takes no enrollment (its join code answers 410), leaves the catalog and
+        takes no enrollment (its join link answers 410), leaves the catalog and
         the listing of non-members, is skipped by the end-of-course report and
         no longer counts in your limit of active courses. Nothing is deleted:
         its students keep reading it and you keep following it. Returns the
@@ -7005,7 +7008,7 @@ class MLArenaClient:
         enrollment row is deleted: the student leaves the roster, the progress
         table, the exports and the course view of the leaderboards. Their
         account, student number and email, submissions, teams and lesson
-        progress are kept, and they can enroll again with the join code (their
+        progress are kept, and they can enroll again with the join link (their
         completed lessons then count again).
         """
         return self._json_call(
@@ -7562,6 +7565,18 @@ class MLArenaClient:
         head = self._token.split("_")
         masked = "_".join(head[:-1] + ["…"]) if len(head) in (3, 4) else "…"
         return f"MLArenaClient(base_url='{self._base_url}', token='{masked}')"
+
+
+def _join_code_of(join_link: str) -> str:
+    """The `join_code` a course's join link ends with (`…/enroll/<join_code>`,
+    a `?redirect=` query allowed), or the value itself when it is the bare
+    token. Anything else with a `/` in it is refused, never sent."""
+    if "/" not in join_link:
+        return join_link
+    parts = urlsplit(join_link).path.rstrip("/").split("/")
+    if len(parts) < 2 or parts[-2] != "enroll" or not parts[-1]:
+        raise MLArenaError(f"Not a course join link: {join_link!r} (expected …/enroll/<join_code>)")
+    return parts[-1]
 
 
 def _as_student(as_student: bool) -> dict | None:
