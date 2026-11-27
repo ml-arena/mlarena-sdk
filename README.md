@@ -60,6 +60,35 @@ client.leaderboard(ch["id"])                      # a DataFrame with pandas
   An error once the submission exists (a refused upload, a deploy over your
   daily quota) carries `err.submission_id` and says how to deploy or delete it.
 
+## 4.25.0 — organizations; no instructor name
+
+Requires a platform at or after the backend change of 2026-11-27
+(migrations `c8e2a6f0b4d7`, `d9f3b7a1c5e8`). Breaking for
+`instructor_name`.
+
+- **Removed: `instructor_name`.** `create_course(...)` no longer takes it
+  (a keyword or a fifth positional argument is a `TypeError`), and
+  `update_course(instructor_name=...)` raises before any request. A course
+  names who runs it with its owner (`owner_username`) and the organization
+  an admin attached to it. A `course.yaml` that still carries
+  `course.instructor_name` is refused by `push_course` / `mlarena course
+  push` with a sentence saying so: remove the key.
+- **`organization(slug)`** reads an organization's public page
+  (`GET /api/organizations/{slug}`, with or without a key): `name`,
+  `website_url`, `description`, `has_logo`, `members`, `courses` (as
+  `course_catalog()` cards) and `challenges` (as `challenges()` rows). An
+  unknown slug raises `NotFoundError`. Organizations are created and
+  attached by an admin in the console; the SDK has no method for that.
+- **`organization`** (`{id, slug, name, has_logo}` or None) on `challenge(id)`
+  (a course challenge shows its course's), the `challenges()` rows,
+  `course(slug)`, the `course_catalog()` cards, `list_courses()` rows,
+  `teacher_course(id)` and `enrollment_info(code)["course"]`;
+  `user_profile(username)["organizations"]` lists a user's.
+- **Owners on cards**: `challenges()` rows and `course_catalog()` cards carry
+  `owner_username` and `owner_avatar_key`.
+- **`my_submissions()` rows name the course**: `course_id`, `course_name`,
+  `course_slug` (all None for a challenge with no course).
+
 ## 4.24.0 — public profiles; who runs a challenge or a course
 
 Requires a platform at or after the backend change of 2026-11-26 (no
@@ -2343,7 +2372,7 @@ method↔route table for the full surface.
 
 **Create + enroll**
 
-- `client.create_course(name, code=None, start_date, end_date, slug=None, description=None, visibility=None, ask_student_identity=None, instructor_name=None)` — any token scope (capped by `max_courses_limit`: 10 active, not archived, courses by default; admins exempt). `visibility` is `private` (default) or `public`; `ask_student_identity` is off unless you turn it on. Add challenges afterwards with `add_course_challenge`, or make a course and its challenge in one call with `create_challenge_for_class`. The response carries the course's `join_code` — the single enrollment token to share with students.
+- `client.create_course(name, code=None, start_date, end_date, slug=None, description=None, visibility=None, ask_student_identity=None)` — any token scope (capped by `max_courses_limit`: 10 active, not archived, courses by default; admins exempt). `visibility` is `private` (default) or `public`; `ask_student_identity` is off unless you turn it on. Add challenges afterwards with `add_course_challenge`, or make a course and its challenge in one call with `create_challenge_for_class`. The response carries the course's `join_code` — the single enrollment token to share with students.
 - `client.enroll_in_course(join_code, student_email=None, student_number=None)` — join with the course's short join code (the token in its `/enroll/<join_code>` link).
 - `client.enrollment_info(join_code)` — preview a course before enrolling (public).
 - `client.list_courses(show_all=False)` — your enrolled + active courses (a challenge's course is `challenge(id)["course_id"]`).

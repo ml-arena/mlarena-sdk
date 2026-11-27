@@ -655,7 +655,10 @@ class MLArenaClient:
         once), ``kernel_version`` and ``kind_label`` (the kind and
         its one label, ``"Python agent"`` | ``"Upload a file"`` |
         ``"Chat with an AI agent"`` | ``"Exercises"``; None without a
-        configuration) and ``my_rank``
+        configuration), ``owner_username`` / ``owner_avatar_key`` (its
+        organizer), ``organization`` (``{id, slug, name, has_logo}`` of the
+        organization an admin attached, or None; ``organization(slug)``
+        reads its page) and ``my_rank``
         (your participant's rank on the challenge's board; None when
         anonymous or with nothing on the board). Call
         ``challenge(id)`` for the machine and the limits.
@@ -724,6 +727,10 @@ class MLArenaClient:
         this challenge's id when it is the course's only content (the course
         is then shown as the challenge), else None; `example_listed_at_ts`
         is when the course was listed as an example (None = not an example).
+        Who runs it: `owner_username` / `owner_avatar_key` (its organizer;
+        on a course challenge the course's owner) and `organization`
+        (`{id, slug, name, has_logo}`, or None): a challenge with no course shows the
+        one an admin attached to it, a course challenge its course's.
         `copied_from_challenge_id` is the challenge it was copied from (None
         when it was not); `copied_from_challenge` (`{id, name, slug}`) names
         that source when it is a public challenge with no course ("Based on
@@ -3978,7 +3985,9 @@ class MLArenaClient:
         submissions are `active`; a teammate's is not counted) and
         `deployment_limits` (the same quota block `submission_deploy_status`
         serves). Each row carries `id`, `submission_name`, `challenge_id`,
-        `challenge_name`, `rank`, `created_at_ts`, `challenge_start_date_ts`
+        `challenge_name`, `course_id`, `course_name`, `course_slug` (the
+        challenge's course; all three None for a challenge with no course),
+        `rank`, `created_at_ts`, `challenge_start_date_ts`
         (the challenge's own `start_date_ts` column), `last_end_run_ts`,
         `owner` (`{user_id, username, avatar_key}`), `viewer_role` (`owner` |
         `teammate`: only the owner writes) and the status block. Deleted
@@ -4756,7 +4765,9 @@ class MLArenaClient:
         with or without a key; the lists are what the caller may see). The
         name is matched whatever its case. Returns `user_id`, `username`,
         `avatar_key`, `bio`, `personal_website`, `created_at_ts`, `ranking`
-        (`user_global_rank()`'s dict), `organized_challenges` (the started
+        (`user_global_rank()`'s dict), `organizations` (the organizations an
+        admin made them a member of, `{id, slug, name, has_logo}` each, by
+        name; read one with `organization(slug)`), `organized_challenges` (the started
         or ended competitions they own, as `challenges()` rows: running
         first, then the most recently ended) and `taught_courses` (the courses
         they own that the course catalog lists, as `course_catalog()` cards).
@@ -4769,6 +4780,32 @@ class MLArenaClient:
         self._handle_response(resp, not_found=NotFoundError)
         if resp.status_code != 200:
             raise _failed(MLArenaError, "user_profile", resp)
+        return resp.json()
+
+    def organization(self, slug: str) -> dict:
+        """An organization's public page, as anyone may read it.
+
+        Mirrors `GET /api/organizations/{slug}` (`organizations/page.py`,
+        public: works with or without a key; the lists are what the caller
+        may see). The slug is matched whatever its case; it is the `slug` of
+        the `organization` that course, challenge and profile payloads carry.
+        Returns `id`, `slug`, `name`, `website_url`, `description`,
+        `has_logo` (its image is `GET /api/organizations/{id}/logo`),
+        `members` (`{username, avatar_key}` of its members with an active
+        account), `courses` (its courses the course catalog lists, as
+        `course_catalog()` cards) and `challenges` (its started or ended
+        challenges with no course, as `challenges()` rows).
+
+        Organizations are created and attached by an admin in the console
+        (Admin › Organizations); the SDK has no method for that.
+
+        A 404 — no organization has the slug — raises `NotFoundError`.
+        """
+        resp = self._request("GET", self._url(f"/organizations/{quote(slug, safe='')}"),
+                             headers=self._headers(), timeout=30)
+        self._handle_response(resp, not_found=NotFoundError)
+        if resp.status_code != 200:
+            raise _failed(MLArenaError, "organization", resp)
         return resp.json()
 
     # ---- Chat challenges (`chat_v1`): one shared JSON-call helper -----------
@@ -5787,7 +5824,6 @@ class MLArenaClient:
 
     def create_course(self, name: str, code: str | None = None,
                       start_date: str | None = None, end_date: str | None = None,
-                      instructor_name: str | None = None,
                       *,
                       slug: str | None = None,
                       description: str | None = None,
@@ -5803,6 +5839,11 @@ class MLArenaClient:
         numbers; `archive_course` or `delete_course` frees a place. Authoring
         its content (modules, lessons, challenges) takes an `author`-scope
         key from your Profile page.
+
+        A course names who runs it with its owner (you, `owner_username`) and
+        the organization an admin attached to it (`organization`, or None);
+        SDK 4.25.0 removed `instructor_name`, a free-text line the platform
+        no longer stores.
 
         `start_date` / `end_date` are optional ISO date strings (`YYYY-MM-DD`) —
         a name is the only required field, so a course can be created without
@@ -5839,8 +5880,6 @@ class MLArenaClient:
             body["end_date"] = end_date
         if code is not None:
             body["code"] = code
-        if instructor_name is not None:
-            body["instructor_name"] = instructor_name
         if slug is not None:
             body["slug"] = slug
         if description is not None:
@@ -5864,7 +5903,7 @@ class MLArenaClient:
         `{course, challenge_names, lesson_count, already_enrolled,
         ask_student_identity, has_student_info}`; the course sits under
         `course` with its own field names (`id`, `name`, `code`, `slug`, ...,
-        `enrollment_state`).
+        `organization`, `enrollment_state`).
         `ask_student_identity` is the course's setting: when it is False,
         `enroll_in_course` needs no student number or email.
         `already_enrolled` and `has_student_info` stay false for an anonymous
@@ -5919,7 +5958,9 @@ class MLArenaClient:
         with the rule `enroll_in_course` refuses by, `single_challenge_id`
         (the id of the course's only challenge when the course is shown as
         that challenge: one module, one challenge, no lesson; else None) and
-        `example_listed_at_ts` (set on an example course). A private course
+        `example_listed_at_ts` (set on an example course), `organization`
+        (`{id, slug, name, has_logo}` of the organization an admin attached, or None).
+        A private course
         is listed only to its members and staff, and `join_code` is set only
         on the courses the caller belongs to or manages (None elsewhere). An
         enrolled row also carries the caller's `progress`, `next_lesson`,
@@ -5946,7 +5987,9 @@ class MLArenaClient:
 
         Mirrors `GET /api/academic_courses/catalog`. Returns
         `{courses, total, limit, offset}` — only public courses appear.
-        `search` matches name + description. A card carries `has_cover`
+        `search` matches name + description. A card carries the course's
+        owner (`owner_username`, `owner_avatar_key`), its `organization`
+        (`{id, slug, name, has_logo}`, or None), `has_cover`
         (fetch the image with `course_cover(card["id"])`),
         `example_listed_at_ts`, `single_challenge_id` and, for a course
         shown as its one challenge, `single_challenge` (the challenge's
@@ -5991,8 +6034,11 @@ class MLArenaClient:
         course that takes enrollment, for anyone (None otherwise): what
         `enroll_in_course` takes. `single_challenge_id` is set when the
         course is shown as its one challenge; `example_listed_at_ts` when it
-        is an example course. An archived public course is a 404 to anyone
-        who is not its member.
+        is an example course. Who runs it: `owner_username` /
+        `owner_avatar_key` (its teacher) and `organization` (`{id, slug, name, has_logo}`
+        of the organization an admin attached, or None; its challenges show
+        it too). An archived public course is a 404 to anyone who is not its
+        member.
         `show_module_headings` is False when you are served a single module:
         the course is then its content, with no module heading. Each lesson
         of the TOC carries `visible_to_students` (it is published and so is
@@ -6440,15 +6486,16 @@ class MLArenaClient:
         """Update course meta and settings — owner, assistant or admin.
 
         Mirrors `PUT /api/teacher/course/{id}`. Accepts `name`, `code`,
-        `description`, `visibility`, `instructor_name`, `start_date`, `end_date`
+        `description`, `visibility`, `start_date`, `end_date`
         (ISO date strings), and the settings `ask_student_identity` (bool:
         whether enrolling asks for the student number and email),
         `report_recipients` (list of extra email addresses the course report
         goes to, at most 20, one plain address per entry; the whole list is
         replaced) and `report_to_assistants` (bool). The two report settings
         are the owner's (or an admin's): an assistant sending either gets a
-        403 and nothing is written. `name` and `instructor_name` are one line
-        of text (a line break or a tab is a 400). With
+        403 and nothing is written. `name` is one line of text (a line break
+        or a tab is a 400). The course's organization is an admin's to attach,
+        in the console; it is not a key here. With
         `ask_student_identity` off, the identity a student already has on
         their profile is still shown and exported; turning it on later does
         not ask the students who are already enrolled. Only the fields you
@@ -6458,7 +6505,6 @@ class MLArenaClient:
         course as `teacher_course(course_id)` does.
         """
         allowed = {"name", "code", "description", "visibility",
-                   "instructor_name",
                    "ask_student_identity", "report_recipients",
                    "report_to_assistants"}
         body = _filtered_fields(fields, allowed, "update_course",
@@ -6846,7 +6892,7 @@ class MLArenaClient:
         the workspace serves (`id`, `name`, `code`, `slug`, `visibility`,
         `join_code`, `start_date`, `end_date`, `archived_at_ts`, `role`). The
         list route this method called (`GET /api/teacher/courses`) is gone,
-        and with it `description`, `has_cover`, `instructor_name` and
+        and with it `description`, `has_cover`, `organization` and
         `is_enrolled` (read them from `teacher_course(id)`). An admin gets
         their own courses; everyone's is the console's. Works with the
         `author` key.
@@ -6868,7 +6914,8 @@ class MLArenaClient:
 
         Mirrors `GET /api/teacher/course/{id}`. The course row (`id`, `name`,
         `code`, `slug`, `description`, `visibility`, `has_cover`,
-        `instructor_name`, `join_code`, `start_date`, `end_date`,
+        `organization` (`{id, slug, name, has_logo}` of the organization an
+        admin attached, or None), `join_code`, `start_date`, `end_date`,
         `archived_at_ts`, `enrollment_state`, `is_enrolled`,
         `single_challenge_id`: the course's one challenge when the course is
         shown as it, `example_listed_at_ts`: set while it is listed as an
@@ -7323,7 +7370,6 @@ class MLArenaClient:
               code: "RL101"          # optional
               description: "..."     # optional markdown
               visibility: public     # private | public
-              instructor_name: "Prof X"
               start_date: 2026-01-01
               end_date: 2026-06-01
               cover: cover.png       # optional, from the directory's root

@@ -369,6 +369,27 @@ def test_update_course_fields():
             rec.last["json"])
 
 
+def test_instructor_name_is_gone_from_create_and_update():
+    # 4.25.0: a course names its owner and its organization, no free text.
+    c, rec = make_client(lambda *_: (201, {"id": 1}))
+    c.create_course("RL", "RL101", "2026-01-05", "2026-06-30")
+    _expect("instructor_name" not in rec.last["json"], rec.last["json"])
+    for call in (lambda: c.create_course("RL", instructor_name="Prof"),
+                 lambda: c.create_course("RL", None, None, None, "Prof")):
+        try:
+            call()
+        except TypeError:
+            pass
+        else:
+            raise AssertionError("create_course took instructor_name")
+    try:
+        c.update_course(1, instructor_name="Prof")
+    except MLArenaError as e:
+        _expect("unknown field" in str(e), str(e))
+    else:
+        raise AssertionError("update_course sent instructor_name")
+
+
 def test_update_course_end_date_none_clears_it():
     # end_date=None is an explicit null (clear); leaving it out sends no key.
     c, rec = make_client(lambda *_: (200, {"id": 1}))

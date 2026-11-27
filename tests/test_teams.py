@@ -339,6 +339,27 @@ def test_user_profile_reads_the_public_profile_by_name():
     assert rec.last["path"] == "/users/Jo%20Jo"
 
 
+def test_organization_reads_the_public_page_by_slug():
+    page = {"id": 3, "slug": "sorbonne-universite", "name": "Sorbonne Université",
+            "website_url": None, "description": None, "has_logo": False,
+            "members": [], "courses": [], "challenges": []}
+    c, rec = make_client(lambda *_: (200, page))
+    assert c.organization("sorbonne-universite") == page
+    assert rec.last["path"] == "/organizations/sorbonne-universite"
+
+
+def test_organization_of_an_unknown_slug_is_not_found():
+    c, _ = make_client(lambda *_: (404, {"error": "Organization not found"}))
+    with pytest.raises(NotFoundError):
+        c.organization("nobody")
+
+
+def test_the_sdk_has_no_admin_organization_method():
+    # Admin › Organizations is console-only (CLAUDE.md, parity rule).
+    c, _ = make_client(lambda *_: (200, {}))
+    assert not [n for n in dir(c) if "organization" in n and n != "organization"]
+
+
 def test_user_profile_of_an_unknown_name_is_not_found():
     c, _ = make_client(lambda *_: (404, {"error": "User not found"}))
     with pytest.raises(NotFoundError):

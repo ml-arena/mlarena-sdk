@@ -65,7 +65,7 @@ def _expect(cond, msg):
 
 COURSE = {
     "id": 42, "name": "Titanic", "code": None, "slug": "titanic", "description": None,
-    "visibility": "private", "has_cover": False, "instructor_name": None,
+    "visibility": "private", "has_cover": False, "organization": None,
     "join_code": "JOIN1234", "start_date": None, "end_date": None,
     "archived_at_ts": None, "single_challenge_id": None, "example_listed_at_ts": None,
 }
