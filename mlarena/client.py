@@ -726,7 +726,11 @@ class MLArenaClient:
         runs; `runtime` is `"k8s"` or `"vm"`, and the two health keys are set
         only on a `vm` machine (polled every minute by simulationmanager).
         `vm_health_ok=False` means the GPU VM is currently unreachable and
-        submissions will queue rather than run. The agent sizing a submission
+        submissions will queue rather than run. `on_hold` is True while the
+        challenge is paused (its owner's credits for its machine are used
+        up): a deploy is accepted and its runs wait, a chat message or an
+        exercise check is refused; `on_hold_message` is the sentence to show
+        a participant then, None otherwise. The agent sizing a submission
         runs under is `number_of_agents`, `agent_cpu_limit`,
         `agent_memory_limit`, `gpu_memory_limit` and `has_gpu`.
 
@@ -989,7 +993,11 @@ class MLArenaClient:
         `has_owner_rights` (whether you may do what only its owner may, the
         assistant roster: the owner and an admin), `owner_username`, whose
         challenge it is, and `kind_label`, the kind's name as every challenge
-        reference carries it.
+        reference carries it. `on_hold` is True while the challenge is paused
+        because its owner's credits for its machine are used up (its queued
+        runs wait, its chat or exercise pod is stopped, Start and test runs
+        are refused); `on_hold_message` says so for you (the owner, or
+        another staff member) and where to ask for more, None otherwise.
 
         `config` is the challenge config as one flat document (the platform's
         modelmanager/PROCESS.md "Challenge config"): `values` — every config key the kind
@@ -3681,7 +3689,11 @@ class MLArenaClient:
           env, or the challenge changed under the attempt) or `platform`
           (the runners lost the runs).
         - `queue_info` — `queue_position`, `queue_total`, `created_at_ts`,
-          `in_queue_for_second`; all-null when nothing is queued.
+          `in_queue_for_second`; all-null when nothing is queued. Also why
+          the runs wait: `challenge_updating` / `challenge_updating_message`
+          (the challenge's files are being updated) and `challenge_on_hold` /
+          `challenge_on_hold_message` (the challenge is paused: see
+          `challenge`'s `on_hold`).
         - the numbers of its board line, under the leaderboard row's names:
           `score`, `score_ci95`, `metrics`, `metrics_window`,
           `number_of_runs`, `last_end_run_ts`, `action_time_max_sec`,
@@ -5688,7 +5700,8 @@ class MLArenaClient:
         participant caused (scheduled runs, chat and exercise pods), `rows`
         largest amount first, keyed by `group_by` (`course_id` +
         `course_name`; `challenge_id`, `challenge_name`, `course_id`,
-        `course_name`; or `kind`) with their `amount` and `seconds`. A null
+        `course_name`, `machine_name` (the machine it runs on now); or
+        `kind`) with their `amount` and `seconds`. A null
         id groups what belongs to no course or to a deleted
         challenge or course. Writes nothing.
         """
@@ -6064,7 +6077,7 @@ class MLArenaClient:
         course (`course_id`); its course's staff read it (its owner, its
         assistants, an admin). Carries `id`, `course_id`, `title`, `slug`,
         `summary`, `icon`, `is_published`, `lesson_count`,
-        `challenge_count`, `content_origin`, `source_revision`, `lessons`
+        `challenge_count`, `source_revision`, `lessons`
         and `challenges` (each `challenge_id`, `challenge`, `position`,
         `pass_threshold`, `metric`; `challenge` is the challenge's
         reference, `can_copy` included: see `challenge_overview`).
@@ -6484,7 +6497,8 @@ class MLArenaClient:
                              kernel_version: str | None = None,
                              copy_from_challenge_id: int | None = None,
                              module_id: int | None = None,
-                             pass_threshold: float | None | _Unset = _UNSET) -> dict:
+                             pass_threshold: float | None | _Unset = _UNSET,
+                             machine: int | str | None = None) -> dict:
         """Create a challenge in a course, or copy one into it.
 
         Mirrors `POST /api/teacher/course/{id}/challenges` — the console's
@@ -6492,11 +6506,19 @@ class MLArenaClient:
         there or copied there, owned by the course's owner (whoever of its
         staff calls), and a draft.
 
-        - **Build**: `name` (unique in the course) and `kernel_version`,
-          any kind of `available_kinds()`: `"file_v1"`, `"flex_v1"`,
-          `"chat_v1"` or `"exercise_v1"` (an exercise set). Every member of
-          the course's staff builds every kind and writes its code and
-          files.
+        - **Build**: `name` (unique in the course), `kernel_version`, any
+          kind of `available_kinds()`: `"file_v1"`, `"flex_v1"`,
+          `"chat_v1"` or `"exercise_v1"` (an exercise set), and `machine`,
+          the machine it runs on: an id or a name (`"small"`, `"large"`)
+          among `machines(kernel_version)`, which serves each one's size
+          (`job_cpu_max`, `job_memory_max`, `job_timeout_max_sec`) and
+          `rate` (credits a minute, from the owner's CPU or GPU balance).
+          No default: the machine sets what the course's owner pays. A name
+          is looked up client-side (`machines(kernel_version)`); one that is
+          not offered to you raises `ValueError`. A machine with GPUs is
+          offered once an admin grants it to you (ask from `/contact`).
+          Every member of the course's staff builds every kind and writes
+          its code and files.
         - **Copy**: `copy_from_challenge_id`, a challenge you may copy: a
           started, stopped or ended challenge of an example course
           (`course_catalog(example=True)`), one you are staff of, any for an
@@ -6510,14 +6532,17 @@ class MLArenaClient:
           the owner's rights on the source. `name` defaults to the source's,
           suffixed ` (2)`, ` (3)`… when the course has it. Every copy starts
           with the same data and the same scoring files as its source:
-          change the seed or the data before you start it.
+          change the seed or the data before you start it. A copy takes no
+          `machine`: it keeps its source's machine when both you and the
+          course's owner may use it, else its kind's default;
+          `update_settings(id, machine_id=…)` changes it before Start.
 
         `module_id` places it at the end of that module of the course (404
         for another course's module; a bundle-managed module takes it too); without
         it a new module titled with the challenge's name is added at the end
         of the course. `pass_threshold` left out is 70 for an exercise set
         and no bar otherwise; `None` sends no bar (null); an exercise set's
-        is 0 to 100. The challenge runs on its kind's default machine.
+        is 0 to 100.
 
         Returns `{message, challenge_id, name, slug, course_id, module_id,
         module_created, position, pass_threshold, copied_from_challenge_id,
@@ -6551,7 +6576,19 @@ class MLArenaClient:
             )
         if kernel_version is not None and name is None:
             raise TypeError("add_course_challenge needs a name for a new challenge")
+        if kernel_version is not None and machine is None:
+            raise TypeError(
+                "add_course_challenge needs machine= for a new challenge: an id or a "
+                "name among machines(kernel_version), e.g. 'small' or 'large'"
+            )
+        if copy_from_challenge_id is not None and machine is not None:
+            raise TypeError(
+                "add_course_challenge takes no machine= with copy_from_challenge_id=: a "
+                "copy keeps its source's machine (change it with update_settings)"
+            )
         body: dict = {}
+        if machine is not None:
+            body["machine_id"] = self._machine_id(machine, kernel_version)
         for key, value in (("name", name), ("kernel_version", kernel_version),
                            ("copy_from_challenge_id", copy_from_challenge_id),
                            ("module_id", module_id)):
@@ -6564,17 +6601,35 @@ class MLArenaClient:
             ok=(201,), error_label="add_course_challenge", timeout=120,
         )
 
+    def _machine_id(self, machine: int | str, kernel_version: str) -> int:
+        """The id of `machine` (an id, or the name of one of
+        `machines(kernel_version)`); `ValueError` for a name not offered."""
+        if isinstance(machine, int) and not isinstance(machine, bool):
+            return machine
+        if not isinstance(machine, str):
+            raise TypeError("machine= is a machine id or a machine name")
+        offered = self.machines(kernel_version)
+        for row in offered:
+            if row["name"] == machine:
+                return row["id"]
+        raise ValueError(
+            f"No machine named {machine!r} runs a {kernel_version} challenge for you: "
+            f"{sorted(row['name'] for row in offered)}"
+        )
+
     def create_challenge_for_class(self, name: str, kernel_version: str | None = None, *,
                                    copy_from_challenge_id: int | None = None,
                                    end_date: str | None = None,
-                                   pass_threshold: float | None | _Unset = _UNSET) -> dict:
+                                   pass_threshold: float | None | _Unset = _UNSET,
+                                   machine: int | str | None = None) -> dict:
         """A challenge for my class: a new private course named after the
         challenge, and the challenge in it.
 
         The console's New › "Challenge for my class", composed client-side
         from two public routes (no route of its own): `create_course(name,
         end_date=…)` (private; `end_date` optional, `YYYY-MM-DD`), then
-        `add_course_challenge` in it, built (`kernel_version`) or copied
+        `add_course_challenge` in it, built (`kernel_version` and
+        `machine`, as `add_course_challenge` takes them) or copied
         (`copy_from_challenge_id`, e.g. a challenge of an example course).
         A course holding one challenge and no lesson is shown as that
         challenge: one page for students, one workspace for you.
@@ -6597,12 +6652,18 @@ class MLArenaClient:
         `https://<console>/enroll/<join_code>` with `course["join_code"]`.
         """
         self._refuse_without_terms()
+        if kernel_version is not None and machine is None:
+            raise TypeError(
+                "create_challenge_for_class needs machine= for a new challenge: an id or "
+                "a name among machines(kernel_version), e.g. 'small' or 'large'"
+            )
+        machine_id = self._machine_id(machine, kernel_version) if machine is not None else None
         course = self.create_course(name, end_date=end_date)
         try:
             challenge = self.add_course_challenge(
                 course["id"], name, kernel_version=kernel_version,
                 copy_from_challenge_id=copy_from_challenge_id,
-                pass_threshold=pass_threshold,
+                pass_threshold=pass_threshold, machine=machine_id,
             )
         except MLArenaError as err:
             raise _course_left_behind(err, course) from None

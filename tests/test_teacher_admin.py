@@ -567,12 +567,12 @@ COURSE_CHALLENGE = {
 
 def test_add_course_challenge_builds_one_in_one_call():
     c, rec = make_client(lambda *_: (201, COURSE_CHALLENGE))
-    out = c.add_course_challenge(7, "Maze", kernel_version="file_v1")
+    out = c.add_course_challenge(7, "Maze", kernel_version="file_v1", machine=3)
     _expect(out == COURSE_CHALLENGE, out)
     _expect(len(rec.calls) == 1, rec.calls)
     _expect((rec.last["method"], rec.last["path"]) == ("POST", "/teacher/course/7/challenges"),
             rec.last)
-    _expect(rec.last["json"] == {"name": "Maze", "kernel_version": "file_v1"},
+    _expect(rec.last["json"] == {"machine_id": 3, "name": "Maze", "kernel_version": "file_v1"},
             rec.last["json"])
 
 
@@ -582,8 +582,8 @@ def test_add_course_challenge_copies_into_a_module_with_a_bar():
     _expect(rec.last["json"] == {"copy_from_challenge_id": 12, "module_id": 4,
                                  "pass_threshold": 0.5}, rec.last["json"])
     # `None` is a value: no bar, sent as null; leaving it out lets the kind decide.
-    c.add_course_challenge(7, "Set", kernel_version="exercise_v1", pass_threshold=None)
-    _expect(rec.last["json"] == {"name": "Set", "kernel_version": "exercise_v1",
+    c.add_course_challenge(7, "Set", kernel_version="exercise_v1", pass_threshold=None, machine=3)
+    _expect(rec.last["json"] == {"machine_id": 3, "name": "Set", "kernel_version": "exercise_v1",
                                  "pass_threshold": None}, rec.last["json"])
 
 
@@ -635,14 +635,14 @@ def test_add_course_challenge_refusal_raises_with_the_reason():
     for kind in ("file_v1", "flex_v1", "chat_v1", "exercise_v1"):
         c, rec = make_client(lambda *_: (403, body))
         try:
-            c.add_course_challenge(7, "Maze", kernel_version=kind)
+            c.add_course_challenge(7, "Maze", kernel_version=kind, machine=3)
         except mlarena.PermissionDeniedError as e:
             _expect(sentence in str(e), str(e))
             _expect(e.status_code == 403 and e.body == body, e.body)
         else:
             raise AssertionError("expected PermissionDeniedError")
         # The kind goes out as asked: no kind is held back client-side.
-        _expect(rec.last["json"] == {"name": "Maze", "kernel_version": kind}, rec.last["json"])
+        _expect(rec.last["json"] == {"machine_id": 3, "name": "Maze", "kernel_version": kind}, rec.last["json"])
 
 
 def test_a_removed_route_reads_its_410_sentence():
@@ -793,3 +793,32 @@ def test_taking_part_without_the_enrollment_is_an_enrollment_required_error():
         c.create_submission(7, "first try")
     except mlarena.PermissionDeniedError as err:
         _expect(not isinstance(err, mlarena.EnrollmentRequiredError), type(err))
+
+
+def test_add_course_challenge_needs_its_machine_and_reads_a_name():
+    """No default machine (docs/credits.md §5): a build names one, by id or by name
+    among `machines(kernel_version)`; a copy takes none."""
+    machines = [{"id": 1, "name": "small"}, {"id": 2, "name": "large"}]
+
+    def answer(method, path, kwargs):
+        return (200, machines) if path == "/machines/" else (201, COURSE_CHALLENGE)
+
+    c, rec = make_client(answer)
+    c.add_course_challenge(7, "Maze", kernel_version="file_v1", machine="large")
+    _expect((rec.calls[0]["path"], rec.calls[0]["params"]) == ("/machines/", {"kernel_version": "file_v1"}),
+            rec.calls[0])
+    _expect(rec.last["json"] == {"machine_id": 2, "name": "Maze", "kernel_version": "file_v1"},
+            rec.last["json"])
+    for call, error in (
+        (lambda: c.add_course_challenge(7, "Maze", kernel_version="file_v1"), TypeError),
+        (lambda: c.add_course_challenge(7, copy_from_challenge_id=12, machine=2), TypeError),
+        (lambda: c.add_course_challenge(7, "Maze", kernel_version="file_v1", machine="gpu"), ValueError),
+    ):
+        before = len(rec.calls)
+        try:
+            call()
+        except error:
+            pass
+        else:
+            raise AssertionError(f"expected {error.__name__}")
+        _expect(not any(r["path"].startswith("/teacher") for r in rec.calls[before:]), rec.calls[before:])

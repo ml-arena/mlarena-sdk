@@ -1,6 +1,6 @@
 # mlarena-sdk — Python SDK
 
-**Purpose**: Python client (`mlarena-sdk` 4.27.0, import `mlarena`) and the `mlarena` command over the public backend REST routes (`/api/*`).
+**Purpose**: Python client (`mlarena-sdk` 4.28.0, import `mlarena`) and the `mlarena` command over the public backend REST routes (`/api/*`).
 
 **Key features**:
 - Bearer-token auth with scope-segmented keys `mlk_<scope>_<lookup>_<secret>` (`user`, `author`; a `creator` / `teacher` key is an `author` key), a course's key `mlc_<lookup>_<secret>` (one course's push only; the repository secret `MLARENA_COURSE_KEY`), or, in a GitHub Actions job, the 15-minute `mlo_<lookup>_<secret>` token of the OIDC exchange (no stored secret; submissions and challenges with no course).

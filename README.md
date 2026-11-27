@@ -60,6 +60,34 @@ client.leaderboard(ch["id"])                      # a DataFrame with pandas
   An error once the submission exists (a refused upload, a deploy over your
   daily quota) carries `err.submission_id` and says how to deploy or delete it.
 
+## 4.28.0 — the machine of a new challenge; a challenge on hold
+
+Breaking for scripts that build a challenge in a course.
+
+- **A new challenge names its machine.** `add_course_challenge(...,
+  kernel_version=..., machine=...)` and `create_challenge_for_class(...,
+  machine=...)` take the machine it runs on, an id or a name among
+  `machines(kernel_version)` (`"small"`, `"large"`), each served with its
+  size (`job_cpu_max`, `job_memory_max`, `job_timeout_max_sec`) and its
+  `rate`. There is no default: the machine sets what the course's owner
+  pays. Left out on a build, `TypeError`; a name not offered to you,
+  `ValueError`; with `copy_from_challenge_id`, `TypeError` (a copy keeps its
+  source's machine when both you and the course's owner may use it, else its
+  kind's default). `update_settings(id, machine_id=...)` changes it until
+  Start.
+- **A challenge on hold says so.** `challenge(id)` serves `on_hold` and
+  `on_hold_message` (the participant's sentence: the deploy waits, or the
+  chat and the check are paused; no credit word), `creator_challenge(id)` the
+  same two keys worded for its staff (whose credits, and where to ask for
+  more), and `submission(id)["queue_info"]` `challenge_on_hold` /
+  `challenge_on_hold_message` next to a deploy that waits.
+- The usage rows by challenge (`credit_usage(group_by="challenge")`) name
+  each challenge's machine (`machine_name`).
+- `enroll_in_course` and `enrollment_info` take the course's join link, or
+  the token it ends with.
+- `get_module` no longer serves `content_origin`: one writer per course
+  (`course_github(...)["edited_in"]`).
+
 ## 4.27.0 — no admin operation in the SDK
 
 Breaking for admin accounts only: every call removed here was refused (403)

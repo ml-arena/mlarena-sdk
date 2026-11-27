@@ -78,7 +78,7 @@ def make_ci_client(status, data):
 # The routes that create a challenge, each through its SDK method (the open
 # challenge's, an admin's, is the in-repo admin client's: mlarena-admin/).
 CREATING_CALLS = {
-    "build in a course": lambda c: c.add_course_challenge(7, "Maze", kernel_version="flex_v1"),
+    "build in a course": lambda c: c.add_course_challenge(7, "Maze", kernel_version="flex_v1", machine=3),
     "copy into a course": lambda c: c.add_course_challenge(7, copy_from_challenge_id=12),
     "module copied": lambda c: c.copy_module_into_course(7, 3),
     "course duplicated": lambda c: c.duplicate_course(7),
@@ -170,7 +170,7 @@ def test_a_github_actions_run_is_told_that_the_account_holder_accepts():
     client, rec = make_ci_client(403, REFUSAL)
 
     with pytest.raises(mlarena.PermissionDeniedError) as raised:
-        client.add_course_challenge(7, "Maze", kernel_version="flex_v1")
+        client.add_course_challenge(7, "Maze", kernel_version="flex_v1", machine=3)
 
     assert raised.value.body == REFUSAL
     assert str(raised.value) == (
@@ -187,7 +187,7 @@ def test_another_403_of_a_creating_route_is_left_as_it_is():
     client, _ = make_client(403, {"error": "You do not manage this course"})
 
     with pytest.raises(mlarena.PermissionDeniedError) as raised:
-        client.add_course_challenge(7, "Maze", kernel_version="flex_v1")
+        client.add_course_challenge(7, "Maze", kernel_version="flex_v1", machine=3)
 
     assert str(raised.value) == "You do not manage this course"
     assert "reason" not in raised.value.body

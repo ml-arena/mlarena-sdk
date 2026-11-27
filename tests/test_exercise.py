@@ -365,7 +365,7 @@ def test_format_attempt_lines():
 def test_exercise_names_are_exported_at_package_level():
     assert mlarena.ExerciseAttemptNotFoundError is ExerciseAttemptNotFoundError
     assert issubclass(mlarena.ExerciseAttemptNotFoundError, mlarena.NotFoundError)
-    assert mlarena.__version__ == "4.27.0"
+    assert mlarena.__version__ == "4.28.0"
 
 
 def test_update_settings_sends_the_exercise_limits_passed(monkeypatch):
@@ -496,12 +496,12 @@ def test_an_exercise_set_is_built_in_its_course(monkeypatch):
     c, rec = make_client(monkeypatch, lambda m, p, k: (201, created))
     assert not hasattr(c, "add_course_exercise_set")
     out = c.add_course_challenge(3, "Week 1 exercises", kernel_version="exercise_v1",
-                                 module_id=12)
+                                 module_id=12, machine=3)
     assert out["challenge_id"] == 91
     assert (rec.last["method"], rec.last["path"]) == ("POST", "/teacher/course/3/challenges")
     # No pass_threshold key: the server applies the kind's default (70).
-    assert rec.last["json"] == {"name": "Week 1 exercises", "kernel_version": "exercise_v1",
-                                "module_id": 12}
+    assert rec.last["json"] == {"machine_id": 3, "name": "Week 1 exercises",
+                                "kernel_version": "exercise_v1", "module_id": 12}
 
 
 def test_self_test_exercises_refusals_carry_the_cap_and_the_blockers(monkeypatch, clock):

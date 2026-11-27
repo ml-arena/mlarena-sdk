@@ -113,7 +113,7 @@ def test_a_challenge_for_my_class_is_a_course_then_its_challenge():
         ("POST", "/academic_courses/"): (201, COURSE),
         ("POST", "/teacher/course/42/challenges"): (201, CREATED),
     })
-    out = client.create_challenge_for_class("Titanic", "file_v1", end_date="2027-06-30")
+    out = client.create_challenge_for_class("Titanic", "file_v1", end_date="2027-06-30", machine=3)
     _expect(out == {"course": COURSE, "challenge": CREATED}, out)
     # The terms are read first, before anything is created.
     _expect(rec.signature() == [
@@ -124,7 +124,7 @@ def test_a_challenge_for_my_class_is_a_course_then_its_challenge():
     # the challenge.
     _expect(rec.calls[1]["json"] == {"name": "Titanic", "end_date": "2027-06-30"},
             rec.calls[1]["json"])
-    _expect(rec.calls[2]["json"] == {"name": "Titanic", "kernel_version": "file_v1"},
+    _expect(rec.calls[2]["json"] == {"machine_id": 3, "name": "Titanic", "kernel_version": "file_v1"},
             rec.calls[2]["json"])
 
 
@@ -134,7 +134,7 @@ def test_a_challenge_for_my_class_without_the_terms_creates_no_course():
     client, rec = make_client({CURRENT_USER: (200, NOT_ACCEPTED)})
     for kind in ("file_v1", "flex_v1", "chat_v1", "exercise_v1"):
         try:
-            client.create_challenge_for_class("Titanic", kind)
+            client.create_challenge_for_class("Titanic", kind, machine=3)
         except mlarena.PermissionDeniedError as err:
             _expect_terms_refusal(err)
             _expect("course" not in err.body, err.body)
@@ -151,7 +151,7 @@ def test_the_helper_never_accepts_the_terms_itself():
         ("POST", "/auth/terms/accept"): (200, {"terms_accepted_at_ts": "2026-11-26T10:15:00Z"}),
     })
     try:
-        client.create_challenge_for_class("Titanic", "file_v1")
+        client.create_challenge_for_class("Titanic", "file_v1", machine=3)
     except mlarena.PermissionDeniedError:
         pass
     else:
@@ -168,7 +168,7 @@ def test_an_unknown_credential_is_left_to_the_first_route():
         ("POST", "/academic_courses/"): (401, {"error": "Authentication required"}),
     })
     try:
-        client.create_challenge_for_class("Titanic", "file_v1")
+        client.create_challenge_for_class("Titanic", "file_v1", machine=3)
     except mlarena.PermissionDeniedError:
         raise AssertionError("a 401 is not a refusal for the terms")
     except mlarena.AuthenticationError as err:
@@ -187,7 +187,7 @@ def test_a_refused_challenge_leaves_the_empty_course_and_says_so():
         ("POST", "/teacher/course/42/challenges"): (503, {"error": KIND_NOT_SET_UP}),
     })
     try:
-        client.create_challenge_for_class("Titanic", "flex_v1")
+        client.create_challenge_for_class("Titanic", "flex_v1", machine=3)
     except MLArenaError as err:
         _expect(KIND_NOT_SET_UP in str(err), str(err))
         _expect("course 42 'Titanic' was created and holds no challenge" in str(err), str(err))
@@ -207,7 +207,7 @@ def test_the_routes_own_terms_refusal_still_names_the_course_it_left():
         ("POST", "/teacher/course/42/challenges"): (403, TERMS_REFUSAL),
     })
     try:
-        client.create_challenge_for_class("Titanic", "file_v1")
+        client.create_challenge_for_class("Titanic", "file_v1", machine=3)
     except mlarena.PermissionDeniedError as err:
         _expect(err.body == {**TERMS_REFUSAL, "course_id": 42}, err.body)
         _expect("client.accept_terms()" in str(err), str(err))
