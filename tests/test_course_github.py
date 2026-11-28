@@ -409,7 +409,7 @@ def test_cli_course_push_with_a_course_key_pushes_its_course(
     assert ("planned (connecting): nothing was changed. Switch to GitHub editing in "
             "Settings › GitHub; the next push then applies") in out
     assert "    challenge House prices: unchanged" in out
-    # What the repository no longer lists (docs/course_github.md §7).
+    # What the repository no longer lists (backend/PROCESS.md "Course on GitHub").
     assert "  module s9-old: not in the repository, unpublished (its lessons kept)" in out
     assert ("  challenge Old quiz: not in the repository, taken out of its module "
             "(its submissions kept)") in out

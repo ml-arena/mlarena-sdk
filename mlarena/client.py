@@ -643,7 +643,7 @@ class MLArenaClient:
         page: int | None = None,
         per_page: int | None = None,
     ):
-        """List the challenges with no course. Public; no
+        """List the open challenges. Public; no
         auth required.
 
         A challenge of a course is never listed here: it is reached from its
@@ -735,11 +735,11 @@ class MLArenaClient:
         `agent_memory_limit`, `gpu_memory_limit` and `has_gpu`.
 
         Where it sits: `course_id`, `module_id` and `pass_threshold` (the
-        course's bar on its score, None = no bar), all None for a
-        challenge with no course; `course` is the course a course challenge belongs to
+        course's bar on its score, None = no bar), all None for an
+        open challenge; `course` is the course a course challenge belongs to
         (`{id, slug, name, visibility, single_challenge_id,
         example_listed_at_ts, enrollment_state, is_enrolled, join_code}`,
-        None for a challenge with no course): what a reader who is not enrolled needs to
+        None for an open challenge): what a reader who is not enrolled needs to
         enroll (`enroll_in_course(join_code)`) while `enrollment_state` is
         `open` (`open` | `archived` | `ended`). `single_challenge_id` is
         this challenge's id when it is the course's only content (the course
@@ -747,17 +747,17 @@ class MLArenaClient:
         is when the course was listed as an example (None = not an example).
         Who runs it: `owner_username` / `owner_avatar_key` (its organizer;
         on a course challenge the course's owner) and `organization`
-        (`{id, slug, name, has_logo}`, or None): a challenge with no course shows the
+        (`{id, slug, name, has_logo}`, or None): an open challenge shows the
         one an admin attached to it, a course challenge its course's.
         `copied_from_challenge_id` is the challenge it was copied from (None
         when it was not); `copied_from_challenge` (`{id, name, slug}`) names
-        that source when it is a public challenge with no course ("Based on
+        that source when it is a public open challenge ("Based on
         the challenge X"), None otherwise.
 
         You on it: `role` (`"owner"`, `"assistant"` or None; an admin who is
         neither reads None), `can_edit` (you may open its workspace: its
         staff, an admin), `can_participate` (you may submit, deploy,
-        chat, check an exercise or team up: on a challenge with no course any signed-in
+        chat, check an exercise or team up: on an open challenge any signed-in
         user who sees it, on a course challenge the course's staff and the
         users enrolled in it; a refusal raises `EnrollmentRequiredError`)
         and `can_copy` (you may copy it into a course of yours,
@@ -1035,7 +1035,7 @@ class MLArenaClient:
         of them started, 10 unless an admin changed it; "Limit of started
         challenges reached: this challenge's owner has 10 started and may
         have 10 (exercise sets are not counted). Stop one to start
-        another."; challenges with no course and an admin's are not limited),
+        another."; open challenges and an admin's are not limited),
         `llm_not_configured`,
         `ground_truth_missing`, `benchmark_missing`, `benchmark_unscored`;
         `[]` means ready, None while started, and None with
@@ -1494,7 +1494,7 @@ class MLArenaClient:
         `submission_filename`, `elo` (a `metrics` spec with
         `agg: "rating"`),
         `episode_budget_brackets`, `run_limits`, `agent_containers`
-        (the agent_* sizing, agent_gpu_count, is_stop_after_deployment,
+        (the agent_* sizing, is_stop_after_deployment,
         render_delay_second: a file challenge has neither), `multi_agent`
         (number_of_agents) and `exercises` (time_limit_sec, memory_limit_mb,
         max_concurrent_attempts, max_attempts_per_minute). The others apply to every kind, the runtime
@@ -2141,7 +2141,7 @@ class MLArenaClient:
         Returns `{"message", "clean_redeploy"}`.
 
         Any of the challenge's staff starts it (a course challenge's: the
-        course's owner and assistants). A public challenge with no course
+        course's owner and assistants). A public open challenge
         is started only by an admin (the publishing right); a stopped one too.
 
         `clean_redeploy_all=True` restarts a stopped or ended challenge and
@@ -2510,7 +2510,7 @@ class MLArenaClient:
         pending or running, a benchmark test on its way); and what goes with
         the challenge: `module_deleted` (a course challenge's module is
         deleted with it, because it then holds no lesson and no other
-        challenge; False for a challenge with no course), `env_files` (names in its env
+        challenge; False for an open challenge), `env_files` (names in its env
         folder), `benchmark_files` (names in its benchmark folder),
         `has_benchmark`, `run_count` (every run of its environment),
         `exercise_count`, `chat_session_count`, `deleted_datasets` (`[{id,
@@ -3106,7 +3106,7 @@ class MLArenaClient:
         rights on this challenge. Every editor of the challenge (its owner,
         an assistant, an admin) may read the list; only the owner (or an
         admin) may change it. The owner is not an entry:
-        `creator_challenge(id)["owner_username"]` names them. A challenge with no course
+        `creator_challenge(id)["owner_username"]` names them. An open challenge
         only: a course challenge's staff are its course's (`course_assistants`),
         and this read, like the add, answers 400 on one.
         """
@@ -3874,7 +3874,7 @@ class MLArenaClient:
         `deployment_limits` (the same quota block `submission_deploy_status`
         serves). Each row carries `id`, `submission_name`, `challenge_id`,
         `challenge_name`, `course_id`, `course_name`, `course_slug` (the
-        challenge's course; all three None for a challenge with no course),
+        challenge's course; all three None for an open challenge),
         `rank`, `created_at_ts`, `challenge_start_date_ts`
         (the challenge's own `start_date_ts` column), `last_end_run_ts`,
         `owner` (`{user_id, username, avatar_key}`), `viewer_role` (`owner` |
@@ -4656,7 +4656,7 @@ class MLArenaClient:
         (`user_global_rank()`'s dict), `organizations` (the organizations an
         admin made them a member of, `{id, slug, name, has_logo}` each, by
         name; read one with `organization(slug)`), `organized_challenges` (the started
-        or ended competitions they own, as `challenges()` rows: running
+        or ended open challenges they own, as `challenges()` rows: running
         first, then the most recently ended) and `taught_courses` (the courses
         they own that the course catalog lists, as `course_catalog()` cards).
         Never the email, the student identity or the linked GitHub account.
@@ -4682,7 +4682,7 @@ class MLArenaClient:
         `members` (`{username, avatar_key}` of its members with an active
         account), `courses` (its courses the course catalog lists, as
         `course_catalog()` cards) and `challenges` (its started or ended
-        challenges with no course, as `challenges()` rows).
+        open challenges, as `challenges()` rows).
 
         Organizations are created and attached by an admin in the console
         (Admin › Organizations); the SDK has no method for that.
@@ -4815,8 +4815,8 @@ class MLArenaClient:
         after 30 idle minutes, see `wait_for_chat_agent` —,
         `max_sessions_per_participant` is reached, the agent is still
         answering a message of your open session — wait for it first —, or
-        the challenge's owner has no compute credits left: that 409 carries
-        `.body["reason"] == "out_of_credits"` beside `error`, and no
+        the challenge is on hold (its owner's credits are used up): that 409
+        carries `.body["reason"] == "on_hold"` beside `error`, and no
         conversation is opened). `EnrollmentRequiredError` when you are not
         enrolled in the challenge's course.
         """
@@ -7307,7 +7307,7 @@ class MLArenaClient:
         The manifest is declarative for what it lists: a key left out takes
         its default, except in the `course` block. A `challenges` entry
         places a challenge of this course in its module, in the manifest's
-        order (a challenge of another course, or one with no course, is refused:
+        order (a challenge of another course, or an open challenge, is refused:
         a challenge belongs to one course and is created there, with
         `add_course_challenge`); a challenge no entry names is left where it
         is, and `challenges: []` is the same as leaving the key out. A

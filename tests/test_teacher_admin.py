@@ -796,7 +796,7 @@ def test_taking_part_without_the_enrollment_is_an_enrollment_required_error():
 
 
 def test_add_course_challenge_needs_its_machine_and_reads_a_name():
-    """No default machine (docs/credits.md §5): a build names one, by id or by name
+    """No default machine (backend/PROCESS.md "The machine of a new challenge"): a build names one, by id or by name
     among `machines(kernel_version)`; a copy takes none."""
     machines = [{"id": 1, "name": "small"}, {"id": 2, "name": "large"}]
 

@@ -60,6 +60,13 @@ client.leaderboard(ch["id"])                      # a DataFrame with pandas
   An error once the submission exists (a refused upload, a deploy over your
   daily quota) carries `err.submission_id` and says how to deploy or delete it.
 
+## 4.28.1 — what a challenge on hold refuses, in the docs
+
+No code change. `open_chat_session` documents the `on_hold` 409 a participant
+gets (it said `out_of_credits`, which only a staff member's request carries);
+"At zero credits" says a deploy is not refused (its runs wait); the docstrings
+say "open challenge" where they said "a challenge with no course".
+
 ## 4.28.0 — the machine of a new challenge; a challenge on hold
 
 Breaking for scripts that build a challenge in a course.
@@ -335,13 +342,13 @@ challenges into courses or used the module library.
   challenge_id=None)`; a run row carries `credits` (`{amount, seconds, kind, resource}`) for the challenge's staff.
   `machines()` rows carry `rate` (`{id, valid_from_ts, resource,
   credits_per_minute, source_note}`, None on a machine that charges nothing).
-- **At zero credits** (once the platform enforces them) new work for a
-  challenge whose owner has none left is refused with a 409 whose
-  `err.body["reason"]` is `"out_of_credits"`, beside `error`: `deploy_submission`
-  (with the two quota blocks, and none of your daily deploys used; a deploy
-  409 always carries `reason`, None when a quota refused),
-  `open_chat_session`, `send_chat_message`, `submit_exercise` / `check`,
-  `run_benchmark`, `clean_redeploy_submission`, `clean_redeploy_all`, and
+- **At zero credits** a challenge whose owner has none left is on hold. A
+  participant's chat and exercise work is refused with a 409 whose
+  `err.body["reason"]` is `"on_hold"`, beside `error` (`open_chat_session`,
+  `send_chat_message`, `submit_exercise` / `check`; the sentence names no
+  credit); `deploy_submission` is not refused, its runs wait. A staff
+  member's new work is refused with `"out_of_credits"`: `run_benchmark`,
+  `clean_redeploy_submission`, `clean_redeploy_all`, and
   every update of a started challenge's files (`upload_env_file`,
   `update_env_file_content`, `delete_env_file`, `push_challenge`,
   `import_challenge_from_github`, `set_scoring_form`,

@@ -513,7 +513,7 @@ def _course_plan_lines(report: dict, *, asked_dry_run: bool) -> list[str]:
         lines.append(f"  module {slug}: not in the manifest, untouched")
     lines += [f"  challenge {name}: in no challenges entry of the manifest, left where it is"
               for name in report["unmanaged_challenges"]]
-    # A course-key push: the repository is the whole course (docs/course_github.md §7).
+    # A course-key push: the repository is the whole course (backend/PROCESS.md "Course on GitHub").
     lines += [f"  module {slug}: not in the repository, unpublished (its lessons kept)"
               for slug in report["unpublished_modules"]]
     lines += [f"  challenge {name}: not in the repository, taken out of its module "
